@@ -29,13 +29,13 @@ def candidate_sentences(sentence):
 
 def candidate_words(word): 
     "Generate possible spelling corrections for word."
-    return (known_words([word]) or known_words(edits(word, 1)) or known_words(edits(word, 2)) or [word])
+    return (known_words([word]) or known_words(edits1(word)) or known_words(edits2(word)) or [word])
 
 def known_words(words): 
     "The subset of `words` that appear in the dictionary of WORDS."
     return set(w for w in words if w in WORDS)
 
-def edit(word):
+def edits1(word):
     "All edits that are one edit away from `word`."
     letters    = 'abcdefghijklmnopqrstuvwxyz'
     splits     = [(word[:i], word[i:])    for i in range(len(word) + 1)]
@@ -45,9 +45,7 @@ def edit(word):
     inserts    = [L + c + R               for L, R in splits for c in letters]
     return set(deletes + transposes + replaces + inserts)
 
-def edits(word, distance):
-    "All edits that are distance edits away from `word`."
-    if 0 == distance:
-        return set([word])
-    return (e2 for e1 in edit(word) for e2 in edits(e1, distance=(distance - 1)))
+def edits2(word):
+    "All edits that are two edits away from `word`."
+    return (e2 for e1 in edits1(word) for e2 in edits1(e1))
     
