@@ -112,11 +112,11 @@ def read_data_sets(data_dir, train_batch_size, dev_batch_size, test_batch_size, 
     train = None
     if "train" in sets:
         train = _read_data_set(data_dir, thread_count, train_batch_size, numcep, numcontext)
-    
+
     dev = None
     if "dev" in sets:
         dev   = _read_data_set(data_dir, thread_count, dev_batch_size, numcep, numcontext)
-    
+
     test = None
     if "test" in sets:
         test  = _read_data_set(data_dir, thread_count, test_batch_size, numcep, numcontext)
