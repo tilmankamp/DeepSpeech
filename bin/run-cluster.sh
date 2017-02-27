@@ -1,66 +1,61 @@
 #!/bin/bash
 
 PROGNAME=$(basename $0)
+ps_count=1
 worker_count=2
 
 export ds_importer="ldc93s1"
 export ds_train_batch_size=1
 export ds_dev_batch_size=1
 export ds_test_batch_size=1
-export ds_epochs=50
+export ds_epochs=100
 
+# Generating the parameter server addresses
+index=0
+while [ "$index" -lt "$ps_count" ]
+do
+  ps_hosts[$index]="localhost:$((index + 2000))"
+  ((index++))
+done
+ps_hosts=$(printf ",%s" "${ps_hosts[@]}")
+ps_hosts=${ps_hosts:1}
 
-function join_by { local IFS="$1"; shift; echo "$*"; }
-
-function usage {
-	# Display usage message on standard error
-	echo "Usage: $PROGNAME" 1>&2
-}
-
-function clean_up {
-	jobs -pr | xargs kill -9
-}
-
-function error_exit {
-	# Display error message and exit
-	echo "${PROGNAME}: ${1:-"Unknown Error"}" 1>&2
-	clean_up 1
-}
-
-trap clean_up SIGHUP SIGINT SIGTERM
-
-# Do stuff
-
+# Generating the worker addresses
 index=0
 while [ "$index" -lt "$worker_count" ]
 do
-  worker_hosts[$index]="localhost:$((index + 2223))"
+  worker_hosts[$index]="localhost:$((index + 3000))"
   ((index++))
 done
 worker_hosts=$(printf ",%s" "${worker_hosts[@]}")
 worker_hosts=${worker_hosts:1}
 
-export ds_ps_hosts='localhost:2222'
+export ds_ps_hosts=$ps_hosts
 export ds_worker_hosts=$worker_hosts
 
 
-CUDA_VISIBLE_DEVICES="" ds_job_name=ps ds_task_index=0 python -u DeepSpeech.py 2>&1 | sed 's/^/[server  ] /' &
-param_server=`jobs -p`
-echo "Started parameter server with PID $param_server"
-
-sleep 4
-
+# Starting the parameter servers
 index=0
-while [ "$index" -lt "$worker_count" ]
+while [ "$index" -lt "$ps_count" ]
 do
-  CUDA_VISIBLE_DEVICES=$index ds_job_name=worker ds_task_index=$index python -u DeepSpeech.py 2>&1 | sed 's/^/[worker '"$index"'] /' &
-  echo "Started worker $index with PID ${workers[$index]}"
-	sleep 4
+  CUDA_VISIBLE_DEVICES="" ds_job_name=ps ds_task_index=$index python -u DeepSpeech.py 2>&1 | sed 's/^/[ps     '"$index"'] /' &
+  echo "Started ps $index"
   ((index++))
 done
 
-while ps -p $param_server > /dev/null
+# Starting the workers
+index=1
+while [ "$index" -lt "$worker_count" ]
 do
-  sleep 1
+  CUDA_VISIBLE_DEVICES="$index" ds_job_name=worker ds_task_index=$index python -u DeepSpeech.py 2>&1 | sed 's/^/[worker '"$index"'] /' &
+  echo "Started worker $index"
+  ((index++))
 done
-clean_up
+
+#JOBS=$(echo $(jobs -lp))
+#trap "set -x; kill $JOBS" EXIT
+
+CUDA_VISIBLE_DEVICES="0" ds_job_name=worker ds_task_index=0 python -u DeepSpeech.py 2>&1 | sed 's/^/[worker 0] /'
+
+
+#while [ 1 ]; do sleep 1; test $? -gt 128 && break; done

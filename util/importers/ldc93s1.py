@@ -82,13 +82,14 @@ class DataSet(object):
         source, source_len, target, target_len = self._compute_source_target()
         while not self._coord.should_stop():
             try:
-                session.run(self._enqueue_op, feed_dict={
+                session.run(self._enqueue_op, options=tf.RunOptions(timeout_in_ms=5000), feed_dict={
                     self._x: source,
                     self._x_length: source_len,
                     self._y: target,
                     self._y_length: target_len})
-            except tf.errors.CancelledError:
-                return
+            except (tf.errors.DeadlineExceededError, tf.errors.CancelledError):
+                pass
+
 
     def next_batch(self):
         source, source_lengths, target, target_lengths = self._example_queue.dequeue_many(self._batch_size)

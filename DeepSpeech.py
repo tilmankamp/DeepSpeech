@@ -38,6 +38,7 @@ if do_fulltrace:
     check_cupti()
 
 
+
 # Cluster configuration
 # =====================
 
@@ -52,6 +53,24 @@ job_name = os.environ.get('ds_job_name', 'worker')
 
 # Index of task within the job - worker with index 0 will be the chief
 task_index = int(os.environ.get('ds_task_index', 0))
+
+# As we are introducing one tower for each GPU, first we must determine how many GPU's are available
+# Get a list of the available gpu's ['/gpu:0', '/gpu:1'...]
+# available_devices = ['/job:%s/task:%d%s' % (job_name, task_index, gpu) for gpu in get_available_gpus()]
+
+# If there are no GPU's use the CPU
+# if 0 == len(available_devices):
+#    available_devices = ['/job:%s/task:%d/cpu:0' % (job_name, task_index)]
+
+# Create a cluster from the parameter server and worker hosts.
+cluster = tf.train.ClusterSpec({"ps": ps_hosts, "worker": worker_hosts})
+
+worker_device = '/job:%s/task:%d' % (job_name, task_index)
+cpu_device = worker_device + '/cpu:0'
+available_devices = [worker_device + gpu for gpu in get_available_gpus()]
+if 0 == len(available_devices):
+    available_devices = [cpu_device]
+print(available_devices)
 
 
 # Global Constants
@@ -199,12 +218,12 @@ n_input = 26 # TODO: Determine this programatically from the sample rate
 n_context = 9 # TODO: Determine the optimal value using a validation data set
 
 # Number of units in hidden layers
-n_hidden_1 = 2048
-n_hidden_2 = 2048
-n_hidden_5 = 2048
+n_hidden_1 = 494
+n_hidden_2 = 494
+n_hidden_5 = 494
 
 # LSTM cell state dimension
-n_cell_dim = 2048
+n_cell_dim = 494
 
 # The number of units in the third layer, which feeds in to the LSTM
 n_hidden_3 = 2 * n_cell_dim
@@ -226,7 +245,9 @@ def variable_on_cpu(name, shape, initializer):
     used to create a variable in CPU memory.
     """
     # Use the /cpu:0 device for scoped operations
-    with tf.device('/cpu:0'):
+    with tf.device(tf.train.replica_device_setter(
+                   worker_device=worker_device,
+                   cluster=cluster)):
         # Create or get apropos variable
         var = tf.get_variable(name=name, shape=shape, initializer=initializer)
     return var
@@ -415,17 +436,7 @@ def create_optimizer():
 # on which all operations within the tower execute.
 # For example, all operations of "tower 0" could execute on the first GPU `tf.device('/gpu:0')`.
 
-# As we are introducing one tower for each GPU, first we must determine how many GPU's are available
-# Get a list of the available gpu's ['/gpu:0', '/gpu:1'...]
-available_devices = get_available_gpus()
-
-# If there are no GPU's use the CPU
-if 0 == len(available_devices):
-    available_devices = ['/cpu:0']
-
-print(available_devices)
-
-def get_tower_results(batch_set, optimizer=None):
+def get_tower_results(batch_set, optimizer):
     r"""
     With this preliminary step out of the way, we can for each GPU introduce a
     tower for which's batch we calculate
@@ -471,7 +482,9 @@ def get_tower_results(batch_set, optimizer=None):
         # Loop over available_devices
         for i in xrange(len(available_devices)):
             # Execute operations of tower i on device i
-            with tf.device(available_devices[i]):
+            with tf.device(tf.train.replica_device_setter(
+                           worker_device=available_devices[i],
+                           cluster=cluster)):
                 # Create a scope for all operations of tower i
                 with tf.name_scope('tower_%d' % i) as scope:
                     # Calculate the avg_loss and accuracy and retrieve the decoded
@@ -494,12 +507,11 @@ def get_tower_results(batch_set, optimizer=None):
                     # Retain tower's total losses
                     tower_total_losses.append(total_loss)
 
-                    if optimizer is not None:
-                        # Compute gradients for model parameters using tower's mini-batch
-                        gradients = optimizer.compute_gradients(avg_loss)
+                    # Compute gradients for model parameters using tower's mini-batch
+                    gradients = optimizer.compute_gradients(avg_loss)
 
-                        # Retain tower's gradients
-                        tower_gradients.append(gradients)
+                    # Retain tower's gradients
+                    tower_gradients.append(gradients)
 
                     # Retain tower's accuracy
                     tower_accuracies.append(accuracy)
@@ -797,7 +809,7 @@ def calculate_loss_and_report(session, tower_results, train_op=None, query_repor
     params['avg_loss'] = avg_loss
 
     # Facilitate a train run
-    if train_op:
+    if not train_op is None:
         params['train_op'] = train_op
 
     # Requirements to display a WER report
@@ -841,22 +853,40 @@ def calculate_loss_and_report(session, tower_results, train_op=None, query_repor
 
 
 
-if __name__ == "__main__":
-
-    # Create a cluster from the parameter server and worker hosts.
-    cluster = tf.train.ClusterSpec({"ps": ps_hosts, "worker": worker_hosts})
+if __name__ == '__main__':
 
     # Create and start a server for the local task.
     server = tf.train.Server(cluster, job_name=job_name, task_index=task_index)
 
-    if job_name == "ps":
-        server.join()
-    elif job_name == "worker":
+    # Queues that are used to gracefully stop parameter servers.
+    # Each queue stands for one ps. A finished worker sends a token to each queue.
+    # Each ps will dequeue as many tokens as there are workers before joining/quitting.
+    with tf.device('/job:ps/task:0'):
+        done_queues = [tf.FIFOQueue(1, tf.int32, shared_name=('queue%i' % i)) for i, ps in enumerate(ps_hosts)]
+    token_placeholder = tf.placeholder(tf.int32)
+    done_enqueues = [queue.enqueue(token_placeholder) for i, queue in enumerate(done_queues)]
+    done_dequeues = [queue.dequeue() for queue in done_queues]
+
+    if job_name == 'ps':
+        with tf.Session(server.target) as session:
+            for worker in worker_hosts:
+                print ('Waiting for stop token...')
+                token = session.run(done_dequeues[task_index])
+                print ('Got a stop token from worker %i' %token)
+        print ('Session stopped.')
+
+    elif job_name == 'worker':
 
         # Assigns ops to the local worker by default.
         with tf.device(tf.train.replica_device_setter(
-                       worker_device="/job:worker/task:%d" % task_index,
+                       worker_device=worker_device,
                        cluster=cluster)):
+
+            # Determine, if we are the chief worker
+            is_chief = (task_index == 0)
+
+            # Create a variable to hold the global_step.
+            global_step = tf.Variable(0, trainable=False, name='global_step')
 
             # Get the required data set
             data_set = read_data_set('train')
@@ -864,11 +894,13 @@ if __name__ == "__main__":
             # Create the optimizer
             optimizer = create_optimizer()
 
-            # Create a variable to hold the global_step.
-            global_step = tf.Variable(0, trainable=False, name='global_step')
+            # Synchronous training
+            optimizer = tf.train.SyncReplicasOptimizer(optimizer,
+                                                       replicas_to_aggregate=len(worker_hosts),
+                                                       total_num_replicas=len(worker_hosts))
 
             # Get the data_set specific graph end-points
-            tower_results = get_tower_results(data_set, optimizer=optimizer)
+            tower_results = get_tower_results(data_set, optimizer)
             results, gradients, accuracy, loss = tower_results
 
             # Average tower gradients across GPUs
@@ -877,28 +909,35 @@ if __name__ == "__main__":
             # Apply gradients to modify the model
             apply_gradient_op = optimizer.apply_gradients(avg_tower_gradients, global_step=global_step)
 
-            # Init all variables for first use
-            init_op = tf.global_variables_initializer()
+            # Hook to handle initialization and queues for sync replicas.
+            sync_replicas_hook = optimizer.make_session_run_hook(is_chief)
 
             class CoordHook(tf.train.SessionRunHook):
                 def after_create_session(self, session, coord):
-                    data_set.start_queue_threads(session, coord)
+                    print ('Starting queue runners...')
+                    self.threads = data_set.start_queue_threads(session, coord)
+                    print ('Queue runners started.')
+                def end(self, session):
+                    # Sending a 'done' token to each parameter server.
+                    for enqueue in done_enqueues:
+                        print ('Sending stop token to ps...')
+                        session.run(enqueue, feed_dict={ token_placeholder: task_index })
+                        print ('Sent stop token to ps.')
+
 
             # The StopAtStepHook handles stopping after running given steps.
-            hooks=[tf.train.StopAtStepHook(num_steps=epochs), CoordHook()]
-
+            hooks=[tf.train.StopAtStepHook(last_step=epochs), CoordHook(), sync_replicas_hook]
 
             # The MonitoredTrainingSession takes care of session initialization,
             # restoring from a checkpoint, saving to a checkpoint, and closing when done
             # or an error occurs.
             with tf.train.MonitoredTrainingSession(master=server.target,
-                                                   is_chief=(task_index == 0),
+                                                   is_chief=is_chief,
                                                    checkpoint_dir=checkpoint_dir,
                                                    hooks=hooks,
+                                                   save_checkpoint_secs=10,
                                                    config=session_config) as session:
-
-                session.run(init_op)
-
+                print ('Starting training...')
                 while not session.should_stop():
                     # Run a training step asynchronously.
                     results = calculate_loss_and_report(session,
@@ -908,3 +947,7 @@ if __name__ == "__main__":
 
                     # Print WER report
                     print_report('Training', results)
+
+                print ('Training stopped.')
+            print ('Session stopped.')
+    print ('Server stopped.')
