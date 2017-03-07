@@ -113,7 +113,7 @@ class DataSet(object):
                     self._x_length: source_len,
                     self._y: target,
                     self._y_length: target_len})
-            except tf.errors.CancelledError:
+            except (RuntimeError, tf.errors.CancelledError) as ex:
                 return
 
     def next_batch(self):
@@ -313,6 +313,7 @@ def _read_data_set(data_dir, extracted_data, data_set, thread_count, batch_size,
     # Obtain list of txt files
     txt_files = glob(path.join(stm_dir, "*.txt"))
     if limit > 0:
+        print ("Limiting DataSet to %d entries." % limit)
         txt_files = txt_files[:limit]
 
     # Return DataSet

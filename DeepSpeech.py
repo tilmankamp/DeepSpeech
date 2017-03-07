@@ -39,7 +39,6 @@ if do_fulltrace:
     check_cupti()
 
 
-
 # Cluster configuration
 # =====================
 
@@ -793,6 +792,8 @@ def calculate_loss_and_report(session, tower_results, feed_dict, total_batches, 
 
     batches_per_device = ceil(float(total_batches) / len(available_devices))
 
+    print ("Total batches: %4d, Batches per device: %4d, Available Devices: %4d" % (total_batches, batches_per_device, len(available_devices)))
+
     total_loss = 0.0
     params = OrderedDict()
     params['avg_loss'] = avg_loss
@@ -817,7 +818,12 @@ def calculate_loss_and_report(session, tower_results, feed_dict, total_batches, 
     # Loop over the batches
     for batch in range(int(batches_per_device)):
         if session.should_stop():
+            print ("Stepping out")
             break
+
+        sys.stdout.write(' %d' % task_index)
+        sys.stdout.flush()
+
         extra_params = { 'feed_dict': feed_dict }
 
         # Compute the batch
@@ -880,6 +886,10 @@ if __name__ == '__main__':
             # Read all data sets
             data_sets = read_data_sets()
 
+            # Calculate last step
+            last_step = epochs * data_sets.train.total_batches - 1
+            print ("Last step: %d" % last_step)
+
             # Get the data sets
             switchable_data_set = SwitchableDataSet(data_sets)
 
@@ -911,6 +921,7 @@ if __name__ == '__main__':
                     print ('Queue runners started.')
                 def end(self, session):
                     # Closing the data_set queues
+                    print ("Closing queues...")
                     switchable_data_set.close_queue(session)
                     # Sending a 'done' token to each parameter server.
                     for enqueue in done_enqueues:
@@ -920,7 +931,7 @@ if __name__ == '__main__':
 
 
             # The StopAtStepHook handles stopping after running given steps.
-            hooks=[tf.train.StopAtStepHook(last_step=epochs), CoordHook(), sync_replicas_hook]
+            hooks=[tf.train.StopAtStepHook(last_step=last_step), CoordHook(), sync_replicas_hook]
 
             # The MonitoredTrainingSession takes care of session initialization,
             # restoring from a checkpoint, saving to a checkpoint, and closing when done
@@ -933,7 +944,7 @@ if __name__ == '__main__':
                                                    config=session_config) as session:
                 print ('Starting training...')
                 while not session.should_stop():
-
+                    print ("Training starts...")
                     feed_dict = {}
                     switchable_data_set.set_data_set(feed_dict, data_sets.train)
 
@@ -943,23 +954,26 @@ if __name__ == '__main__':
                                                         feed_dict,
                                                         data_sets.train.total_batches,
                                                         train_op=apply_gradient_op,
-                                                        query_report=True)
+                                                        query_report=False)
 
                     # Print WER report
                     print_report('Training', results)
 
-                    feed_dict = {}
-                    switchable_data_set.set_data_set(feed_dict, data_sets.dev)
+                    if not session.should_stop():
+                        print ("Validation starts...")
+                        feed_dict = {}
+                        switchable_data_set.set_data_set(feed_dict, data_sets.dev)
 
-                    # Run one epoch
-                    results = calculate_loss_and_report(session,
-                                                        tower_results,
-                                                        feed_dict,
-                                                        data_sets.dev.total_batches,
-                                                        query_report=True)
+                        # Run one epoch
+                        results = calculate_loss_and_report(session,
+                                                            tower_results,
+                                                            feed_dict,
+                                                            data_sets.dev.total_batches,
+                                                            query_report=False)
 
-                    # Print WER report
-                    print_report('Validation', results)
+                        # Print WER report
+                        print_report('Validation', results)
+
 
                 print ('Training stopped.')
             print ('Session stopped.')
