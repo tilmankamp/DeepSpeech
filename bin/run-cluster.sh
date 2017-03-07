@@ -5,13 +5,13 @@ ps_count=1
 worker_count=2
 
 export ds_importer="ted"
-export ds_train_batch_size=48
-export ds_dev_batch_size=48
-export ds_test_batch_size=48
-export ds_limit_train=1000
-export ds_limit_dev=1000
-export ds_limit_test=1000
-export ds_epochs=50
+export ds_train_batch_size=8
+export ds_dev_batch_size=8
+export ds_test_batch_size=8
+export ds_limit_train=16
+export ds_limit_dev=16
+export ds_limit_test=16
+export ds_epochs=1
 
 # Generating the parameter server addresses
 index=0

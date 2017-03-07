@@ -773,81 +773,6 @@ def read_data_sets(set_names=['train', 'dev', 'test']):
                                              sets=set_names)
 
 
-def calculate_loss_and_report(session, tower_results, feed_dict, total_batches, train_op=None, query_report=False):
-    r"""
-    Now let's introduce the main routine for training and inference.
-    It takes a started execution context (given by ``execution_context``),
-    a ``Session`` (``session``), an optional epoch index (``epoch``)
-    and a flag (``query_report``) which indicates whether to calculate the WER
-    report data or not.
-    Its main duty is to iterate over all batches and calculate the mean loss.
-    If a non-negative epoch is provided, it will also optimize the parameters.
-    If ``query_report`` is ``False``, the default, it will return a tuple which
-    contains the mean loss.
-    If ``query_report`` is ``True``, the mean accuracy and individual results
-    are also included in the returned tuple.
-    """
-
-    results_params, _, avg_accuracy, avg_loss = tower_results
-
-    batches_per_device = ceil(float(total_batches) / len(available_devices))
-
-    print ("Total batches: %4d, Batches per device: %4d, Available Devices: %4d" % (total_batches, batches_per_device, len(available_devices)))
-
-    total_loss = 0.0
-    params = OrderedDict()
-    params['avg_loss'] = avg_loss
-
-    # Facilitate a train run
-    if not train_op is None:
-        params['train_op'] = train_op
-
-    # Requirements to display a WER report
-    if query_report:
-        # Reset accuracy
-        total_accuracy = 0.0
-        # Create report results tuple
-        report_results = ([],[],[],[])
-        # Extend the session.run parameters
-        params['sample_results'] = [results_params, avg_accuracy]
-
-    # Get the index of each of the session fetches so we can recover the results more easily
-    param_idx = dict(zip(params.keys(), range(len(params))))
-    params = params.values()
-
-    # Loop over the batches
-    for batch in range(int(batches_per_device)):
-        if session.should_stop():
-            print ("Stepping out")
-            break
-
-        sys.stdout.write(' %d' % task_index)
-        sys.stdout.flush()
-
-        extra_params = { 'feed_dict': feed_dict }
-
-        # Compute the batch
-        result = session.run(params, **extra_params)
-
-        # Add batch to loss
-        total_loss += result[param_idx['avg_loss']]
-
-        if query_report:
-            sample_results = result[param_idx['sample_results']]
-            # Collect individual sample results
-            collect_results(report_results, sample_results[0])
-            # Add batch to total_accuracy
-            total_accuracy += sample_results[1]
-
-    # Returning the batch set result tuple
-    loss = total_loss / batches_per_device
-    if query_report:
-        return (loss, total_accuracy / batches_per_device, report_results)
-    else:
-        return (loss, None, None)
-
-
-
 if __name__ == '__main__':
 
     # Create and start a server for the local task.
@@ -888,7 +813,6 @@ if __name__ == '__main__':
 
             # Calculate last step
             last_step = epochs * data_sets.train.total_batches - 1
-            print ("Last step: %d" % last_step)
 
             # Get the data sets
             switchable_data_set = SwitchableDataSet(data_sets)
@@ -903,7 +827,7 @@ if __name__ == '__main__':
 
             # Get the data_set specific graph end-points
             tower_results = get_tower_results(switchable_data_set, optimizer)
-            results, gradients, accuracy, loss = tower_results
+            results_tuple, gradients, accuracy, loss = tower_results
 
             # Average tower gradients across GPUs
             avg_tower_gradients = average_gradients(gradients)
@@ -914,12 +838,80 @@ if __name__ == '__main__':
             # Hook to handle initialization and queues for sync replicas.
             sync_replicas_hook = optimizer.make_session_run_hook(is_chief)
 
+            def calculate_loss_and_report(session, data_set, train_op=None, query_report=False):
+                r"""
+                A routine to iterate over all batches and calculate the mean loss.
+                If ``query_report`` is ``False``, the default, it will return a tuple which
+                contains the mean loss.
+                If ``query_report`` is ``True``, the mean accuracy and individual results
+                are also included in the returned tuple.
+                """
+
+                feed_dict = {}
+                switchable_data_set.set_data_set(feed_dict, data_set)
+
+                batches_per_device = ceil(float(data_set.total_batches) / len(available_devices))
+
+                total_loss = 0.0
+                params = OrderedDict()
+
+                params['loss'] = loss
+
+                # Facilitate a train run
+                if not train_op is None:
+                    params['train_op'] = train_op
+
+                # Requirements to display a WER report
+                if query_report:
+                    # Reset accuracy
+                    total_accuracy = 0.0
+                    # Create report results tuple
+                    report_results = ([],[],[],[])
+                    # Extend the session.run parameters
+                    params['sample_results'] = [results_tuple, accuracy]
+
+                # Get the index of each of the session fetches so we can recover the results more easily
+                param_idx = dict(zip(params.keys(), range(len(params))))
+                params = params.values()
+
+                # Loop over the batches
+                for batch in range(int(batches_per_device)):
+                    if "should_stop" in dir(session):
+                        if session.should_stop():
+                            break
+
+                    extra_params = { 'feed_dict': feed_dict }
+
+                    # Compute the batch
+                    result = session.run(params, **extra_params)
+
+                    # Add batch to loss
+                    total_loss += result[param_idx['loss']]
+
+                    if query_report:
+                        sample_results = result[param_idx['sample_results']]
+                        # Collect individual sample results
+                        collect_results(report_results, sample_results[0])
+                        # Add batch to total_accuracy
+                        total_accuracy += sample_results[1]
+
+                # Returning the batch set result tuple
+                avg_loss = total_loss / batches_per_device
+                if query_report:
+                    return (avg_loss, total_accuracy / batches_per_device, report_results)
+                else:
+                    return (avg_loss, None, None)
+
+
             class CoordHook(tf.train.SessionRunHook):
                 def after_create_session(self, session, coord):
                     print ('Starting queue runners...')
                     self.threads = switchable_data_set.start_queue_threads(session, coord)
                     print ('Queue runners started.')
                 def end(self, session):
+                    results = calculate_loss_and_report(session, data_sets.test, query_report=True)
+                    # Print Validation WER report
+                    print_report('Test', results)
                     # Closing the data_set queues
                     print ("Closing queues...")
                     switchable_data_set.close_queue(session)
@@ -942,36 +934,22 @@ if __name__ == '__main__':
                                                    hooks=hooks,
                                                    save_checkpoint_secs=10,
                                                    config=session_config) as session:
+
                 print ('Starting training...')
                 while not session.should_stop():
-                    print ("Training starts...")
-                    feed_dict = {}
-                    switchable_data_set.set_data_set(feed_dict, data_sets.train)
-
-                    # Run one epoch
+                    # Train for one epoch
                     results = calculate_loss_and_report(session,
-                                                        tower_results,
-                                                        feed_dict,
-                                                        data_sets.train.total_batches,
+                                                        data_sets.train,
                                                         train_op=apply_gradient_op,
                                                         query_report=False)
-
-                    # Print WER report
+                    # Print Training WER report
                     print_report('Training', results)
 
                     if not session.should_stop():
-                        print ("Validation starts...")
-                        feed_dict = {}
-                        switchable_data_set.set_data_set(feed_dict, data_sets.dev)
-
-                        # Run one epoch
                         results = calculate_loss_and_report(session,
-                                                            tower_results,
-                                                            feed_dict,
-                                                            data_sets.dev.total_batches,
+                                                            data_sets.dev,
                                                             query_report=False)
-
-                        # Print WER report
+                        # Print Validation WER report
                         print_report('Validation', results)
 
 
