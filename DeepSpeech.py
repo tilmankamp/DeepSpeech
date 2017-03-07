@@ -22,6 +22,7 @@ from util.log import merge_logs
 from util.spell import correction
 from util.shared_lib import check_cupti
 from util.text import sparse_tensor_value_to_texts, wer
+from util.data_set_helpers import SwitchableDataSet
 from xdg import BaseDirectory as xdg
 
 ds_importer = os.environ.get('ds_importer', 'ldc93s1')
@@ -756,7 +757,7 @@ def format_duration(duration):
 # The first returns a `DataSets` object of the selected importer, containing all available sets.
 # The latter takes the name of the required data set
 # (`'train'`, `'dev'` or `'test'`) as string and returns the respective set.
-def read_data_sets(set_names):
+def read_data_sets(set_names=['train', 'dev', 'test']):
     r"""
     Returns a :class:`DataSets` object of the selected importer, containing all available sets.
     """
@@ -772,20 +773,8 @@ def read_data_sets(set_names):
                                              limit_train=limit_train,
                                              sets=set_names)
 
-def read_data_set(set_name):
-    r"""
-    ``set_name``: string, the name of the required data set (``'train'``, ``'dev'`` or ``'test'``)
 
-    Returns the respective set.
-    """
-    # Obtain all the data sets
-    data_sets = read_data_sets([set_name])
-
-    # Pick the train, dev, or test data set from it
-    return getattr(data_sets, set_name)
-
-
-def calculate_loss_and_report(session, tower_results, train_op=None, query_report=False):
+def calculate_loss_and_report(session, tower_results, feed_dict, total_batches, train_op=None, query_report=False):
     r"""
     Now let's introduce the main routine for training and inference.
     It takes a started execution context (given by ``execution_context``),
@@ -802,7 +791,7 @@ def calculate_loss_and_report(session, tower_results, train_op=None, query_repor
 
     results_params, _, avg_accuracy, avg_loss = tower_results
 
-    batches_per_device = ceil(float(data_set.total_batches) / len(available_devices))
+    batches_per_device = ceil(float(total_batches) / len(available_devices))
 
     total_loss = 0.0
     params = OrderedDict()
@@ -829,7 +818,7 @@ def calculate_loss_and_report(session, tower_results, train_op=None, query_repor
     for batch in range(int(batches_per_device)):
         if session.should_stop():
             break
-        extra_params = { }
+        extra_params = { 'feed_dict': feed_dict }
 
         # Compute the batch
         result = session.run(params, **extra_params)
@@ -888,8 +877,11 @@ if __name__ == '__main__':
             # Create a variable to hold the global_step.
             global_step = tf.Variable(0, trainable=False, name='global_step')
 
-            # Get the required data set
-            data_set = read_data_set('train')
+            # Read all data sets
+            data_sets = read_data_sets()
+
+            # Get the data sets
+            switchable_data_set = SwitchableDataSet(data_sets)
 
             # Create the optimizer
             optimizer = create_optimizer()
@@ -900,7 +892,7 @@ if __name__ == '__main__':
                                                        total_num_replicas=len(worker_hosts))
 
             # Get the data_set specific graph end-points
-            tower_results = get_tower_results(data_set, optimizer)
+            tower_results = get_tower_results(switchable_data_set, optimizer)
             results, gradients, accuracy, loss = tower_results
 
             # Average tower gradients across GPUs
@@ -915,9 +907,11 @@ if __name__ == '__main__':
             class CoordHook(tf.train.SessionRunHook):
                 def after_create_session(self, session, coord):
                     print ('Starting queue runners...')
-                    self.threads = data_set.start_queue_threads(session, coord)
+                    self.threads = switchable_data_set.start_queue_threads(session, coord)
                     print ('Queue runners started.')
                 def end(self, session):
+                    # Closing the data_set queues
+                    switchable_data_set.close_queue(session)
                     # Sending a 'done' token to each parameter server.
                     for enqueue in done_enqueues:
                         print ('Sending stop token to ps...')
@@ -939,14 +933,33 @@ if __name__ == '__main__':
                                                    config=session_config) as session:
                 print ('Starting training...')
                 while not session.should_stop():
-                    # Run a training step asynchronously.
+
+                    feed_dict = {}
+                    switchable_data_set.set_data_set(feed_dict, data_sets.train)
+
+                    # Run one epoch
                     results = calculate_loss_and_report(session,
                                                         tower_results,
+                                                        feed_dict,
+                                                        data_sets.train.total_batches,
                                                         train_op=apply_gradient_op,
                                                         query_report=True)
 
                     # Print WER report
                     print_report('Training', results)
+
+                    feed_dict = {}
+                    switchable_data_set.set_data_set(feed_dict, data_sets.dev)
+
+                    # Run one epoch
+                    results = calculate_loss_and_report(session,
+                                                        tower_results,
+                                                        feed_dict,
+                                                        data_sets.dev.total_batches,
+                                                        query_report=True)
+
+                    # Print WER report
+                    print_report('Validation', results)
 
                 print ('Training stopped.')
             print ('Session stopped.')

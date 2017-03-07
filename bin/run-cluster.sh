@@ -4,11 +4,14 @@ PROGNAME=$(basename $0)
 ps_count=1
 worker_count=2
 
-export ds_importer="ldc93s1"
-export ds_train_batch_size=1
-export ds_dev_batch_size=1
-export ds_test_batch_size=1
-export ds_epochs=100
+export ds_importer="ted"
+export ds_train_batch_size=16
+export ds_dev_batch_size=16
+export ds_test_batch_size=16
+export ds_train_limit=16
+export ds_dev_limit=16
+export ds_test_limit=16
+export ds_epochs=10
 
 # Generating the parameter server addresses
 index=0
