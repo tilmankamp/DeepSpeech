@@ -13,7 +13,7 @@ import tensorflow as tf
 import time
 
 from collections import OrderedDict
-from math import ceil
+from math import ceil, floor
 from tensorflow.contrib.session_bundle import exporter
 from tensorflow.python.ops import ctc_ops
 from tensorflow.contrib.rnn.python.ops import core_rnn_cell
@@ -658,13 +658,13 @@ def calculate_and_print_wer_report(caption, results_tuple):
 
     return mean_wer
 
-def print_report(caption, batch_set_result):
+def print_report(caption, batch_set_result, no_wer=None):
     r"""
     This routine will print a report from a provided batch set result tuple.
     It takes a caption for titling the output plus the batch set result tuple.
     If the batch set result tuple contains accuracy and a report results tuple,
     a complete WER report will be calculated, printed and its mean WER returned.
-    Otherwise it will just print the loss and return ``None``.
+    Otherwise it will just print the loss and return ``no_wer``.
     """
     # Unpacking batch set result tuple
     loss, accuracy, results_tuple = batch_set_result
@@ -672,7 +672,7 @@ def print_report(caption, batch_set_result):
     # We always have a loss value
     title = caption + " loss=" + "{:.9f}".format(loss)
 
-    mean_wer = None
+    mean_wer = no_wer
     if accuracy is not None and results_tuple is not None:
         title += " avg_cer=" + "{:.9f}".format(accuracy)
         mean_wer = calculate_and_print_wer_report(title, results_tuple)
@@ -779,15 +779,23 @@ if __name__ == '__main__':
     server = tf.train.Server(cluster, job_name=job_name, task_index=task_index)
 
     # Queues that are used to gracefully stop parameter servers.
-    # Each queue stands for one ps. A finished worker sends a token to each queue.
+    # Each queue stands for one ps. A finishing worker sends a token to each queue befor joining/quitting.
     # Each ps will dequeue as many tokens as there are workers before joining/quitting.
     with tf.device('/job:ps/task:0'):
         done_queues = [tf.FIFOQueue(1, tf.int32, shared_name=('queue%i' % i)) for i, ps in enumerate(ps_hosts)]
+
+    # Placeholder to pass in the worker's index as token
     token_placeholder = tf.placeholder(tf.int32)
+
+    # Enqueue operations for each parameter server
     done_enqueues = [queue.enqueue(token_placeholder) for i, queue in enumerate(done_queues)]
+
+    # Dequeue operations for each parameter server
     done_dequeues = [queue.dequeue() for queue in done_queues]
 
     if job_name == 'ps':
+        # We are a parameter server and therefore we just wait for all workers to finish
+        # by waiting for their stop tokens.
         with tf.Session(server.target) as session:
             for worker in worker_hosts:
                 print ('Waiting for stop token...')
@@ -796,6 +804,7 @@ if __name__ == '__main__':
         print ('Session stopped.')
 
     elif job_name == 'worker':
+        # We are a worker and therefore we have to do some work.
 
         # Assigns ops to the local worker by default.
         with tf.device(tf.train.replica_device_setter(
@@ -806,13 +815,11 @@ if __name__ == '__main__':
             is_chief = (task_index == 0)
 
             # Create a variable to hold the global_step.
+            # It will automgically get incremented by the optimizer.
             global_step = tf.Variable(0, trainable=False, name='global_step')
 
             # Read all data sets
             data_sets = read_data_sets()
-
-            # Calculate last step
-            last_step = epochs * data_sets.train.total_batches - 1
 
             # Get the data sets
             switchable_data_set = SwitchableDataSet(data_sets)
@@ -832,34 +839,42 @@ if __name__ == '__main__':
             # Average tower gradients across GPUs
             avg_tower_gradients = average_gradients(gradients)
 
+            # Add variable summaries to log
+            log_grads_and_vars(avg_tower_gradients)
+
             # Apply gradients to modify the model
             apply_gradient_op = optimizer.apply_gradients(avg_tower_gradients, global_step=global_step)
 
             # Hook to handle initialization and queues for sync replicas.
             sync_replicas_hook = optimizer.make_session_run_hook(is_chief)
 
-            def calculate_loss_and_report(session, data_set, train_op=None, query_report=False):
-                r"""
-                A routine to iterate over all batches and calculate the mean loss.
-                If ``query_report`` is ``False``, the default, it will return a tuple which
-                contains the mean loss.
-                If ``query_report`` is ``True``, the mean accuracy and individual results
-                are also included in the returned tuple.
-                """
 
+            # It iterates over all batches ``data_set`` and
+            # calculate the mean loss using the provided ``session``.
+            # If ``train`` is set to ``True``, the data set will get trained.
+            # If ``query_report`` is set to ``True``, data for a WER report will be gathered.
+            # Returns batch set result tuple consisting of the current global step, the average loss, and,
+            # if WER report data should be gathered, the average accuracy and a report results tuple.
+            # During operation this method is using variables of the encapsulating Python context.
+            def run_batches(session, data_set, train=False, query_report=False):
+
+                # The feed_dict (mainly for switching between queues)
                 feed_dict = {}
+
+                # Sets the current data_set on SwitchableDataSet switchable_data_set
+                # and the respective placeholder in feed_dict
                 switchable_data_set.set_data_set(feed_dict, data_set)
 
+                print (feed_dict)
+
+                # The amount of batches per device (GPU) == ceiled number of loops in batch loop
                 batches_per_device = ceil(float(data_set.total_batches) / len(available_devices))
 
+                # Initialize loss aggregator
                 total_loss = 0.0
-                params = OrderedDict()
 
-                params['loss'] = loss
-
-                # Facilitate a train run
-                if not train_op is None:
-                    params['train_op'] = train_op
+                # Setting the training operation in case of training requested
+                train_op = apply_gradient_op if train else []
 
                 # Requirements to display a WER report
                 if query_report:
@@ -868,62 +883,79 @@ if __name__ == '__main__':
                     # Create report results tuple
                     report_results = ([],[],[],[])
                     # Extend the session.run parameters
-                    params['sample_results'] = [results_tuple, accuracy]
+                    report_params = [results_tuple, accuracy]
+                else:
+                    report_params = []
 
-                # Get the index of each of the session fetches so we can recover the results more easily
-                param_idx = dict(zip(params.keys(), range(len(params))))
-                params = params.values()
+                # So far the only extra parameter is the feed_dict
+                extra_params = { 'feed_dict': feed_dict }
 
                 # Loop over the batches
                 for batch in range(int(batches_per_device)):
-                    if "should_stop" in dir(session):
+                    # In case of the test set iteration from within the CoordHook,
+                    # the provided session is (for some reason) not
+                    # a MonitoredTrainingSession with a ``should_stop`` method.
+                    if 'should_stop' in dir(session):
                         if session.should_stop():
                             break
 
-                    extra_params = { 'feed_dict': feed_dict }
-
                     # Compute the batch
-                    result = session.run(params, **extra_params)
+                    _, current_step, batch_loss, batch_report = session.run([train_op, global_step, loss, report_params], **extra_params)
 
                     # Add batch to loss
-                    total_loss += result[param_idx['loss']]
+                    total_loss += batch_loss
 
                     if query_report:
-                        sample_results = result[param_idx['sample_results']]
                         # Collect individual sample results
-                        collect_results(report_results, sample_results[0])
+                        collect_results(report_results, batch_report[0])
                         # Add batch to total_accuracy
-                        total_accuracy += sample_results[1]
+                        total_accuracy += batch_report[1]
 
                 # Returning the batch set result tuple
                 avg_loss = total_loss / batches_per_device
                 if query_report:
-                    return (avg_loss, total_accuracy / batches_per_device, report_results)
+                    return current_step, (avg_loss, total_accuracy / batches_per_device, report_results)
                 else:
-                    return (avg_loss, None, None)
+                    return current_step, (avg_loss, None, None)
 
 
+            # Embedded coordination hook-class that will use variables of the
+            # surrounding Python context.
+            # It will start the importers queue threads after session creation.
+            # Before the session ends, it will evaluate the final test data set and
+            # send out this worker's stop token to all parameter servers.
             class CoordHook(tf.train.SessionRunHook):
                 def after_create_session(self, session, coord):
                     print ('Starting queue runners...')
                     self.threads = switchable_data_set.start_queue_threads(session, coord)
                     print ('Queue runners started.')
+
                 def end(self, session):
-                    results = calculate_loss_and_report(session, data_sets.test, query_report=True)
-                    # Print Validation WER report
-                    print_report('Test', results)
+                    # Iterate over test data set
+                    _, results = run_batches(session, data_sets.test, query_report=True)
+
+                    if is_chief:
+                        # Print Test WER report
+                        test_wer = print_report('Test', results)
+
                     # Closing the data_set queues
                     print ("Closing queues...")
                     switchable_data_set.close_queue(session)
-                    # Sending a 'done' token to each parameter server.
+
+                    # Sending our token (the task_index as a debug opportunity) to each parameter server.
                     for enqueue in done_enqueues:
                         print ('Sending stop token to ps...')
                         session.run(enqueue, feed_dict={ token_placeholder: task_index })
                         print ('Sent stop token to ps.')
 
 
+            # Calculate last step
+            last_step = epochs * data_sets.train.total_batches - 1
+
             # The StopAtStepHook handles stopping after running given steps.
-            hooks=[tf.train.StopAtStepHook(last_step=last_step), CoordHook(), sync_replicas_hook]
+            hooks = [tf.train.StopAtStepHook(last_step=last_step),
+                     CoordHook(),
+                     sync_replicas_hook]
 
             # The MonitoredTrainingSession takes care of session initialization,
             # restoring from a checkpoint, saving to a checkpoint, and closing when done
@@ -935,24 +967,68 @@ if __name__ == '__main__':
                                                    save_checkpoint_secs=10,
                                                    config=session_config) as session:
 
-                print ('Starting training...')
+                # Retrieving global_step from the (potentially restored) model
+                feed_dict = {}
+                switchable_data_set.set_data_set(feed_dict, data_sets.train)
+                step = session.run(global_step, feed_dict=feed_dict)
+
+                if is_chief:
+                    print "STARTING Optimization\n"
+                    global_time = stopwatch()
+                    global_train_time = 0
+
+                    # Init recent word error rate levels
+                    train_wer = 0.0
+                    dev_wer = 0.0
+
                 while not session.should_stop():
-                    # Train for one epoch
-                    results = calculate_loss_and_report(session,
-                                                        data_sets.train,
-                                                        train_op=apply_gradient_op,
-                                                        query_report=False)
-                    # Print Training WER report
-                    print_report('Training', results)
 
-                    if not session.should_stop():
-                        results = calculate_loss_and_report(session,
-                                                            data_sets.dev,
-                                                            query_report=False)
-                        # Print Validation WER report
-                        print_report('Validation', results)
+                    # Calculate the current epoch on base of global step
+                    epoch = int(floor(float(step) / float(data_sets.train.total_batches)))
 
+                    # Determine if we want to display and/or validate on this iteration/worker
+                    is_display_step = is_chief and display_step > 0 and ((epoch + 1) % display_step == 0 or epoch == epochs - 1)
+                    is_validation_step = validation_step > 0 and (epoch + 1) % validation_step == 0
 
-                print ('Training stopped.')
-            print ('Session stopped.')
+                    if is_chief:
+                        print "STARTING Epoch", '%04d' % (epoch)
+                        overall_time = stopwatch()
+                        train_time = 0
+
+                        # (Re)start training stopwatches
+                        global_train_time = stopwatch(global_train_time)
+                        train_time = stopwatch(train_time)
+
+                    # Train for one epoch, keep global step for next loop and report data
+                    step, results = run_batches(session, data_sets.train, train=True, query_report=is_display_step)
+
+                    if is_chief:
+                        # Stop training stopwatches
+                        global_train_time = stopwatch(global_train_time)
+                        train_time = stopwatch(train_time)
+
+                        # Print report and keep (potentially) calculated WER
+                        train_wer = print_report('Training', results, no_wer=train_wer)
+
+                    if is_validation_step and not session.should_stop():
+                        _, results = run_batches(session, data_sets.dev, query_report=True)
+                        # Print report and keep (potentially) calculated WER
+                        if is_chief:
+                            dev_wer = print_report('Validation', results, no_wer=dev_wer)
+
+                    if is_chief:
+                        overall_time = stopwatch(overall_time)
+                        print "FINISHED Epoch", '%04d' % (epoch),\
+                              "  Overall epoch time:", format_duration(overall_time),\
+                              "  Training time:", format_duration(train_time)
+                        print
+
+                if is_chief:
+                    # Indicate optimization has concluded
+                    print "FINISHED Optimization",\
+                        "  Overall time:", format_duration(stopwatch(global_time)),\
+                        "  Training time:", format_duration(global_train_time)
+                    print
+
+            print ('Session closed.')
     print ('Server stopped.')
