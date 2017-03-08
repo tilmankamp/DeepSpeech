@@ -81,6 +81,8 @@ class DataSet(object):
     def _populate_batch_queue(self, session):
         source, source_len, target, target_len = self._compute_source_target()
         while not self._coord.should_stop():
+            if self._coord.should_stop():
+                return
             try:
                 session.run(self._enqueue_op, feed_dict={
                     self._x: source,

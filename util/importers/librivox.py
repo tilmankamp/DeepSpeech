@@ -105,7 +105,7 @@ class DataSet(object):
                     self._x_length: source_len,
                     self._y: target,
                     self._y_length: target_len})
-            except tf.errors.CancelledError:
+            except (RuntimeError, tf.errors.CancelledError):
                 return
 
     def next_batch(self):

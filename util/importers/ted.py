@@ -100,7 +100,7 @@ class DataSet(object):
     def _populate_batch_queue(self, session):
         for txt_file, wav_file in self._files_circular_list:
             if self._coord.should_stop():
-              return
+                return
             source = audiofile_to_input_vector(wav_file, self._numcep, self._numcontext)
             source_len = len(source)
             with codecs.open(txt_file, encoding="utf-8") as open_txt_file:
@@ -113,7 +113,7 @@ class DataSet(object):
                     self._x_length: source_len,
                     self._y: target,
                     self._y_length: target_len})
-            except (RuntimeError, tf.errors.CancelledError) as ex:
+            except (RuntimeError, tf.errors.CancelledError):
                 return
 
     def next_batch(self):
@@ -313,7 +313,6 @@ def _read_data_set(data_dir, extracted_data, data_set, thread_count, batch_size,
     # Obtain list of txt files
     txt_files = glob(path.join(stm_dir, "*.txt"))
     if limit > 0:
-        print ("Limiting DataSet to %d entries." % limit)
         txt_files = txt_files[:limit]
 
     # Return DataSet
