@@ -116,7 +116,7 @@ class DataSet(object):
         return int(ceil(float(len(self._txt_files)) / float(self._batch_size)))
 
 
-def read_data_sets(data_dir, train_batch_size, dev_batch_size, test_batch_size, numcep, numcontext, thread_count=8, limit_dev=0, limit_test=0, limit_train=0, sets=[]):
+def read_data_sets(data_dir, train_batch_size, dev_batch_size, test_batch_size, numcep, numcontext, thread_count=8, stride=1, offset=0, limit_dev=0, limit_test=0, limit_train=0, sets=[]):
     data_dir = os.path.join(data_dir, "LDC97S62")
 
     # Conditionally convert swb sph data to wav
@@ -144,19 +144,19 @@ def read_data_sets(data_dir, train_batch_size, dev_batch_size, test_batch_size, 
     dev = None
     if "dev" in sets:
         dev = _read_data_set(data_dir, "final_sets/dev", thread_count, dev_batch_size, numcep,
-                             numcontext, limit_dev)
+                             numcontext, stride=stride, offset=offset, limit=limit_dev)
 
     # Create test DataSet
     test = None
     if "test" in sets:
         test = _read_data_set(data_dir, "final_sets/test", thread_count, test_batch_size, numcep,
-                             numcontext, limit_test)
+                             numcontext, stride=stride, offset=offset, limit=limit_test)
 
     # Create train DataSet
     train = None
     if "train" in sets:
         train = _read_data_set(data_dir, "final_sets/train", thread_count, train_batch_size, numcep,
-                             numcontext, limit_train)
+                             numcontext, stride=stride, offset=offset, limit=limit_train)
 
     # Return DataSets
     return DataSets(train, dev, test)
@@ -356,11 +356,12 @@ def _maybe_split_dataset(filelist, target_dir):
             os.rename(wav_file, new_wav_file)
 
 
-def _read_data_set(work_dir, data_set, thread_count, batch_size, numcep, numcontext, limit=0):
+def _read_data_set(work_dir, data_set, thread_count, batch_size, numcep, numcontext, stride=1, offset=0, limit=0):
     # Obtain list of txt files
     txt_files = glob(os.path.join(work_dir, data_set, "*.txt"))
     if limit > 0:
         txt_files = txt_files[:limit]
+    txt_files = txt_files[offset::stride]
 
     # Return DataSet
     return DataSet(txt_files, thread_count, batch_size, numcep, numcontext)

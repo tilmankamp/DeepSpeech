@@ -119,7 +119,7 @@ class DataSet(object):
         return int(ceil(float(len(self._txt_files)) /float(self._batch_size)))
 
 
-def read_data_sets(data_dir, train_batch_size, dev_batch_size, test_batch_size, numcep, numcontext, thread_count=8, limit_dev=0, limit_test=0, limit_train=0, sets=[]):
+def read_data_sets(data_dir, train_batch_size, dev_batch_size, test_batch_size, numcep, numcontext, thread_count=8, stride=1, offset=0, limit_dev=0, limit_test=0, limit_train=0, sets=[]):
     # Check if we can convert FLAC with SoX before we start
     sox_help_out = subprocess.check_output(["sox", "-h"])
     if sox_help_out.find("flac") == -1:
@@ -197,17 +197,17 @@ def read_data_sets(data_dir, train_batch_size, dev_batch_size, test_batch_size, 
     # Create train DataSet from all the train archives
     train = None
     if "train" in sets:
-        train = _read_data_set(work_dir, "train-*-wav", thread_count, train_batch_size, numcep, numcontext, limit=limit_train)
+        train = _read_data_set(work_dir, "train-*-wav", thread_count, train_batch_size, numcep, numcontext, stride=stride, offset=offset, limit=limit_train)
 
     # Create dev DataSet from all the dev archives
     dev = None
     if "dev" in sets:
-        dev = _read_data_set(work_dir, "dev-*-wav", thread_count, dev_batch_size, numcep, numcontext, limit=limit_dev)
+        dev = _read_data_set(work_dir, "dev-*-wav", thread_count, dev_batch_size, numcep, numcontext, stride=stride, offset=offset, limit=limit_dev)
 
     # Create test DataSet from all the test archives
     test = None
     if "test" in sets:
-        test = _read_data_set(work_dir, "test-*-wav", thread_count, test_batch_size, numcep, numcontext, limit=limit_test)
+        test = _read_data_set(work_dir, "test-*-wav", thread_count, test_batch_size, numcep, numcontext, stride=stride, offset=offset, limit=limit_test)
 
     # Return DataSets
     return DataSets(train, dev, test)
@@ -265,7 +265,7 @@ def _maybe_split_transcriptions(extracted_dir, data_set, dest_dir):
                         fout.write(line[first_space+1:].lower().strip("\n"))
             os.remove(trans_filename)
 
-def _read_data_set(work_dir, data_set, thread_count, batch_size, numcep, numcontext, limit=0):
+def _read_data_set(work_dir, data_set, thread_count, batch_size, numcep, numcontext, stride=1, offset=0, limit=0):
     # Create data set dir
     dataset_dir = os.path.join(work_dir, data_set)
 
@@ -273,6 +273,7 @@ def _read_data_set(work_dir, data_set, thread_count, batch_size, numcep, numcont
     txt_files = glob(os.path.join(dataset_dir, "*.txt"))
     if limit > 0:
         txt_files = txt_files[:limit]
+    txt_files = txt_files[offset::stride]
 
     # Return DataSet
     return DataSet(txt_files, thread_count, batch_size, numcep, numcontext)
