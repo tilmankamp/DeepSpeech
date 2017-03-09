@@ -748,6 +748,10 @@ def format_duration(duration):
 # Execution
 # =========
 
+# Calculates the epoch from a given global ``step``
+def get_epoch_from_step(step):
+    return int(ceil(float(step) * len(available_devices) * len(worker_hosts) / float(data_sets.train.total_batches)))
+
 
 # To run our different graphs in separate sessions,
 # we first need to create some common infrastructure.
@@ -767,6 +771,8 @@ def read_data_sets(set_names=['train', 'dev', 'test']):
                                              test_batch_size,
                                              n_input,
                                              n_context,
+                                             stride=len(worker_hosts),
+                                             offset=task_index,
                                              limit_dev=limit_dev,
                                              limit_test=limit_test,
                                              limit_train=limit_train,
@@ -801,7 +807,7 @@ if __name__ == '__main__':
                 print ('Waiting for stop token...')
                 token = session.run(done_dequeues[task_index])
                 print ('Got a stop token from worker %i' %token)
-        print ('Session stopped.')
+        print ('Session closed.')
 
     elif job_name == 'worker':
         # We are a worker and therefore we have to do some work.
@@ -865,8 +871,6 @@ if __name__ == '__main__':
                 # and the respective placeholder in feed_dict
                 switchable_data_set.set_data_set(feed_dict, data_set)
 
-                print (feed_dict)
-
                 # The amount of batches per device (GPU) == ceiled number of loops in batch loop
                 batches_per_device = ceil(float(data_set.total_batches) / len(available_devices))
 
@@ -901,6 +905,8 @@ if __name__ == '__main__':
 
                     # Compute the batch
                     _, current_step, batch_loss, batch_report = session.run([train_op, global_step, loss, report_params], **extra_params)
+
+                    print ('Batch step %d' % current_step)
 
                     # Add batch to loss
                     total_loss += batch_loss
@@ -967,11 +973,6 @@ if __name__ == '__main__':
                                                    save_checkpoint_secs=10,
                                                    config=session_config) as session:
 
-                # Retrieving global_step from the (potentially restored) model
-                feed_dict = {}
-                switchable_data_set.set_data_set(feed_dict, data_sets.train)
-                step = session.run(global_step, feed_dict=feed_dict)
-
                 if is_chief:
                     print "STARTING Optimization\n"
                     global_time = stopwatch()
@@ -981,26 +982,37 @@ if __name__ == '__main__':
                     train_wer = 0.0
                     dev_wer = 0.0
 
+                # Retrieving global_step from the (potentially restored) model
+                feed_dict = {}
+                switchable_data_set.set_data_set(feed_dict, data_sets.train)
+                step = session.run(global_step, feed_dict=feed_dict)
+                epoch = get_epoch_from_step(step)
+                last_epoch = -1
+
                 while not session.should_stop():
 
-                    # Calculate the current epoch on base of global step
-                    epoch = int(floor(float(step) / float(data_sets.train.total_batches)))
-
-                    # Determine if we want to display and/or validate on this iteration/worker
-                    is_display_step = is_chief and display_step > 0 and ((epoch + 1) % display_step == 0 or epoch == epochs - 1)
-                    is_validation_step = validation_step > 0 and (epoch + 1) % validation_step == 0
-
                     if is_chief:
-                        print "STARTING Epoch", '%04d' % (epoch)
-                        overall_time = stopwatch()
-                        train_time = 0
+                        if epoch > last_epoch:
+                            print "STARTING Epoch", '%04d' % (epoch)
+                            overall_time = stopwatch()
+                            train_time = 0
 
                         # (Re)start training stopwatches
                         global_train_time = stopwatch(global_train_time)
                         train_time = stopwatch(train_time)
 
+                    # As the entry check is done, we can now make the last one the current one.
+                    last_epoch = epoch
+
+                    # Determine if we want to display and/or validate on this iteration/worker
+                    is_display_step = is_chief and display_step > 0 and ((epoch + 1) % display_step == 0 or epoch == epochs - 1)
+                    is_validation_step = validation_step > 0 and (epoch + 1) % validation_step == 0
+
                     # Train for one epoch, keep global step for next loop and report data
                     step, results = run_batches(session, data_sets.train, train=True, query_report=is_display_step)
+
+                    # Calculate (potentially next) epoch on base of global step
+                    epoch = get_epoch_from_step(step)
 
                     if is_chief:
                         # Stop training stopwatches
@@ -1016,9 +1028,10 @@ if __name__ == '__main__':
                         if is_chief:
                             dev_wer = print_report('Validation', results, no_wer=dev_wer)
 
-                    if is_chief:
+                    if is_chief and epoch > last_epoch:
+                        # Finishing last epoch
                         overall_time = stopwatch(overall_time)
-                        print "FINISHED Epoch", '%04d' % (epoch),\
+                        print "FINISHED Epoch", '%04d' % (last_epoch),\
                               "  Overall epoch time:", format_duration(overall_time),\
                               "  Training time:", format_duration(train_time)
                         print
@@ -1026,8 +1039,8 @@ if __name__ == '__main__':
                 if is_chief:
                     # Indicate optimization has concluded
                     print "FINISHED Optimization",\
-                        "  Overall time:", format_duration(stopwatch(global_time)),\
-                        "  Training time:", format_duration(global_train_time)
+                          "  Overall time:", format_duration(stopwatch(global_time)),\
+                          "  Training time:", format_duration(global_train_time)
                     print
 
             print ('Session closed.')
