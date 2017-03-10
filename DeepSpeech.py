@@ -43,13 +43,13 @@ if do_fulltrace:
 # =====================
 
 # Comma separated list of hostname:port pairs
-ps_hosts = os.environ.get('ds_ps_hosts', 'localhost:2223').split(",")
+ps_hosts = filter(len, os.environ.get('ds_ps_hosts', '').split(","))
 
 # Comma separated list of hostname:port pairs
-worker_hosts = os.environ.get('ds_worker_hosts', 'localhost:2222').split(",")
+worker_hosts = filter(len, os.environ.get('ds_worker_hosts', '').split(","))
 
 # One of 'ps', 'worker', if cluster operation is desired. '' for single operation.
-job_name = os.environ.get('ds_job_name', 'worker')
+job_name = os.environ.get('ds_job_name', 'localhost')
 
 # Index of task within the job - worker with index 0 will be the chief
 task_index = int(os.environ.get('ds_task_index', 0))
@@ -244,10 +244,13 @@ def variable_on_cpu(name, shape, initializer):
     However, before we do so we must introduce a utility function ``variable_on_cpu()``
     used to create a variable in CPU memory.
     """
-    # Use the /cpu:0 device for scoped operations
-    with tf.device(tf.train.replica_device_setter(
-                   worker_device=worker_device,
-                   cluster=cluster)):
+    # Use the /cpu:0 device on worker_device for scoped operations
+    if len(ps_hosts) == 0:
+        device = worker_device
+    else:
+        device = tf.train.replica_device_setter(worker_device=worker_device, cluster=cluster)
+
+    with tf.device(device):
         # Create or get apropos variable
         var = tf.get_variable(name=name, shape=shape, initializer=initializer)
     return var
@@ -482,9 +485,11 @@ def get_tower_results(batch_set, optimizer):
         # Loop over available_devices
         for i in xrange(len(available_devices)):
             # Execute operations of tower i on device i
-            with tf.device(tf.train.replica_device_setter(
-                           worker_device=available_devices[i],
-                           cluster=cluster)):
+            if len(ps_hosts) == 0:
+                device = available_devices[i]
+            else:
+                device = tf.train.replica_device_setter(worker_device=available_devices[i], cluster=cluster)
+            with tf.device(device):
                 # Create a scope for all operations of tower i
                 with tf.name_scope('tower_%d' % i) as scope:
                     # Calculate the avg_loss and accuracy and retrieve the decoded
@@ -748,11 +753,6 @@ def format_duration(duration):
 # Execution
 # =========
 
-# Calculates the epoch from a given global ``step``
-def get_epoch_from_step(step):
-    return int(ceil(float(step) * len(available_devices) * len(worker_hosts) / float(data_sets.train.total_batches)))
-
-
 # To run our different graphs in separate sessions,
 # we first need to create some common infrastructure.
 #
@@ -771,24 +771,259 @@ def read_data_sets(set_names=['train', 'dev', 'test']):
                                              test_batch_size,
                                              n_input,
                                              n_context,
-                                             stride=len(worker_hosts),
+                                             stride=max(1, len(worker_hosts)),
                                              offset=task_index,
                                              limit_dev=limit_dev,
                                              limit_test=limit_test,
                                              limit_train=limit_train,
                                              sets=set_names)
 
+def train(server=None):
+    # Determine, if we are the chief worker
+    is_chief = (task_index == 0)
+
+    # Create a variable to hold the global_step.
+    # It will automgically get incremented by the optimizer.
+    global_step = tf.Variable(0, trainable=False, name='global_step')
+
+    # Read all data sets
+    data_sets = read_data_sets()
+
+    # Calculates the epoch from a given global ``step``
+    def get_epoch_from_step(step):
+        # Uncomment the next line for debugging distributed TF
+        # print ('step: %d, devices: %d, tau: %d, batches: %d' % (step, len(available_devices), 3, data_sets.train.total_batches))
+        return int(ceil(float(step * len(available_devices) * 3) / float(data_sets.train.total_batches)))
+
+    # Get the data sets
+    switchable_data_set = SwitchableDataSet(data_sets)
+
+    # Create the optimizer
+    optimizer = create_optimizer()
+
+    # Synchronous training
+    if not server is None:
+        optimizer = tf.train.SyncReplicasOptimizer(optimizer,
+                                                   replicas_to_aggregate=3*len(worker_hosts),
+                                                   total_num_replicas=3*len(worker_hosts))
+
+    # Get the data_set specific graph end-points
+    tower_results = get_tower_results(switchable_data_set, optimizer)
+    results_tuple, gradients, accuracy, loss = tower_results
+
+    # Average tower gradients across GPUs
+    avg_tower_gradients = average_gradients(gradients)
+
+    # Add variable summaries to log
+    log_grads_and_vars(avg_tower_gradients)
+
+    # Apply gradients to modify the model
+    apply_gradient_op = optimizer.apply_gradients(avg_tower_gradients, global_step=global_step)
+
+
+    # It iterates over all batches ``data_set`` and
+    # calculate the mean loss using the provided ``session``.
+    # If ``train`` is set to ``True``, the data set will get trained.
+    # If ``query_report`` is set to ``True``, data for a WER report will be gathered.
+    # Returns batch set result tuple consisting of the current global step, the average loss, and,
+    # if WER report data should be gathered, the average accuracy and a report results tuple.
+    # During operation this method is using variables of the encapsulating Python context.
+    def run_batches(session, data_set, train=False, query_report=False):
+
+        # The feed_dict (mainly for switching between queues)
+        feed_dict = {}
+
+        # Sets the current data_set on SwitchableDataSet switchable_data_set
+        # and the respective placeholder in feed_dict
+        switchable_data_set.set_data_set(feed_dict, data_set)
+
+        # The amount of batches per device (GPU) == ceiled number of loops in batch loop
+        batches_per_device = ceil(float(data_set.total_batches) / len(available_devices))
+
+        # Initialize loss aggregator
+        total_loss = 0.0
+
+        # Setting the training operation in case of training requested
+        train_op = apply_gradient_op if train else []
+
+        # Requirements to display a WER report
+        if query_report:
+            # Reset accuracy
+            total_accuracy = 0.0
+            # Create report results tuple
+            report_results = ([],[],[],[])
+            # Extend the session.run parameters
+            report_params = [results_tuple, accuracy]
+        else:
+            report_params = []
+
+        # So far the only extra parameter is the feed_dict
+        extra_params = { 'feed_dict': feed_dict }
+
+        # Loop over the batches
+        for batch in range(int(batches_per_device)):
+            # In case of the test set iteration from within the CoordHook,
+            # the provided session is (for some reason) not
+            # a MonitoredTrainingSession with a ``should_stop`` method.
+            if 'should_stop' in dir(session):
+                if session.should_stop():
+                    break
+
+            # Compute the batch
+            _, current_step, batch_loss, batch_report = session.run([train_op, global_step, loss, report_params], **extra_params)
+
+            # Uncomment the next line for debugging race conditions / distributed TF
+            # print ('Batch step %d' % current_step)
+
+            # Add batch to loss
+            total_loss += batch_loss
+
+            if query_report:
+                # Collect individual sample results
+                collect_results(report_results, batch_report[0])
+                # Add batch to total_accuracy
+                total_accuracy += batch_report[1]
+
+        # Returning the batch set result tuple
+        avg_loss = total_loss / batches_per_device
+        if query_report:
+            return current_step, (avg_loss, total_accuracy / batches_per_device, report_results)
+        else:
+            return current_step, (avg_loss, None, None)
+
+
+    # Embedded coordination hook-class that will use variables of the
+    # surrounding Python context.
+    # It will start the importers queue threads after session creation.
+    # Before the session ends, it will evaluate the final test data set and
+    # send out this worker's stop token to all parameter servers.
+    class CoordHook(tf.train.SessionRunHook):
+        def after_create_session(self, session, coord):
+            print ('Starting queue runners...')
+            self.threads = switchable_data_set.start_queue_threads(session, coord)
+            print ('Queue runners started.')
+
+        def end(self, session):
+            # Iterate over test data set
+            _, results = run_batches(session, data_sets.test, query_report=True)
+
+            if is_chief:
+                # Print Test WER report
+                test_wer = print_report('Test', results)
+
+            # Closing the data_set queues
+            print ("Closing queues...")
+            switchable_data_set.close_queue(session)
+
+            # Sending our token (the task_index as a debug opportunity) to each parameter server.
+            for enqueue in done_enqueues:
+                print ('Sending stop token to ps...')
+                session.run(enqueue, feed_dict={ token_placeholder: task_index })
+                print ('Sent stop token to ps.')
+
+
+    # Calculate last step
+    last_step = epochs * data_sets.train.total_batches - 1
+
+    # The StopAtStepHook handles stopping after running given steps.
+    hooks = [tf.train.StopAtStepHook(last_step=last_step),
+             CoordHook()]
+
+    # Hook to handle initialization and queues for sync replicas.
+    if not server is None:
+        hooks.append(optimizer.make_session_run_hook(is_chief))
+
+    # The MonitoredTrainingSession takes care of session initialization,
+    # restoring from a checkpoint, saving to a checkpoint, and closing when done
+    # or an error occurs.
+    with tf.train.MonitoredTrainingSession(master='' if server is None else server.target,
+                                           is_chief=is_chief,
+                                           checkpoint_dir=checkpoint_dir,
+                                           hooks=hooks,
+                                           save_checkpoint_secs=10,
+                                           config=session_config) as session:
+
+        if is_chief:
+            print "STARTING Optimization\n"
+            global_time = stopwatch()
+            global_train_time = 0
+
+            # Init recent word error rate levels
+            train_wer = 0.0
+            dev_wer = 0.0
+
+        # Retrieving global_step from the (potentially restored) model
+        feed_dict = {}
+        switchable_data_set.set_data_set(feed_dict, data_sets.train)
+        step = session.run(global_step, feed_dict=feed_dict)
+        epoch = get_epoch_from_step(step)
+
+        while not session.should_stop():
+
+            if is_chief:
+                print "STARTING Epoch", '%04d' % (epoch)
+                overall_time = stopwatch()
+                train_time = 0
+
+                # (Re)start training stopwatches
+                global_train_time = stopwatch(global_train_time)
+                train_time = stopwatch(train_time)
+
+            # As the entry check is done, we can now make the last one the current one.
+            last_epoch = epoch
+
+            # Determine if we want to display and/or validate on this iteration/worker
+            is_display_step = is_chief and display_step > 0 and ((epoch + 1) % display_step == 0 or epoch == epochs - 1)
+            is_validation_step = validation_step > 0 and (epoch + 1) % validation_step == 0
+
+            # Train for one epoch, keep global step for next loop and report data
+            step, results = run_batches(session, data_sets.train, train=True, query_report=is_display_step)
+
+            # Calculate (potentially next) epoch on base of global step
+            last_epoch = epoch
+            epoch = get_epoch_from_step(step)
+
+            if is_chief:
+                # Stop training stopwatches
+                global_train_time = stopwatch(global_train_time)
+                train_time = stopwatch(train_time)
+
+                # Print report and keep (potentially) calculated WER
+                train_wer = print_report('Training', results, no_wer=train_wer)
+
+            if is_validation_step and not session.should_stop():
+                _, results = run_batches(session, data_sets.dev, query_report=True)
+                # Print report and keep (potentially) calculated WER
+                if is_chief:
+                    dev_wer = print_report('Validation', results, no_wer=dev_wer)
+
+            if is_chief:
+                # Finishing last epoch
+                overall_time = stopwatch(overall_time)
+                print "FINISHED Epoch", '%04d' % (last_epoch),\
+                      "  Overall epoch time:", format_duration(overall_time),\
+                      "  Training time:", format_duration(train_time)
+                print
+
+        if is_chief:
+            # Indicate optimization has concluded
+            print "FINISHED Optimization",\
+                  "  Overall time:", format_duration(stopwatch(global_time)),\
+                  "  Training time:", format_duration(global_train_time)
+            print
+
+    print ('Session closed.')
+
 
 if __name__ == '__main__':
-
-    # Create and start a server for the local task.
-    server = tf.train.Server(cluster, job_name=job_name, task_index=task_index)
 
     # Queues that are used to gracefully stop parameter servers.
     # Each queue stands for one ps. A finishing worker sends a token to each queue befor joining/quitting.
     # Each ps will dequeue as many tokens as there are workers before joining/quitting.
-    with tf.device('/job:ps/task:0'):
-        done_queues = [tf.FIFOQueue(1, tf.int32, shared_name=('queue%i' % i)) for i, ps in enumerate(ps_hosts)]
+    done_queues = []
+    for i, ps in enumerate(ps_hosts):
+        with tf.device('/job:ps/task:%d' % i):
+            done_queues.append(tf.FIFOQueue(1, tf.int32, shared_name=('queue%i' % i)))
 
     # Placeholder to pass in the worker's index as token
     token_placeholder = tf.placeholder(tf.int32)
@@ -799,249 +1034,32 @@ if __name__ == '__main__':
     # Dequeue operations for each parameter server
     done_dequeues = [queue.dequeue() for queue in done_queues]
 
-    if job_name == 'ps':
-        # We are a parameter server and therefore we just wait for all workers to finish
-        # by waiting for their stop tokens.
-        with tf.Session(server.target) as session:
-            for worker in worker_hosts:
-                print ('Waiting for stop token...')
-                token = session.run(done_dequeues[task_index])
-                print ('Got a stop token from worker %i' %token)
-        print ('Session closed.')
+    if len(worker_hosts) == 0 and len(ps_hosts) == 0:
+        # Only one local task (this process)
+        train()
+    else:
+        # Create and start a server for the local task.
+        server = tf.train.Server(cluster, job_name=job_name, task_index=task_index)
 
-    elif job_name == 'worker':
-        # We are a worker and therefore we have to do some work.
-
-        # Assigns ops to the local worker by default.
-        with tf.device(tf.train.replica_device_setter(
-                       worker_device=worker_device,
-                       cluster=cluster)):
-
-            # Determine, if we are the chief worker
-            is_chief = (task_index == 0)
-
-            # Create a variable to hold the global_step.
-            # It will automgically get incremented by the optimizer.
-            global_step = tf.Variable(0, trainable=False, name='global_step')
-
-            # Read all data sets
-            data_sets = read_data_sets()
-
-            # Get the data sets
-            switchable_data_set = SwitchableDataSet(data_sets)
-
-            # Create the optimizer
-            optimizer = create_optimizer()
-
-            # Synchronous training
-            optimizer = tf.train.SyncReplicasOptimizer(optimizer,
-                                                       replicas_to_aggregate=len(worker_hosts),
-                                                       total_num_replicas=len(worker_hosts))
-
-            # Get the data_set specific graph end-points
-            tower_results = get_tower_results(switchable_data_set, optimizer)
-            results_tuple, gradients, accuracy, loss = tower_results
-
-            # Average tower gradients across GPUs
-            avg_tower_gradients = average_gradients(gradients)
-
-            # Add variable summaries to log
-            log_grads_and_vars(avg_tower_gradients)
-
-            # Apply gradients to modify the model
-            apply_gradient_op = optimizer.apply_gradients(avg_tower_gradients, global_step=global_step)
-
-            # Hook to handle initialization and queues for sync replicas.
-            sync_replicas_hook = optimizer.make_session_run_hook(is_chief)
-
-
-            # It iterates over all batches ``data_set`` and
-            # calculate the mean loss using the provided ``session``.
-            # If ``train`` is set to ``True``, the data set will get trained.
-            # If ``query_report`` is set to ``True``, data for a WER report will be gathered.
-            # Returns batch set result tuple consisting of the current global step, the average loss, and,
-            # if WER report data should be gathered, the average accuracy and a report results tuple.
-            # During operation this method is using variables of the encapsulating Python context.
-            def run_batches(session, data_set, train=False, query_report=False):
-
-                # The feed_dict (mainly for switching between queues)
-                feed_dict = {}
-
-                # Sets the current data_set on SwitchableDataSet switchable_data_set
-                # and the respective placeholder in feed_dict
-                switchable_data_set.set_data_set(feed_dict, data_set)
-
-                # The amount of batches per device (GPU) == ceiled number of loops in batch loop
-                batches_per_device = ceil(float(data_set.total_batches) / len(available_devices))
-
-                # Initialize loss aggregator
-                total_loss = 0.0
-
-                # Setting the training operation in case of training requested
-                train_op = apply_gradient_op if train else []
-
-                # Requirements to display a WER report
-                if query_report:
-                    # Reset accuracy
-                    total_accuracy = 0.0
-                    # Create report results tuple
-                    report_results = ([],[],[],[])
-                    # Extend the session.run parameters
-                    report_params = [results_tuple, accuracy]
-                else:
-                    report_params = []
-
-                # So far the only extra parameter is the feed_dict
-                extra_params = { 'feed_dict': feed_dict }
-
-                # Loop over the batches
-                for batch in range(int(batches_per_device)):
-                    # In case of the test set iteration from within the CoordHook,
-                    # the provided session is (for some reason) not
-                    # a MonitoredTrainingSession with a ``should_stop`` method.
-                    if 'should_stop' in dir(session):
-                        if session.should_stop():
-                            break
-
-                    # Compute the batch
-                    _, current_step, batch_loss, batch_report = session.run([train_op, global_step, loss, report_params], **extra_params)
-
-                    print ('Batch step %d' % current_step)
-
-                    # Add batch to loss
-                    total_loss += batch_loss
-
-                    if query_report:
-                        # Collect individual sample results
-                        collect_results(report_results, batch_report[0])
-                        # Add batch to total_accuracy
-                        total_accuracy += batch_report[1]
-
-                # Returning the batch set result tuple
-                avg_loss = total_loss / batches_per_device
-                if query_report:
-                    return current_step, (avg_loss, total_accuracy / batches_per_device, report_results)
-                else:
-                    return current_step, (avg_loss, None, None)
-
-
-            # Embedded coordination hook-class that will use variables of the
-            # surrounding Python context.
-            # It will start the importers queue threads after session creation.
-            # Before the session ends, it will evaluate the final test data set and
-            # send out this worker's stop token to all parameter servers.
-            class CoordHook(tf.train.SessionRunHook):
-                def after_create_session(self, session, coord):
-                    print ('Starting queue runners...')
-                    self.threads = switchable_data_set.start_queue_threads(session, coord)
-                    print ('Queue runners started.')
-
-                def end(self, session):
-                    # Iterate over test data set
-                    _, results = run_batches(session, data_sets.test, query_report=True)
-
-                    if is_chief:
-                        # Print Test WER report
-                        test_wer = print_report('Test', results)
-
-                    # Closing the data_set queues
-                    print ("Closing queues...")
-                    switchable_data_set.close_queue(session)
-
-                    # Sending our token (the task_index as a debug opportunity) to each parameter server.
-                    for enqueue in done_enqueues:
-                        print ('Sending stop token to ps...')
-                        session.run(enqueue, feed_dict={ token_placeholder: task_index })
-                        print ('Sent stop token to ps.')
-
-
-            # Calculate last step
-            last_step = epochs * data_sets.train.total_batches - 1
-
-            # The StopAtStepHook handles stopping after running given steps.
-            hooks = [tf.train.StopAtStepHook(last_step=last_step),
-                     CoordHook(),
-                     sync_replicas_hook]
-
-            # The MonitoredTrainingSession takes care of session initialization,
-            # restoring from a checkpoint, saving to a checkpoint, and closing when done
-            # or an error occurs.
-            with tf.train.MonitoredTrainingSession(master=server.target,
-                                                   is_chief=is_chief,
-                                                   checkpoint_dir=checkpoint_dir,
-                                                   hooks=hooks,
-                                                   save_checkpoint_secs=10,
-                                                   config=session_config) as session:
-
-                if is_chief:
-                    print "STARTING Optimization\n"
-                    global_time = stopwatch()
-                    global_train_time = 0
-
-                    # Init recent word error rate levels
-                    train_wer = 0.0
-                    dev_wer = 0.0
-
-                # Retrieving global_step from the (potentially restored) model
-                feed_dict = {}
-                switchable_data_set.set_data_set(feed_dict, data_sets.train)
-                step = session.run(global_step, feed_dict=feed_dict)
-                epoch = get_epoch_from_step(step)
-                last_epoch = -1
-
-                while not session.should_stop():
-
-                    if is_chief:
-                        if epoch > last_epoch:
-                            print "STARTING Epoch", '%04d' % (epoch)
-                            overall_time = stopwatch()
-                            train_time = 0
-
-                        # (Re)start training stopwatches
-                        global_train_time = stopwatch(global_train_time)
-                        train_time = stopwatch(train_time)
-
-                    # As the entry check is done, we can now make the last one the current one.
-                    last_epoch = epoch
-
-                    # Determine if we want to display and/or validate on this iteration/worker
-                    is_display_step = is_chief and display_step > 0 and ((epoch + 1) % display_step == 0 or epoch == epochs - 1)
-                    is_validation_step = validation_step > 0 and (epoch + 1) % validation_step == 0
-
-                    # Train for one epoch, keep global step for next loop and report data
-                    step, results = run_batches(session, data_sets.train, train=True, query_report=is_display_step)
-
-                    # Calculate (potentially next) epoch on base of global step
-                    epoch = get_epoch_from_step(step)
-
-                    if is_chief:
-                        # Stop training stopwatches
-                        global_train_time = stopwatch(global_train_time)
-                        train_time = stopwatch(train_time)
-
-                        # Print report and keep (potentially) calculated WER
-                        train_wer = print_report('Training', results, no_wer=train_wer)
-
-                    if is_validation_step and not session.should_stop():
-                        _, results = run_batches(session, data_sets.dev, query_report=True)
-                        # Print report and keep (potentially) calculated WER
-                        if is_chief:
-                            dev_wer = print_report('Validation', results, no_wer=dev_wer)
-
-                    if is_chief and epoch > last_epoch:
-                        # Finishing last epoch
-                        overall_time = stopwatch(overall_time)
-                        print "FINISHED Epoch", '%04d' % (last_epoch),\
-                              "  Overall epoch time:", format_duration(overall_time),\
-                              "  Training time:", format_duration(train_time)
-                        print
-
-                if is_chief:
-                    # Indicate optimization has concluded
-                    print "FINISHED Optimization",\
-                          "  Overall time:", format_duration(stopwatch(global_time)),\
-                          "  Training time:", format_duration(global_train_time)
-                    print
-
+        if job_name == 'ps':
+            # We are a parameter server and therefore we just wait for all workers to finish
+            # by waiting for their stop tokens.
+            with tf.Session(server.target) as session:
+                for worker in worker_hosts:
+                    print ('Waiting for stop token...')
+                    token = session.run(done_dequeues[task_index])
+                    print ('Got a stop token from worker %i' %token)
             print ('Session closed.')
-    print ('Server stopped.')
+
+        elif job_name == 'worker':
+            # We are a worker and therefore we have to do some work.
+
+            # Assigns ops to the local worker by default.
+            with tf.device(tf.train.replica_device_setter(
+                           worker_device=worker_device,
+                           cluster=cluster)):
+
+                # Do the training
+                train(server)
+
+        print ('Server stopped.')
