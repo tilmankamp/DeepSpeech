@@ -70,7 +70,6 @@ cpu_device = worker_device + '/cpu:0'
 available_devices = [worker_device + gpu for gpu in get_available_gpus()]
 if 0 == len(available_devices):
     available_devices = [cpu_device]
-print(available_devices)
 
 
 # Global Constants
@@ -745,7 +744,8 @@ def stopwatch(start_duration=0):
 
 def format_duration(duration):
     """Formats the result of an even stopwatch call as hours:minutes:seconds"""
-    m, s = divmod(duration.seconds, 60)
+    duration = duration if isinstance(duration, int) else duration.seconds
+    m, s = divmod(duration, 60)
     h, m = divmod(m, 60)
     return "%d:%02d:%02d" % (h, m, s)
 
@@ -926,8 +926,8 @@ def train(server=None):
     last_step = epochs * data_sets.train.total_batches - 1
 
     # The StopAtStepHook handles stopping after running given steps.
-    hooks = [tf.train.StopAtStepHook(last_step=last_step),
-             CoordHook()]
+    hooks = [CoordHook(),
+             tf.train.StopAtStepHook(last_step=last_step)]
 
     # Hook to handle initialization and queues for sync replicas.
     if not server is None:
@@ -1012,6 +1012,7 @@ def train(server=None):
                   "  Training time:", format_duration(global_train_time)
             print
 
+
     print ('Session closed.')
 
 
@@ -1020,8 +1021,11 @@ if __name__ == '__main__':
     # Queues that are used to gracefully stop parameter servers.
     # Each queue stands for one ps. A finishing worker sends a token to each queue befor joining/quitting.
     # Each ps will dequeue as many tokens as there are workers before joining/quitting.
+    # This ensures parameter servers won't quit, if still required by at least one worker and
+    # also won't wait forever (like with a standard `server.join()`).
     done_queues = []
     for i, ps in enumerate(ps_hosts):
+        # Queues are hosted by their respective owners
         with tf.device('/job:ps/task:%d' % i):
             done_queues.append(tf.FIFOQueue(1, tf.int32, shared_name=('queue%i' % i)))
 
@@ -1035,8 +1039,11 @@ if __name__ == '__main__':
     done_dequeues = [queue.dequeue() for queue in done_queues]
 
     if len(worker_hosts) == 0 and len(ps_hosts) == 0:
-        # Only one local task (this process)
+        # Only one local task: this process (default case with no cluster)
         train()
+
+        print "Done."
+
     else:
         # Create and start a server for the local task.
         server = tf.train.Server(cluster, job_name=job_name, task_index=task_index)
