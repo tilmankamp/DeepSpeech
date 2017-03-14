@@ -1,16 +1,21 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
+import os
+
+if 'TF_CPP_MIN_LOG_LEVEL' not in os.environ:
+    os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+
 import datetime
 import json
 import numpy as np
-import os
 import shutil
 import subprocess
 import sys
 import tempfile
 import tensorflow as tf
 import time
+import importlib
 
 from collections import OrderedDict
 from math import ceil, floor
@@ -25,183 +30,89 @@ from util.text import sparse_tensor_value_to_texts, wer
 from util.data_set_helpers import SwitchableDataSet
 from xdg import BaseDirectory as xdg
 
-ds_importer = os.environ.get('ds_importer', 'ldc93s1')
-ds_dataset_path = os.environ.get('ds_dataset_path', os.path.join('./data', ds_importer))
 
-import importlib
-ds_importer_module = importlib.import_module('util.importers.%s' % ds_importer)
+# Importer
+# ========
 
-from util.website import maybe_publish
-
-do_fulltrace = bool(len(os.environ.get('ds_do_fulltrace', '')))
-
-if do_fulltrace:
-    check_cupti()
-
+tf.app.flags.DEFINE_string  ('importer',         'ldc93s1',   'importer module - one of ldc93s1, LDC97S62, ted, librivox, fischer')
+tf.app.flags.DEFINE_string  ('dataset_path',     '',          'data set path for the importer - defaults to .data/<importer>')
+tf.app.flags.DEFINE_boolean ('fulltrace',        False,       'if full trace debug info should be generated during training')
 
 # Cluster configuration
 # =====================
 
-# Comma separated list of hostname:port pairs
-ps_hosts = filter(len, os.environ.get('ds_ps_hosts', '').split(","))
-
-# Comma separated list of hostname:port pairs
-worker_hosts = filter(len, os.environ.get('ds_worker_hosts', '').split(","))
-
-# One of 'ps', 'worker', if cluster operation is desired. '' for single operation.
-job_name = os.environ.get('ds_job_name', 'localhost')
-
-# Index of task within the job - worker with index 0 will be the chief
-task_index = int(os.environ.get('ds_task_index', 0))
-
-# As we are introducing one tower for each GPU, first we must determine how many GPU's are available
-# Get a list of the available gpu's ['/gpu:0', '/gpu:1'...]
-# available_devices = ['/job:%s/task:%d%s' % (job_name, task_index, gpu) for gpu in get_available_gpus()]
-
-# If there are no GPU's use the CPU
-# if 0 == len(available_devices):
-#    available_devices = ['/job:%s/task:%d/cpu:0' % (job_name, task_index)]
-
-# Create a cluster from the parameter server and worker hosts.
-cluster = tf.train.ClusterSpec({"ps": ps_hosts, "worker": worker_hosts})
-
-worker_device = '/job:%s/task:%d' % (job_name, task_index)
-cpu_device = worker_device + '/cpu:0'
-available_devices = [worker_device + gpu for gpu in get_available_gpus()]
-if 0 == len(available_devices):
-    available_devices = [cpu_device]
-
+tf.app.flags.DEFINE_string  ('ps_hosts',         '',          'parameter servers - comma separated list of hostname:port pairs')
+tf.app.flags.DEFINE_string  ('worker_hosts',     '',          'workers - comma separated list of hostname:port pairs')
+tf.app.flags.DEFINE_string  ('job_name',         'localhost', 'job name - one of localhost (default), worker, ps')
+tf.app.flags.DEFINE_integer ('task_index',       0,           'index of task within the job - worker with index 0 will be the chief')
 
 # Global Constants
 # ================
 
-# The number of iterations (epochs) we will train for
-epochs = int(os.environ.get('ds_epochs', 75))
+tf.app.flags.DEFINE_integer ('epochs',           75,          'number of iterations to train')
+tf.app.flags.DEFINE_boolean ('use_warpctc',      False,       'weather to use GPU bound Warp-CTC')
 
-# Weather to use GPU bound Warp-CTC
-use_warpctc = bool(len(os.environ.get('ds_use_warpctc', '')))
+tf.app.flags.DEFINE_float   ('dropout_rate',     0.05,        'dropout rate for feedforward layers')
+tf.app.flags.DEFINE_float   ('dropout_rate2',    -1.0,        'dropout rate for layer 2 - defaults to dropout_rate')
+tf.app.flags.DEFINE_float   ('dropout_rate3',    -1.0,        'dropout rate for layer 3 - defaults to dropout_rate')
+tf.app.flags.DEFINE_float   ('dropout_rate4',    0.0,         'dropout rate for layer 4 - defaults to 0.0')
+tf.app.flags.DEFINE_float   ('dropout_rate5',    0.0,         'dropout rate for layer 5 - defaults to 0.0')
+tf.app.flags.DEFINE_float   ('dropout_rate6',    -1.0,        'dropout rate for layer 6 - defaults to dropout_rate')
 
-# As we will employ dropout on the feedforward layers of the network,
-# we need to define a parameter `dropout_rate` that keeps track of the dropout rate for these layers
-dropout_rate = float(os.environ.get('ds_dropout_rate', 0.05))  # TODO: Validate this is a reasonable value
-
-# We allow for customisation of dropout per-layer
-dropout_rate2 = float(os.environ.get('ds_dropout_rate2', dropout_rate))
-dropout_rate3 = float(os.environ.get('ds_dropout_rate3', dropout_rate))
-dropout_rate4 = float(os.environ.get('ds_dropout_rate4', 0.0))
-dropout_rate5 = float(os.environ.get('ds_dropout_rate5', 0.0))
-dropout_rate6 = float(os.environ.get('ds_dropout_rate6', dropout_rate))
-
-dropout_rates = [ dropout_rate,
-                  dropout_rate2,
-                  dropout_rate3,
-                  dropout_rate4,
-                  dropout_rate5,
-                  dropout_rate6 ]
-no_dropout = [ 0.0 ] * 6
-
-# One more constant required of the non-recurrant layers is the clipping value of the ReLU.
-relu_clip = int(os.environ.get('ds_relu_clip', 20)) # TODO: Validate this is a reasonable value
-
+tf.app.flags.DEFINE_float   ('relu_clip',        20.0,        'ReLU clipping value for non-recurrant layers')
 
 # Adam optimizer (http://arxiv.org/abs/1412.6980) parameters
 
-# Beta 1 parameter
-beta1 = float(os.environ.get('ds_beta1', 0.9)) # TODO: Determine a reasonable value for this
-
-# Beta 2 parameter
-beta2 = float(os.environ.get('ds_beta2', 0.999)) # TODO: Determine a reasonable value for this
-
-# Epsilon parameter
-epsilon = float(os.environ.get('ds_epsilon', 1e-8)) # TODO: Determine a reasonable value for this
-
-# Learning rate parameter
-learning_rate = float(os.environ.get('ds_learning_rate', 0.001))
-
+tf.app.flags.DEFINE_float   ('beta1',            0.9,         'Beta 1 parameter of Adam optimizer')
+tf.app.flags.DEFINE_float   ('beta2',            0.999,       'Beta 2 parameter of Adam optimizer')
+tf.app.flags.DEFINE_float   ('epsilon',          1e-8,        'Epsilon parameter of Adam optimizer')
+tf.app.flags.DEFINE_float   ('learning_rate',    0.001,       'Learning Rate of Adam optimizer')
 
 # Batch sizes
 
-# The number of elements in a training batch
-train_batch_size = int(os.environ.get('ds_train_batch_size', 1))
-
-# The number of elements in a dev batch
-dev_batch_size = int(os.environ.get('ds_dev_batch_size', 1))
-
-# The number of elements in a test batch
-test_batch_size = int(os.environ.get('ds_test_batch_size', 1))
-
+tf.app.flags.DEFINE_integer ('train_batch_size', 1,           'number of elements in a training batch')
+tf.app.flags.DEFINE_integer ('dev_batch_size',   1,           'number of elements in a validation batch')
+tf.app.flags.DEFINE_integer ('test_batch_size',  1,           'number of elements in a test batch')
 
 # Sample limits
 
-# The maximum amount of samples taken from (the beginning of) the train set - 0 meaning no limit
-limit_train = int(os.environ.get('ds_limit_train', 0))
-
-# The maximum amount of samples taken from (the beginning of) the validation set - 0 meaning no limit
-limit_dev   = int(os.environ.get('ds_limit_dev',   0))
-
-# The maximum amount of samples taken from (the beginning of) the test set - 0 meaning no limit
-limit_test  = int(os.environ.get('ds_limit_test',  0))
-
+tf.app.flags.DEFINE_integer ('limit_train',      0,           'maximum number of elements to use from train set')
+tf.app.flags.DEFINE_integer ('limit_dev',        0,           'maximum number of elements to use from validation set')
+tf.app.flags.DEFINE_integer ('limit_test',       0,           'maximum number of elements to use from test set')
 
 # Step widths
 
-# The number of epochs we cycle through before displaying progress
-display_step = int(os.environ.get('ds_display_step', 1))
-
-# The number of epochs we cycle through before checkpointing the model
-checkpoint_step = int(os.environ.get('ds_checkpoint_step', 5))
-
-# The number of epochs we cycle through before validating the model
-validation_step = int(os.environ.get('ds_validation_step', 0))
-
+tf.app.flags.DEFINE_integer ('display_step',     1,           'number of epochs we cycle through before displaying progress')
+tf.app.flags.DEFINE_integer ('validation_step',  0,           'number of epochs we cycle through before validating the model')
 
 # Checkpointing
 
-# The directory in which checkpoints are stored
-checkpoint_dir = os.environ.get('ds_checkpoint_dir', xdg.save_data_path('deepspeech'))
+tf.app.flags.DEFINE_string  ('checkpoint_dir',   '',          'directory in which checkpoints are stored')
+tf.app.flags.DEFINE_integer ('checkpoint_secs',  600,         'checkpoint saving interval in seconds')
 
-# Whether to resume from checkpoints when training
-restore_checkpoint = bool(int(os.environ.get('ds_restore_checkpoint', 0)))
+# Exporting
 
-# The directory in which exported models are stored
-export_dir = os.environ.get('ds_export_dir', None)
-
-# The version number of the exported model
-export_version = 1
-
-# Whether to remove old exported models
-remove_export = bool(int(os.environ.get('ds_remove_export', 0)))
-
+tf.app.flags.DEFINE_string  ('export_dir',       '',          'directory in which exported models are stored')
+tf.app.flags.DEFINE_integer ('export_version',   1,           'version number of the exported model')
+tf.app.flags.DEFINE_boolean ('remove_export',    False,       'weather to remove old exported models')
 
 # Reporting
 
-# The number of phrases to print out during a WER report
-report_count = int(os.environ.get('ds_report_count', 10))
-
-# Whether to log device placement of the operators to the console
-log_device_placement = bool(int(os.environ.get('ds_log_device_placement', 0)))
-
-# Whether to log gradients and variables summaries to TensorBoard during training.
-# This incurs a performance hit, so should generally only be enabled for debugging.
-log_variables = bool(len(os.environ.get('ds_log_variables', '')))
-
+tf.app.flags.DEFINE_integer ('report_count',     10,          'number of phrases to print out during a WER report')
+tf.app.flags.DEFINE_boolean ('log_placement',    False,       'weather to log device placement of the operators to the console')
+tf.app.flags.DEFINE_boolean ('log_variables',    False,       'weather to log gradients and variables summaries to TensorBoard during training')
+tf.app.flags.DEFINE_integer ('summaries_steps',  100,         'number of global training steps we cycle through before saving a summary')
 
 # Initialization
 
-# The default random seed that is used to initialize variables. Ensures reproducibility.
-random_seed = int(os.environ.get('ds_random_seed', 4567)) # To be adjusted in case of bad luck
+tf.app.flags.DEFINE_integer ('random_seed',      4567,        'default random seed that is used to initialize variables')
+tf.app.flags.DEFINE_float   ('default_stddev',   0.046875,    'default standard deviation to use when initialising weights and biases')
 
-# The default standard deviation to use when initialising weights and biases
-default_stddev = float(os.environ.get('ds_default_stddev', 0.046875))
-
-# Individual standard deviations to use when initialising particular weights and biases
 for var in ['b1', 'h1', 'b2', 'h2', 'b3', 'h3', 'b5', 'h5', 'b6', 'h6']:
-    locals()['%s_stddev' % var] = float(os.environ.get('ds_%s_stddev' % var, default_stddev))
+    tf.app.flags.DEFINE_float('%s_stddev' % var, None, 'standard deviation to use when initialising %s' % var)
 
-# Session settings
 
-# Standard session configuration that'll be used for all new sessions.
-session_config = tf.ConfigProto(allow_soft_placement=True, log_device_placement=log_device_placement)
+FLAGS = tf.app.flags.FLAGS
 
 
 # Geometric Constants
@@ -244,7 +155,7 @@ def variable_on_cpu(name, shape, initializer):
     used to create a variable in CPU memory.
     """
     # Use the /cpu:0 device on worker_device for scoped operations
-    if len(ps_hosts) == 0:
+    if len(FLAGS.ps_hosts) == 0:
         device = worker_device
     else:
         device = tf.train.replica_device_setter(worker_device=worker_device, cluster=cluster)
@@ -284,21 +195,21 @@ def BiRNN(batch_x, seq_length, dropout):
     # clipped RELU activation and dropout.
 
     # 1st layer
-    b1 = variable_on_cpu('b1', [n_hidden_1], tf.random_normal_initializer(stddev=b1_stddev))
-    h1 = variable_on_cpu('h1', [n_input + 2*n_input*n_context, n_hidden_1], tf.random_normal_initializer(stddev=h1_stddev))
-    layer_1 = tf.minimum(tf.nn.relu(tf.add(tf.matmul(batch_x, h1), b1)), relu_clip)
+    b1 = variable_on_cpu('b1', [n_hidden_1], tf.random_normal_initializer(stddev=FLAGS.b1_stddev))
+    h1 = variable_on_cpu('h1', [n_input + 2*n_input*n_context, n_hidden_1], tf.random_normal_initializer(stddev=FLAGS.h1_stddev))
+    layer_1 = tf.minimum(tf.nn.relu(tf.add(tf.matmul(batch_x, h1), b1)), FLAGS.relu_clip)
     layer_1 = tf.nn.dropout(layer_1, (1.0 - dropout[0]))
 
     # 2nd layer
-    b2 = variable_on_cpu('b2', [n_hidden_2], tf.random_normal_initializer(stddev=b2_stddev))
-    h2 = variable_on_cpu('h2', [n_hidden_1, n_hidden_2], tf.random_normal_initializer(stddev=h2_stddev))
-    layer_2 = tf.minimum(tf.nn.relu(tf.add(tf.matmul(layer_1, h2), b2)), relu_clip)
+    b2 = variable_on_cpu('b2', [n_hidden_2], tf.random_normal_initializer(stddev=FLAGS.b2_stddev))
+    h2 = variable_on_cpu('h2', [n_hidden_1, n_hidden_2], tf.random_normal_initializer(stddev=FLAGS.h2_stddev))
+    layer_2 = tf.minimum(tf.nn.relu(tf.add(tf.matmul(layer_1, h2), b2)), FLAGS.relu_clip)
     layer_2 = tf.nn.dropout(layer_2, (1.0 - dropout[1]))
 
     # 3rd layer
-    b3 = variable_on_cpu('b3', [n_hidden_3], tf.random_normal_initializer(stddev=b3_stddev))
-    h3 = variable_on_cpu('h3', [n_hidden_2, n_hidden_3], tf.random_normal_initializer(stddev=h3_stddev))
-    layer_3 = tf.minimum(tf.nn.relu(tf.add(tf.matmul(layer_2, h3), b3)), relu_clip)
+    b3 = variable_on_cpu('b3', [n_hidden_3], tf.random_normal_initializer(stddev=FLAGS.b3_stddev))
+    h3 = variable_on_cpu('h3', [n_hidden_2, n_hidden_3], tf.random_normal_initializer(stddev=FLAGS.h3_stddev))
+    layer_3 = tf.minimum(tf.nn.relu(tf.add(tf.matmul(layer_2, h3), b3)), FLAGS.relu_clip)
     layer_3 = tf.nn.dropout(layer_3, (1.0 - dropout[2]))
 
     # Now we create the forward and backward LSTM units.
@@ -309,13 +220,13 @@ def BiRNN(batch_x, seq_length, dropout):
     lstm_fw_cell = core_rnn_cell.DropoutWrapper(lstm_fw_cell,
                                                 input_keep_prob=1.0 - dropout[3],
                                                 output_keep_prob=1.0 - dropout[3],
-                                                seed=random_seed)
+                                                seed=FLAGS.random_seed)
     # Backward direction cell:
     lstm_bw_cell = core_rnn_cell.BasicLSTMCell(n_cell_dim, forget_bias=1.0, state_is_tuple=True)
     lstm_bw_cell = core_rnn_cell.DropoutWrapper(lstm_bw_cell,
                                                 input_keep_prob=1.0 - dropout[4],
                                                 output_keep_prob=1.0 - dropout[4],
-                                                seed=random_seed)
+                                                seed=FLAGS.random_seed)
 
     # `layer_3` is now reshaped into `[n_steps, batch_size, 2*n_cell_dim]`,
     # as the LSTM BRNN expects its input to be of shape `[max_time, batch_size, input_size]`.
@@ -335,15 +246,15 @@ def BiRNN(batch_x, seq_length, dropout):
     outputs = tf.reshape(outputs, [-1, 2*n_cell_dim])
 
     # Now we feed `outputs` to the fifth hidden layer with clipped RELU activation and dropout
-    b5 = variable_on_cpu('b5', [n_hidden_5], tf.random_normal_initializer(stddev=b5_stddev))
-    h5 = variable_on_cpu('h5', [(2 * n_cell_dim), n_hidden_5], tf.random_normal_initializer(stddev=h5_stddev))
-    layer_5 = tf.minimum(tf.nn.relu(tf.add(tf.matmul(outputs, h5), b5)), relu_clip)
+    b5 = variable_on_cpu('b5', [n_hidden_5], tf.random_normal_initializer(stddev=FLAGS.b5_stddev))
+    h5 = variable_on_cpu('h5', [(2 * n_cell_dim), n_hidden_5], tf.random_normal_initializer(stddev=FLAGS.h5_stddev))
+    layer_5 = tf.minimum(tf.nn.relu(tf.add(tf.matmul(outputs, h5), b5)), FLAGS.relu_clip)
     layer_5 = tf.nn.dropout(layer_5, (1.0 - dropout[5]))
 
     # Now we apply the weight matrix `h6` and bias `b6` to the output of `layer_5`
     # creating `n_classes` dimensional vectors, the logits.
-    b6 = variable_on_cpu('b6', [n_hidden_6], tf.random_normal_initializer(stddev=b6_stddev))
-    h6 = variable_on_cpu('h6', [n_hidden_5, n_hidden_6], tf.random_normal_initializer(stddev=h6_stddev))
+    b6 = variable_on_cpu('b6', [n_hidden_6], tf.random_normal_initializer(stddev=FLAGS.b6_stddev))
+    h6 = variable_on_cpu('h6', [n_hidden_5, n_hidden_6], tf.random_normal_initializer(stddev=FLAGS.h6_stddev))
     layer_6 = tf.add(tf.matmul(layer_5, h6), b6)
 
     # Finally we reshape layer_6 from a tensor of shape [n_steps*batch_size, n_hidden_6]
@@ -378,7 +289,7 @@ def calculate_accuracy_and_loss(batch_set, dropout):
     logits = BiRNN(batch_x, tf.to_int64(batch_seq_len), dropout)
 
     # Compute the CTC loss using either TensorFlow's `ctc_loss` or Baidu's `warp_ctc_loss`.
-    if use_warpctc:
+    if FLAGS.use_warpctc:
         total_loss = tf.contrib.warpctc.warp_ctc_loss(labels=batch_y, inputs=logits, sequence_length=batch_seq_len)
     else:
         total_loss = ctc_ops.ctc_loss(labels=batch_y, inputs=logits, sequence_length=batch_seq_len)
@@ -415,10 +326,10 @@ def calculate_accuracy_and_loss(batch_set, dropout):
 # we will use the Adam method for optimization (http://arxiv.org/abs/1412.6980),
 # because, generally, it requires less fine-tuning.
 def create_optimizer():
-    optimizer = tf.train.AdamOptimizer(learning_rate=learning_rate,
-                                       beta1=beta1,
-                                       beta2=beta2,
-                                       epsilon=epsilon)
+    optimizer = tf.train.AdamOptimizer(learning_rate=FLAGS.learning_rate,
+                                       beta1=FLAGS.beta1,
+                                       beta2=FLAGS.beta2,
+                                       epsilon=FLAGS.epsilon)
     return optimizer
 
 
@@ -484,7 +395,7 @@ def get_tower_results(batch_set, optimizer):
         # Loop over available_devices
         for i in xrange(len(available_devices)):
             # Execute operations of tower i on device i
-            if len(ps_hosts) == 0:
+            if len(FLAGS.ps_hosts) == 0:
                 device = available_devices[i]
             else:
                 device = tf.train.replica_device_setter(worker_device=available_devices[i], cluster=cluster)
@@ -617,7 +528,7 @@ def get_git_branch():
 def calculate_and_print_wer_report(caption, results_tuple):
     r"""
     This routine will print a WER report with a given caption.
-    It'll print the `mean` WER plus summaries of the ``ds_report_count`` top lowest
+    It'll print the `mean` WER plus summaries of the ``report_count`` top lowest
     loss items from the provided WER results tuple
     (only items with WER!=0 and ordered by their WER).
     """
@@ -647,7 +558,7 @@ def calculate_and_print_wer_report(caption, results_tuple):
     items.sort(key=lambda a: a[3])
 
     # Take only the first report_count items
-    items = items[:report_count]
+    items = items[:FLAGS.report_count]
 
     # Order this top ten items by their WER (lowest WER on top)
     items.sort(key=lambda a: a[2])
@@ -765,22 +676,22 @@ def read_data_sets(set_names=['train', 'dev', 'test']):
     Returns a :class:`DataSets` object of the selected importer, containing all available sets.
     """
     # Obtain all the data sets
-    return ds_importer_module.read_data_sets(ds_dataset_path,
-                                             train_batch_size,
-                                             dev_batch_size,
-                                             test_batch_size,
-                                             n_input,
-                                             n_context,
-                                             stride=max(1, len(worker_hosts)),
-                                             offset=task_index,
-                                             limit_dev=limit_dev,
-                                             limit_test=limit_test,
-                                             limit_train=limit_train,
-                                             sets=set_names)
+    return importer_module.read_data_sets(FLAGS.dataset_path,
+                                          FLAGS.train_batch_size,
+                                          FLAGS.dev_batch_size,
+                                          FLAGS.test_batch_size,
+                                          n_input,
+                                          n_context,
+                                          stride=max(1, len(FLAGS.worker_hosts)),
+                                          offset=FLAGS.task_index,
+                                          limit_dev=FLAGS.limit_dev,
+                                          limit_test=FLAGS.limit_test,
+                                          limit_train=FLAGS.limit_train,
+                                          sets=set_names)
 
 def train(server=None):
     # Determine, if we are the chief worker
-    is_chief = (task_index == 0)
+    is_chief = (FLAGS.task_index == 0)
 
     # Create a variable to hold the global_step.
     # It will automgically get incremented by the optimizer.
@@ -788,6 +699,10 @@ def train(server=None):
 
     # Read all data sets
     data_sets = read_data_sets()
+
+    if data_sets.train.total_batches == 0:
+        print 'Zero batches in train data set - stopping...'
+        return
 
     # Calculates the epoch from a given global ``step``
     def get_epoch_from_step(step):
@@ -804,8 +719,8 @@ def train(server=None):
     # Synchronous training
     if not server is None:
         optimizer = tf.train.SyncReplicasOptimizer(optimizer,
-                                                   replicas_to_aggregate=3*len(worker_hosts),
-                                                   total_num_replicas=3*len(worker_hosts))
+                                                   replicas_to_aggregate=3*len(FLAGS.worker_hosts),
+                                                   total_num_replicas=3*len(FLAGS.worker_hosts))
 
     # Get the data_set specific graph end-points
     tower_results = get_tower_results(switchable_data_set, optimizer)
@@ -918,12 +833,12 @@ def train(server=None):
             # Sending our token (the task_index as a debug opportunity) to each parameter server.
             for enqueue in done_enqueues:
                 print ('Sending stop token to ps...')
-                session.run(enqueue, feed_dict={ token_placeholder: task_index })
+                session.run(enqueue, feed_dict={ token_placeholder: FLAGS.task_index })
                 print ('Sent stop token to ps.')
 
 
     # Calculate last step
-    last_step = epochs * data_sets.train.total_batches - 1
+    last_step = FLAGS.epochs * data_sets.train.total_batches - 1
 
     # The StopAtStepHook handles stopping after running given steps.
     hooks = [CoordHook(),
@@ -938,9 +853,10 @@ def train(server=None):
     # or an error occurs.
     with tf.train.MonitoredTrainingSession(master='' if server is None else server.target,
                                            is_chief=is_chief,
-                                           checkpoint_dir=checkpoint_dir,
                                            hooks=hooks,
-                                           save_checkpoint_secs=10,
+                                           checkpoint_dir=FLAGS.checkpoint_dir,
+                                           save_checkpoint_secs=FLAGS.checkpoint_secs,
+                                           save_summaries_steps=FLAGS.summaries_steps,
                                            config=session_config) as session:
 
         if is_chief:
@@ -973,8 +889,8 @@ def train(server=None):
             last_epoch = epoch
 
             # Determine if we want to display and/or validate on this iteration/worker
-            is_display_step = is_chief and display_step > 0 and ((epoch + 1) % display_step == 0 or epoch == epochs - 1)
-            is_validation_step = validation_step > 0 and (epoch + 1) % validation_step == 0
+            is_display_step = is_chief and FLAGS.display_step > 0 and ((epoch + 1) % FLAGS.display_step == 0 or epoch == FLAGS.epochs - 1)
+            is_validation_step = FLAGS.validation_step > 0 and (epoch + 1) % FLAGS.validation_step == 0
 
             # Train for one epoch, keep global step for next loop and report data
             step, results = run_batches(session, data_sets.train, train=True, query_report=is_display_step)
@@ -1016,7 +932,77 @@ def train(server=None):
     print ('Session closed.')
 
 
-if __name__ == '__main__':
+def main(_) :
+
+    # Set default relative data set directory based on importer name
+    if FLAGS.dataset_path == '':
+        FLAGS.dataset_path = os.path.join('./data', FLAGS.importer)
+
+    # Lazy-import data set module
+    global importer_module
+    importer_module = importlib.import_module('util.importers.%s' % FLAGS.importer)
+
+
+    from util.website import maybe_publish
+    if FLAGS.fulltrace:
+        check_cupti()
+
+    # ps and worker hosts required for p2p cluster setup
+    FLAGS.ps_hosts = filter(len, FLAGS.ps_hosts.split(","))
+    FLAGS.worker_hosts = filter(len, FLAGS.worker_hosts.split(","))
+
+    # Create a cluster from the parameter server and worker hosts.
+    global cluster
+    cluster = tf.train.ClusterSpec({"ps": FLAGS.ps_hosts, "worker": FLAGS.worker_hosts})
+
+    # The device path base for this node
+    global worker_device
+    worker_device = '/job:%s/task:%d' % (FLAGS.job_name, FLAGS.task_index)
+
+    # This node's CPU device
+    global cpu_device
+    cpu_device = worker_device + '/cpu:0'
+
+    # This node's available GPU devices
+    global available_devices
+    available_devices = [worker_device + gpu for gpu in get_available_gpus()]
+
+    # If there is no GPU available, we fall back to CPU based operation
+    if 0 == len(available_devices):
+        available_devices = [cpu_device]
+
+    # Set default dropout rates
+    if FLAGS.dropout_rate2 < 0:
+        FLAGS.dropout_rate2 = FLAGS.dropout_rate
+    if FLAGS.dropout_rate3 < 0:
+        FLAGS.dropout_rate3 = FLAGS.dropout_rate
+    if FLAGS.dropout_rate6 < 0:
+        FLAGS.dropout_rate6 = FLAGS.dropout_rate
+
+    global dropout_rates
+    dropout_rates = [ FLAGS.dropout_rate,
+                      FLAGS.dropout_rate2,
+                      FLAGS.dropout_rate3,
+                      FLAGS.dropout_rate4,
+                      FLAGS.dropout_rate5,
+                      FLAGS.dropout_rate6 ]
+
+    global no_dropout
+    no_dropout = [ 0.0 ] * 6
+
+    # Set default checkpoint dir
+    if len(FLAGS.checkpoint_dir) == 0:
+        FLAGS.checkpoint_dir = xdg.save_data_path('deepspeech')
+
+    # Standard session configuration that'll be used for all new sessions.
+    global session_config
+    session_config = tf.ConfigProto(allow_soft_placement=True, log_device_placement=FLAGS.log_placement)
+
+    # Assign default values for standard deviation
+    for var in ['b1', 'h1', 'b2', 'h2', 'b3', 'h3', 'b5', 'h5', 'b6', 'h6']:
+        val = getattr(FLAGS, '%s_stddev' % var)
+        if val is None:
+            setattr(FLAGS, '%s_stddev' % var, FLAGS.default_stddev)
 
     # Queues that are used to gracefully stop parameter servers.
     # Each queue stands for one ps. A finishing worker sends a token to each queue befor joining/quitting.
@@ -1024,21 +1010,24 @@ if __name__ == '__main__':
     # This ensures parameter servers won't quit, if still required by at least one worker and
     # also won't wait forever (like with a standard `server.join()`).
     done_queues = []
-    for i, ps in enumerate(ps_hosts):
+    for i, ps in enumerate(FLAGS.ps_hosts):
         # Queues are hosted by their respective owners
         with tf.device('/job:ps/task:%d' % i):
             done_queues.append(tf.FIFOQueue(1, tf.int32, shared_name=('queue%i' % i)))
 
     # Placeholder to pass in the worker's index as token
+    global token_placeholder
     token_placeholder = tf.placeholder(tf.int32)
 
     # Enqueue operations for each parameter server
+    global done_enqueues
     done_enqueues = [queue.enqueue(token_placeholder) for i, queue in enumerate(done_queues)]
 
     # Dequeue operations for each parameter server
+    global done_dequeues
     done_dequeues = [queue.dequeue() for queue in done_queues]
 
-    if len(worker_hosts) == 0 and len(ps_hosts) == 0:
+    if len(FLAGS.worker_hosts) == 0 and len(FLAGS.ps_hosts) == 0:
         # Only one local task: this process (default case with no cluster)
         train()
 
@@ -1046,19 +1035,19 @@ if __name__ == '__main__':
 
     else:
         # Create and start a server for the local task.
-        server = tf.train.Server(cluster, job_name=job_name, task_index=task_index)
+        server = tf.train.Server(cluster, job_name=FLAGS.job_name, task_index=FLAGS.task_index)
 
-        if job_name == 'ps':
+        if FLAGS.job_name == 'ps':
             # We are a parameter server and therefore we just wait for all workers to finish
             # by waiting for their stop tokens.
             with tf.Session(server.target) as session:
-                for worker in worker_hosts:
+                for worker in FLAGS.worker_hosts:
                     print ('Waiting for stop token...')
-                    token = session.run(done_dequeues[task_index])
+                    token = session.run(done_dequeues[FLAGS.task_index])
                     print ('Got a stop token from worker %i' %token)
             print ('Session closed.')
 
-        elif job_name == 'worker':
+        elif FLAGS.job_name == 'worker':
             # We are a worker and therefore we have to do some work.
 
             # Assigns ops to the local worker by default.
@@ -1070,3 +1059,6 @@ if __name__ == '__main__':
                 train(server)
 
         print ('Server stopped.')
+
+if __name__ == '__main__' :
+    tf.app.run()

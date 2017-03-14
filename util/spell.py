@@ -4,9 +4,14 @@ from heapq import heapify
 
 # Define beam with for alt sentence search
 BEAM_WIDTH = 1024
+MODEL = None
 
-# Load language model (TED corpus, Kneser-Ney, 4-gram, 30k word LM)
-MODEL = kenlm.Model('./data/lm/lm.arpa')
+# Lazy-load language model (TED corpus, Kneser-Ney, 4-gram, 30k word LM)
+def get_model():
+    global MODEL
+    if MODEL is None:
+        MODEL = kenlm.Model('./data/lm/lm.arpa')
+    return MODEL
 
 def words(text):
     "List of words in text."
@@ -18,7 +23,7 @@ with open('./data/spell/words.txt') as f:
 
 def log_probability(sentence):
     "Log base 10 probability of `sentence`, a list of words"
-    return MODEL.score(' '.join(sentence), bos = False, eos = False)
+    return get_model().score(' '.join(sentence), bos = False, eos = False)
 
 def correction(sentence):
     "Most probable spelling correction for sentence."
