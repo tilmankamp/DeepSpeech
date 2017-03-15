@@ -20,6 +20,7 @@ import importlib
 from collections import OrderedDict
 from math import ceil, floor
 from tensorflow.contrib.session_bundle import exporter
+from tensorflow.python.tools import freeze_graph
 from tensorflow.python.ops import ctc_ops
 from tensorflow.contrib.rnn.python.ops import core_rnn_cell
 from util.gpu import get_available_gpus
@@ -98,10 +99,12 @@ tf.app.flags.DEFINE_boolean ('remove_export',    False,       'weather to remove
 
 # Reporting
 
+tf.app.flags.DEFINE_boolean ('publish',          False,       'weather to publish hyper parameters')
 tf.app.flags.DEFINE_integer ('report_count',     10,          'number of phrases to print out during a WER report')
 tf.app.flags.DEFINE_boolean ('log_placement',    False,       'weather to log device placement of the operators to the console')
 tf.app.flags.DEFINE_boolean ('log_variables',    False,       'weather to log gradients and variables summaries to TensorBoard during training')
 tf.app.flags.DEFINE_integer ('summaries_steps',  100,         'number of global training steps we cycle through before saving a summary')
+tf.app.flags.DEFINE_string  ('logs_dir',         'logs',      'directory in which checkpoints are stored')
 
 # Initialization
 
@@ -509,12 +512,6 @@ def log_grads_and_vars(grads_and_vars):
     for gradient, variable in grads_and_vars:
         log_variable(variable, gradient=gradient)
 
-
-# Finally we define the top directory for all logs and our current log sub-directory of it.
-# We also add some log helpers.
-logs_dir = os.environ.get('ds_logs_dir', 'logs')
-log_dir = '%s/%s' % (logs_dir, time.strftime("%Y%m%d-%H%M%S"))
-
 def get_git_revision_hash():
     return subprocess.check_output(['git', 'rev-parse', 'HEAD']).strip()
 
@@ -664,18 +661,10 @@ def format_duration(duration):
 # Execution
 # =========
 
-# To run our different graphs in separate sessions,
-# we first need to create some common infrastructure.
-#
-# At first we introduce the functions `read_data_sets` and `read_data_set` to read in data sets.
-# The first returns a `DataSets` object of the selected importer, containing all available sets.
-# The latter takes the name of the required data set
-# (`'train'`, `'dev'` or `'test'`) as string and returns the respective set.
 def read_data_sets(set_names=['train', 'dev', 'test']):
     r"""
-    Returns a :class:`DataSets` object of the selected importer, containing all available sets.
+    Returns a :class:`DataSets` object of the selected importer, containing all available/selected sets.
     """
-    # Obtain all the data sets
     return importer_module.read_data_sets(FLAGS.dataset_path,
                                           FLAGS.train_batch_size,
                                           FLAGS.dev_batch_size,
@@ -690,6 +679,11 @@ def read_data_sets(set_names=['train', 'dev', 'test']):
                                           sets=set_names)
 
 def train(server=None):
+    r"""
+    Trains the network on a given server of a cluster.
+    If no server provided, it performs single process training.
+    """
+
     # Determine, if we are the chief worker
     is_chief = (FLAGS.task_index == 0)
 
@@ -736,14 +730,16 @@ def train(server=None):
     apply_gradient_op = optimizer.apply_gradients(avg_tower_gradients, global_step=global_step)
 
 
-    # It iterates over all batches ``data_set`` and
-    # calculate the mean loss using the provided ``session``.
-    # If ``train`` is set to ``True``, the data set will get trained.
-    # If ``query_report`` is set to ``True``, data for a WER report will be gathered.
-    # Returns batch set result tuple consisting of the current global step, the average loss, and,
-    # if WER report data should be gathered, the average accuracy and a report results tuple.
-    # During operation this method is using variables of the encapsulating Python context.
     def run_batches(session, data_set, train=False, query_report=False):
+        r"""
+        It iterates over all batches ``data_set`` and
+        calculate the mean loss using the provided ``session``.
+        If ``train`` is set to ``True``, the data set will get trained.
+        If ``query_report`` is set to ``True``, data for a WER report will be gathered.
+        Returns batch set result tuple consisting of the current global step, the average loss, and,
+        if WER report data should be gathered, the average accuracy and a report results tuple.
+        During operation this method is using variables of the encapsulating Python context.
+        """
 
         # The feed_dict (mainly for switching between queues)
         feed_dict = {}
@@ -806,13 +802,14 @@ def train(server=None):
         else:
             return current_step, (avg_loss, None, None)
 
-
-    # Embedded coordination hook-class that will use variables of the
-    # surrounding Python context.
-    # It will start the importers queue threads after session creation.
-    # Before the session ends, it will evaluate the final test data set and
-    # send out this worker's stop token to all parameter servers.
     class CoordHook(tf.train.SessionRunHook):
+        r"""
+        Embedded coordination hook-class that will use variables of the
+        surrounding Python context.
+        It will start the importers queue threads after session creation.
+        Before the session ends, it will evaluate the final test data set and
+        send out this worker's stop token to all parameter servers.
+        """
         def after_create_session(self, session, coord):
             print ('Starting queue runners...')
             self.threads = switchable_data_set.start_queue_threads(session, coord)
@@ -824,6 +821,7 @@ def train(server=None):
 
             if is_chief:
                 # Print Test WER report
+                global test_wer
                 test_wer = print_report('Test', results)
 
             # Closing the data_set queues
@@ -858,6 +856,12 @@ def train(server=None):
                                            save_checkpoint_secs=FLAGS.checkpoint_secs,
                                            save_summaries_steps=FLAGS.summaries_steps,
                                            config=session_config) as session:
+
+        # Defining as globals for statistics and reporting
+        global global_time
+        global global_train_time
+        global train_wer
+        global dev_wer
 
         if is_chief:
             print "STARTING Optimization\n"
@@ -923,13 +927,158 @@ def train(server=None):
 
         if is_chief:
             # Indicate optimization has concluded
+            global_time = stopwatch(global_time)
             print "FINISHED Optimization",\
-                  "  Overall time:", format_duration(stopwatch(global_time)),\
+                  "  Overall time:", format_duration(global_time),\
                   "  Training time:", format_duration(global_train_time)
             print
 
 
     print ('Session closed.')
+
+
+def export():
+    r"""
+    Restores the trained variables into a simpler graph that will be exported for serving.
+    """
+    print ('Exporting the model...')
+    with tf.device('/cpu:0'):
+
+        tf.reset_default_graph()
+        session = tf.Session(config=session_config)
+
+        # Run inference
+
+        # Input tensor will be of shape [batch_size, n_steps, n_input + 2*n_input*n_context]
+        input_tensor = tf.placeholder(tf.float32, [None, None, n_input + 2*n_input*n_context], name='input_node')
+
+        # Calculate input sequence length. This is done by tiling n_steps, batch_size times.
+        # If there are multiple sequences, it is assumed they are padded with zeros to be of
+        # the same length.
+        n_items  = tf.slice(tf.shape(input_tensor), [0], [1])
+        n_steps = tf.slice(tf.shape(input_tensor), [1], [1])
+        seq_length = tf.tile(n_steps, n_items)
+
+        # Calculate the logits of the batch using BiRNN
+        logits = BiRNN(input_tensor, tf.to_int64(seq_length), no_dropout)
+
+        # Beam search decode the batch
+        decoded, _ = tf.nn.ctc_beam_search_decoder(logits, seq_length, merge_repeated=False)
+        decoded = tf.convert_to_tensor(
+            [tf.sparse_tensor_to_dense(sparse_tensor) for sparse_tensor in decoded], name='output_node')
+
+        # TODO: Transform the decoded output to a string
+
+        # Create a saver and exporter using variables from the above newly created graph
+        saver = tf.train.Saver(tf.global_variables())
+        model_exporter = exporter.Exporter(saver)
+
+        # Restore variables from training checkpoint
+        # TODO: This restores the most recent checkpoint, but if we use validation to counterract
+        #       over-fitting, we may want to restore an earlier checkpoint.
+        checkpoint = tf.train.get_checkpoint_state(FLAGS.checkpoint_dir)
+        checkpoint_path = checkpoint.model_checkpoint_path
+        saver.restore(session, checkpoint_path)
+        print 'Restored checkpoint at training epoch %d' % (int(checkpoint_path.split('-')[-1]) + 1)
+
+        # Initialise the model exporter and export the model
+        model_exporter.init(session.graph.as_graph_def(),
+                            named_graph_signatures = {
+                                'inputs': exporter.generic_signature(
+                                    { 'input': input_tensor }),
+                                'outputs': exporter.generic_signature(
+                                    { 'outputs': decoded})})
+        if FLAGS.remove_export:
+            actual_export_dir = os.path.join(FLAGS.export_dir, '%08d' % FLAGS.export_version)
+            if os.path.isdir(actual_export_dir):
+                print 'Removing old export'
+                shutil.rmtree(actual_FLAGS.export_dir)
+        try:
+            # Export serving model
+            model_exporter.export(FLAGS.export_dir, tf.constant(FLAGS.export_version), session)
+
+            # Export graph
+            input_graph_name = 'input_graph.pb'
+            tf.train.write_graph(session.graph, FLAGS.export_dir, input_graph_name, as_text=False)
+
+            # Freeze graph
+            input_graph_path = os.path.join(FLAGS.export_dir, input_graph_name)
+            input_saver_def_path = ''
+            input_binary = True
+            output_node_names = 'output_node'
+            restore_op_name = 'save/restore_all'
+            filename_tensor_name = 'save/Const:0'
+            output_graph_path = os.path.join(FLAGS.export_dir, 'output_graph.pb')
+            clear_devices = False
+            freeze_graph.freeze_graph(input_graph_path, input_saver_def_path,
+                                      input_binary, checkpoint_path, output_node_names,
+                                      restore_op_name, filename_tensor_name,
+                                      output_graph_path, clear_devices, '')
+
+            print 'Models exported at %s' % (FLAGS.export_dir)
+        except RuntimeError:
+            print sys.exc_info()[1]
+
+
+def publish():
+    r"""
+    Persists results alongside with the involved hyper parameters for further reporting.
+    """
+    data_sets = read_data_sets()
+
+    with open(os.path.join(log_dir, 'hyper.json'), 'w') as dump_file:
+
+        # Calculate duration in seconds
+        duration = time_finished - time_started
+        duration = duration.days * 86400 + duration.seconds
+
+        json.dump({
+            'context': {
+                'time_started': time_started.isoformat(),
+                'time_finished': time_finished.isoformat(),
+                'git_hash': get_git_revision_hash(),
+                'git_branch': get_git_branch()
+            },
+            'parameters': {
+                'learning_rate': FLAGS.learning_rate,
+                'beta1': FLAGS.beta1,
+                'beta2': FLAGS.beta2,
+                'epsilon': FLAGS.epsilon,
+                'epochs': FLAGS.epochs,
+                'train_batch_size': FLAGS.train_batch_size,
+                'dev_batch_size': FLAGS.dev_batch_size,
+                'test_batch_size': FLAGS.test_batch_size,
+                'validation_step': FLAGS.validation_step,
+                'dropout_rates': dropout_rates,
+                'relu_clip': FLAGS.relu_clip,
+                'n_input': n_input,
+                'n_context': n_context,
+                'n_hidden_1': n_hidden_1,
+                'n_hidden_2': n_hidden_2,
+                'n_hidden_3': n_hidden_3,
+                'n_hidden_5': n_hidden_5,
+                'n_hidden_6': n_hidden_6,
+                'n_cell_dim': n_cell_dim,
+                'n_character': n_character,
+                'total_batches_train': data_sets.train.total_batches,
+                'total_batches_validation': data_sets.dev.total_batches,
+                'total_batches_test': data_sets.test.total_batches,
+                'data_set': {
+                    'name': FLAGS.importer
+                }
+            },
+            'results': {
+                'duration': global_time.days * 86400 + global_time.seconds,
+                'last_train_wer': train_wer,
+                'last_validation_wer': dev_wer,
+                'test_wer': test_wer
+            }
+        }, dump_file, sort_keys=True, indent=4)
+
+    # Let's also re-populate a central JS file, that contains all the dumps at once.
+    merge_logs(logs_dir)
+    maybe_publish()
+
 
 
 def main(_) :
@@ -994,6 +1143,10 @@ def main(_) :
     if len(FLAGS.checkpoint_dir) == 0:
         FLAGS.checkpoint_dir = xdg.save_data_path('deepspeech')
 
+    # Current log sub-directory
+    global log_dir
+    log_dir = os.path.join(FLAGS.logs_dir, time.strftime("%Y%m%d-%H%M%S"))
+
     # Standard session configuration that'll be used for all new sessions.
     global session_config
     session_config = tf.ConfigProto(allow_soft_placement=True, log_device_placement=FLAGS.log_placement)
@@ -1027,10 +1180,9 @@ def main(_) :
     global done_dequeues
     done_dequeues = [queue.dequeue() for queue in done_queues]
 
-    if len(FLAGS.worker_hosts) == 0 and len(FLAGS.ps_hosts) == 0:
-        # Only one local task: this process (default case with no cluster)
+    if len(FLAGS.worker_hosts) == 0:
+        # Only one local task: this process (default case - no cluster)
         train()
-
         print "Done."
 
     else:
@@ -1059,6 +1211,19 @@ def main(_) :
                 train(server)
 
         print ('Server stopped.')
+
+    # Are we the main process?
+    if len(FLAGS.worker_hosts) == 0 or (FLAGS.task_index == 0 and FLAGS.job_name == 'worker'):
+        # Doing solo/post-processing work just on the main process...
+
+        # Exporting the model
+        if FLAGS.export_dir:
+            export()
+
+        # Exporting hyper parameters
+        if FLAGS.publish:
+            publish()
+
 
 if __name__ == '__main__' :
     tf.app.run()
