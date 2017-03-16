@@ -49,6 +49,8 @@ tf.app.flags.DEFINE_integer ('task_index',       0,           'index of task wit
 # Global Constants
 # ================
 
+tf.app.flags.DEFINE_boolean ('train',            True,        'weather to train the network')
+
 tf.app.flags.DEFINE_integer ('epochs',           75,          'number of iterations to train')
 tf.app.flags.DEFINE_boolean ('use_warpctc',      False,       'weather to use GPU bound Warp-CTC')
 
@@ -98,13 +100,16 @@ tf.app.flags.DEFINE_boolean ('remove_export',    False,       'weather to remove
 
 # Reporting
 
-tf.app.flags.DEFINE_boolean ('publish',          False,       'weather to publish hyper parameters')
-tf.app.flags.DEFINE_integer ('report_count',     10,          'number of phrases to print out during a WER report')
+tf.app.flags.DEFINE_boolean ('publish_wer_log',  False,       'weather to publish the WER log')
+tf.app.flags.DEFINE_string  ('wer_log_file',     'werlog.js', 'log-file for keeping track of WER progress')
+
 tf.app.flags.DEFINE_boolean ('log_placement',    False,       'weather to log device placement of the operators to the console')
+tf.app.flags.DEFINE_integer ('report_count',     10,          'number of phrases to print out during a WER report')
+
 tf.app.flags.DEFINE_boolean ('log_variables',    False,       'weather to log gradients and variables summaries to TensorBoard during training')
 tf.app.flags.DEFINE_integer ('summaries_steps',  1,           'number of global training steps we cycle through before saving a summary')
 tf.app.flags.DEFINE_string  ('logs_dir',         'logs',      'directory in which checkpoints are stored')
-tf.app.flags.DEFINE_string  ('wer_log_file',     'werlog.js', 'log-file for keeping track of WER progress')
+
 
 # Initialization
 
@@ -695,21 +700,27 @@ def train(server=None):
         print 'Zero batches in train data set - stopping...'
         return
 
-    # Calculates the epoch from a given global ``step``
     def get_epoch_from_step(step):
+        r"""
+        Calculates the epoch from a given global ``step``
+        """
         # Uncomment the next line for debugging distributed TF
         # print ('step: %d, devices: %d, tau: %d, batches: %d' % (step, len(available_devices), 3, data_sets.train.total_batches))
         return int(ceil(float(step * len(available_devices) * 3) / float(data_sets.train.total_batches)))
 
     def log_wer(wer_type, wer):
+        r"""
+        Logs Train, Validation and Tst WERs to a WER log-file and publishes it.
+        """
         hash = get_git_revision_hash()
         time = datetime.datetime.utcnow().isoformat()
+        # Append to log file
         with open(FLAGS.wer_log_file, 'a') as wer_log_file:
             if wer_log_file.tell() > 0:
                 wer_log_file.write('\n')
             wer_log_file.write('logwer("%s", "%s", "%s", %f)' % (hash, time, wer_type, wer))
         # Publish to web server
-        if FLAGS.publish:
+        if FLAGS.publish_wer_log:
             maybe_publish()
 
     # Get the data sets
@@ -1136,46 +1147,45 @@ def main(_) :
     global done_dequeues
     done_dequeues = [queue.dequeue() for queue in done_queues]
 
-    if len(FLAGS.worker_hosts) == 0:
-        # Only one local task: this process (default case - no cluster)
-        train()
-        print "Done."
+    if FLAGS.train:
+        if len(FLAGS.worker_hosts) == 0:
+            # Only one local task: this process (default case - no cluster)
+            train()
+            print "Done."
 
-    else:
-        # Create and start a server for the local task.
-        server = tf.train.Server(cluster, job_name=FLAGS.job_name, task_index=FLAGS.task_index)
+        else:
+            # Create and start a server for the local task.
+            server = tf.train.Server(cluster, job_name=FLAGS.job_name, task_index=FLAGS.task_index)
 
-        if FLAGS.job_name == 'ps':
-            # We are a parameter server and therefore we just wait for all workers to finish
-            # by waiting for their stop tokens.
-            with tf.Session(server.target) as session:
-                for worker in FLAGS.worker_hosts:
-                    print ('Waiting for stop token...')
-                    token = session.run(done_dequeues[FLAGS.task_index])
-                    print ('Got a stop token from worker %i' %token)
-            print ('Session closed.')
+            if FLAGS.job_name == 'ps':
+                # We are a parameter server and therefore we just wait for all workers to finish
+                # by waiting for their stop tokens.
+                with tf.Session(server.target) as session:
+                    for worker in FLAGS.worker_hosts:
+                        print ('Waiting for stop token...')
+                        token = session.run(done_dequeues[FLAGS.task_index])
+                        print ('Got a stop token from worker %i' %token)
+                print ('Session closed.')
 
-        elif FLAGS.job_name == 'worker':
-            # We are a worker and therefore we have to do some work.
+            elif FLAGS.job_name == 'worker':
+                # We are a worker and therefore we have to do some work.
 
-            # Assigns ops to the local worker by default.
-            with tf.device(tf.train.replica_device_setter(
-                           worker_device=worker_device,
-                           cluster=cluster)):
+                # Assigns ops to the local worker by default.
+                with tf.device(tf.train.replica_device_setter(
+                               worker_device=worker_device,
+                               cluster=cluster)):
 
-                # Do the training
-                train(server)
+                    # Do the training
+                    train(server)
 
-        print ('Server stopped.')
+            print ('Server stopped.')
 
     # Are we the main process?
     if is_chief:
         # Doing solo/post-processing work just on the main process...
-
         # Exporting the model
         if FLAGS.export_dir:
             export()
-
 
 if __name__ == '__main__' :
     tf.app.run()
