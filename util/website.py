@@ -4,7 +4,6 @@ import pysftp
 import sys
 
 from bs4 import BeautifulSoup
-from log import merge_logs
 
 def parse_for_deps(filename):
     """
@@ -152,8 +151,6 @@ def maybe_publish(file='index.htm'):
         print "Not publishing, missing some required environment variables:", missing_env
         print "But maybe this is what you wanted, after all ..."
         return False
-
-    merge_logs("logs")
 
     all_deps = parse_for_deps(file)
 

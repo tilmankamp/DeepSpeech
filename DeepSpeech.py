@@ -24,7 +24,6 @@ from tensorflow.python.tools import freeze_graph
 from tensorflow.python.ops import ctc_ops
 from tensorflow.contrib.rnn.python.ops import core_rnn_cell
 from util.gpu import get_available_gpus
-from util.log import merge_logs
 from util.spell import correction
 from util.shared_lib import check_cupti
 from util.text import sparse_tensor_value_to_texts, wer
@@ -103,8 +102,9 @@ tf.app.flags.DEFINE_boolean ('publish',          False,       'weather to publis
 tf.app.flags.DEFINE_integer ('report_count',     10,          'number of phrases to print out during a WER report')
 tf.app.flags.DEFINE_boolean ('log_placement',    False,       'weather to log device placement of the operators to the console')
 tf.app.flags.DEFINE_boolean ('log_variables',    False,       'weather to log gradients and variables summaries to TensorBoard during training')
-tf.app.flags.DEFINE_integer ('summaries_steps',  100,         'number of global training steps we cycle through before saving a summary')
+tf.app.flags.DEFINE_integer ('summaries_steps',  1,           'number of global training steps we cycle through before saving a summary')
 tf.app.flags.DEFINE_string  ('logs_dir',         'logs',      'directory in which checkpoints are stored')
+tf.app.flags.DEFINE_string  ('wer_log_file',     'werlog.js', 'log-file for keeping track of WER progress')
 
 # Initialization
 
@@ -684,9 +684,6 @@ def train(server=None):
     If no server provided, it performs single process training.
     """
 
-    # Determine, if we are the chief worker
-    is_chief = (FLAGS.task_index == 0)
-
     # Create a variable to hold the global_step.
     # It will automgically get incremented by the optimizer.
     global_step = tf.Variable(0, trainable=False, name='global_step')
@@ -703,6 +700,17 @@ def train(server=None):
         # Uncomment the next line for debugging distributed TF
         # print ('step: %d, devices: %d, tau: %d, batches: %d' % (step, len(available_devices), 3, data_sets.train.total_batches))
         return int(ceil(float(step * len(available_devices) * 3) / float(data_sets.train.total_batches)))
+
+    def log_wer(wer_type, wer):
+        hash = get_git_revision_hash()
+        time = datetime.datetime.utcnow().isoformat()
+        with open(FLAGS.wer_log_file, 'a') as wer_log_file:
+            if wer_log_file.tell() > 0:
+                wer_log_file.write('\n')
+            wer_log_file.write('logwer("%s", "%s", "%s", %f)' % (hash, time, wer_type, wer))
+        # Publish to web server
+        if FLAGS.publish:
+            maybe_publish()
 
     # Get the data sets
     switchable_data_set = SwitchableDataSet(data_sets)
@@ -802,6 +810,7 @@ def train(server=None):
         else:
             return current_step, (avg_loss, None, None)
 
+
     class CoordHook(tf.train.SessionRunHook):
         r"""
         Embedded coordination hook-class that will use variables of the
@@ -821,8 +830,10 @@ def train(server=None):
 
             if is_chief:
                 # Print Test WER report
-                global test_wer
                 test_wer = print_report('Test', results)
+
+                # Append to WER-log
+                log_wer('test', test_wer)
 
             # Closing the data_set queues
             print ("Closing queues...")
@@ -856,12 +867,6 @@ def train(server=None):
                                            save_checkpoint_secs=FLAGS.checkpoint_secs,
                                            save_summaries_steps=FLAGS.summaries_steps,
                                            config=session_config) as session:
-
-        # Defining as globals for statistics and reporting
-        global global_time
-        global global_train_time
-        global train_wer
-        global dev_wer
 
         if is_chief:
             print "STARTING Optimization\n"
@@ -909,13 +914,21 @@ def train(server=None):
                 train_time = stopwatch(train_time)
 
                 # Print report and keep (potentially) calculated WER
-                train_wer = print_report('Training', results, no_wer=train_wer)
+                train_wer = print_report('Training', results)
+
+                # If we got a Training WER, we append it to the WER log
+                if train_wer:
+                    log_wer('train', train_wer)
 
             if is_validation_step and not session.should_stop():
                 _, results = run_batches(session, data_sets.dev, query_report=True)
                 # Print report and keep (potentially) calculated WER
                 if is_chief:
-                    dev_wer = print_report('Validation', results, no_wer=dev_wer)
+                    # Print Validation WER report
+                    dev_wer = print_report('Validation', results)
+
+                    # Append to WER log
+                    log_wer('dev', dev_wer)
 
             if is_chief:
                 # Finishing last epoch
@@ -1020,68 +1033,11 @@ def export():
             print sys.exc_info()[1]
 
 
-def publish():
-    r"""
-    Persists results alongside with the involved hyper parameters for further reporting.
-    """
-    data_sets = read_data_sets()
-
-    with open(os.path.join(log_dir, 'hyper.json'), 'w') as dump_file:
-
-        # Calculate duration in seconds
-        duration = time_finished - time_started
-        duration = duration.days * 86400 + duration.seconds
-
-        json.dump({
-            'context': {
-                'time_started': time_started.isoformat(),
-                'time_finished': time_finished.isoformat(),
-                'git_hash': get_git_revision_hash(),
-                'git_branch': get_git_branch()
-            },
-            'parameters': {
-                'learning_rate': FLAGS.learning_rate,
-                'beta1': FLAGS.beta1,
-                'beta2': FLAGS.beta2,
-                'epsilon': FLAGS.epsilon,
-                'epochs': FLAGS.epochs,
-                'train_batch_size': FLAGS.train_batch_size,
-                'dev_batch_size': FLAGS.dev_batch_size,
-                'test_batch_size': FLAGS.test_batch_size,
-                'validation_step': FLAGS.validation_step,
-                'dropout_rates': dropout_rates,
-                'relu_clip': FLAGS.relu_clip,
-                'n_input': n_input,
-                'n_context': n_context,
-                'n_hidden_1': n_hidden_1,
-                'n_hidden_2': n_hidden_2,
-                'n_hidden_3': n_hidden_3,
-                'n_hidden_5': n_hidden_5,
-                'n_hidden_6': n_hidden_6,
-                'n_cell_dim': n_cell_dim,
-                'n_character': n_character,
-                'total_batches_train': data_sets.train.total_batches,
-                'total_batches_validation': data_sets.dev.total_batches,
-                'total_batches_test': data_sets.test.total_batches,
-                'data_set': {
-                    'name': FLAGS.importer
-                }
-            },
-            'results': {
-                'duration': global_time.days * 86400 + global_time.seconds,
-                'last_train_wer': train_wer,
-                'last_validation_wer': dev_wer,
-                'test_wer': test_wer
-            }
-        }, dump_file, sort_keys=True, indent=4)
-
-    # Let's also re-populate a central JS file, that contains all the dumps at once.
-    merge_logs(logs_dir)
-    maybe_publish()
-
-
-
 def main(_) :
+
+    # Determine, if we are the chief worker
+    global is_chief
+    is_chief = len(FLAGS.worker_hosts) == 0 or (FLAGS.task_index == 0 and FLAGS.job_name == 'worker')
 
     # Set default relative data set directory based on importer name
     if FLAGS.dataset_path == '':
@@ -1213,16 +1169,12 @@ def main(_) :
         print ('Server stopped.')
 
     # Are we the main process?
-    if len(FLAGS.worker_hosts) == 0 or (FLAGS.task_index == 0 and FLAGS.job_name == 'worker'):
+    if is_chief:
         # Doing solo/post-processing work just on the main process...
 
         # Exporting the model
         if FLAGS.export_dir:
             export()
-
-        # Exporting hyper parameters
-        if FLAGS.publish:
-            publish()
 
 
 if __name__ == '__main__' :
