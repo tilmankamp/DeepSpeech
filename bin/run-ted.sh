@@ -9,6 +9,6 @@ python -u DeepSpeech.py \
   --importer ted \
   --train_batch_size 16 \
   --dev_batch_size 8 \
-  --ds_test_batch_size 8 \
+  --test_batch_size 8 \
   --learning_rate 0.0001 \
   "$@"

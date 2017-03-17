@@ -9,5 +9,5 @@ python -u DeepSpeech.py \
   --importer librivox \
   --train_batch_size 32 \
   --dev_batch_size 32 \
-  --ds_test_batch_size 32 \
+  --test_batch_size 32 \
   "$@"

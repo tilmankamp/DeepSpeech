@@ -9,6 +9,6 @@ python -u DeepSpeech.py \
   --importer fischer \
   --train_batch_size 32 \
   --dev_batch_size 32 \
-  --ds_test_batch_size 32 \
+  --test_batch_size 32 \
   --learning_rate 0.0001 \
   "$@"

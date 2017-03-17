@@ -9,5 +9,5 @@ python -u DeepSpeech.py \
   --importer LDC97S62 \
   --train_batch_size 48 \
   --dev_batch_size 32 \
-  --ds_test_batch_size 32 \
+  --test_batch_size 32 \
   "$@"

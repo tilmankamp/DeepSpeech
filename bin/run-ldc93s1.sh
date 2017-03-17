@@ -9,5 +9,5 @@ python -u DeepSpeech.py \
   --importer ldc93s1 \
   --train_batch_size 1 \
   --dev_batch_size 1 \
-  --ds_test_batch_size 1 \
+  --test_batch_size 1 \
   "$@"
