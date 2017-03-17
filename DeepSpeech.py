@@ -35,7 +35,7 @@ from xdg import BaseDirectory as xdg
 # ========
 
 tf.app.flags.DEFINE_string  ('importer',         'ldc93s1',   'importer module - one of ldc93s1, LDC97S62, ted, librivox, fischer')
-tf.app.flags.DEFINE_string  ('dataset_path',     '',          'data set path for the importer - defaults to .data/<importer>')
+tf.app.flags.DEFINE_string  ('dataset_path',     '',          'data set path for the importer - defaults to ./data/<importer>')
 tf.app.flags.DEFINE_boolean ('fulltrace',        False,       'if full trace debug info should be generated during training')
 
 # Cluster configuration
@@ -45,13 +45,15 @@ tf.app.flags.DEFINE_string  ('ps_hosts',         '',          'parameter servers
 tf.app.flags.DEFINE_string  ('worker_hosts',     '',          'workers - comma separated list of hostname:port pairs')
 tf.app.flags.DEFINE_string  ('job_name',         'localhost', 'job name - one of localhost (default), worker, ps')
 tf.app.flags.DEFINE_integer ('task_index',       0,           'index of task within the job - worker with index 0 will be the chief')
+tf.app.flags.DEFINE_integer ('replicas',         -1,          'total number of replicas - if negative, its absolute value is multiplied by the number of workers')
+tf.app.flags.DEFINE_integer ('replicas_to_agg',  -1,          'number of replicas to aggregate - if negative, its absolute value is multiplied by the number of workers')
 
 # Global Constants
 # ================
 
 tf.app.flags.DEFINE_boolean ('train',            True,        'weather to train the network')
+tf.app.flags.DEFINE_string  ('steps',           'E75',        'number of iterations to train - prefix E or e: epochs, S or s: steps - upper/lower case for absolute/relative number')
 
-tf.app.flags.DEFINE_integer ('epochs',           75,          'number of iterations to train')
 tf.app.flags.DEFINE_boolean ('use_warpctc',      False,       'weather to use GPU bound Warp-CTC')
 
 tf.app.flags.DEFINE_float   ('dropout_rate',     0.05,        'dropout rate for feedforward layers')
@@ -109,7 +111,6 @@ tf.app.flags.DEFINE_integer ('report_count',     10,          'number of phrases
 tf.app.flags.DEFINE_boolean ('log_variables',    False,       'weather to log gradients and variables summaries to TensorBoard during training')
 tf.app.flags.DEFINE_integer ('summaries_steps',  1,           'number of global training steps we cycle through before saving a summary')
 tf.app.flags.DEFINE_string  ('logs_dir',         'logs',      'directory in which checkpoints are stored')
-
 
 # Initialization
 
@@ -676,7 +677,7 @@ def read_data_sets(set_names=['train', 'dev', 'test']):
                                           FLAGS.test_batch_size,
                                           n_input,
                                           n_context,
-                                          stride=max(1, len(FLAGS.worker_hosts)),
+                                          stride=num_workers,
                                           offset=FLAGS.task_index,
                                           limit_dev=FLAGS.limit_dev,
                                           limit_test=FLAGS.limit_test,
@@ -696,17 +697,27 @@ def train(server=None):
     # Read all data sets
     data_sets = read_data_sets()
 
+    # Compute an epoch factor - number of global steps per epoch.
+    # The number of workers is factored in to (re)compensate data set sharding.
+    # `replicas_to_agg` times `available_devices` (per node) is
+    # the number of batches trained during one global step
+    epoch_factor = int(ceil(float(data_sets.train.total_batches * num_workers) / \
+                   float((max(1, FLAGS.replicas_to_agg) * len(available_devices)))))
+    print ('Total batches: %d, Number of workers: %d, Replicas to aggregate: %d, Available Devices: %d => Epoch factor: %d' % (data_sets.train.total_batches, num_workers, max(1, FLAGS.replicas_to_agg), len(available_devices), epoch_factor))
+
+
     if data_sets.train.total_batches == 0:
         print 'Zero batches in train data set - stopping...'
         return
+
 
     def get_epoch_from_step(step):
         r"""
         Calculates the epoch from a given global ``step``
         """
         # Uncomment the next line for debugging distributed TF
-        # print ('step: %d, devices: %d, tau: %d, batches: %d' % (step, len(available_devices), 3, data_sets.train.total_batches))
-        return int(ceil(float(step * len(available_devices) * 3) / float(data_sets.train.total_batches)))
+        print ('step: %d, epoch_factor: %d' % (step, epoch_factor))
+        return int(ceil(float(step) / float(epoch_factor)))
 
     def log_wer(wer_type, wer):
         r"""
@@ -729,11 +740,11 @@ def train(server=None):
     # Create the optimizer
     optimizer = create_optimizer()
 
-    # Synchronous training
+    # Synchronous distributed training is facilitated by a special proxy-optimizer
     if not server is None:
         optimizer = tf.train.SyncReplicasOptimizer(optimizer,
-                                                   replicas_to_aggregate=3*len(FLAGS.worker_hosts),
-                                                   total_num_replicas=3*len(FLAGS.worker_hosts))
+                                                   replicas_to_aggregate=FLAGS.replicas_to_agg,
+                                                   total_num_replicas=FLAGS.replicas)
 
     # Get the data_set specific graph end-points
     tower_results = get_tower_results(switchable_data_set, optimizer)
@@ -803,7 +814,7 @@ def train(server=None):
             _, current_step, batch_loss, batch_report = session.run([train_op, global_step, loss, report_params], **extra_params)
 
             # Uncomment the next line for debugging race conditions / distributed TF
-            # print ('Batch step %d' % current_step)
+            print ('Batch step %d' % current_step)
 
             # Add batch to loss
             total_loss += batch_loss
@@ -856,13 +867,23 @@ def train(server=None):
                 session.run(enqueue, feed_dict={ token_placeholder: FLAGS.task_index })
                 print ('Sent stop token to ps.')
 
+    # Parsing the steps specifier
+    step_unit = FLAGS.steps[0]
+    step_count = int(FLAGS.steps[1:])
+    absolute = step_unit.isupper()
+    if step_unit.lower() == 'e':
+        # Prefix e/E stands for epochs - so we multiply the given steps by the epoch_factor
+        step_count = step_count * epoch_factor
 
-    # Calculate last step
-    last_step = FLAGS.epochs * data_sets.train.total_batches - 1
+    if absolute:
+        # Training will stop at an absolute step that's persisted as a variable
+        stop_hook = tf.train.StopAtStepHook(last_step=step_count)
+    else:
+        # Training will stop after the given number of additional steps
+        stop_hook = tf.train.StopAtStepHook(num_steps=step_count)
 
-    # The StopAtStepHook handles stopping after running given steps.
-    hooks = [CoordHook(),
-             tf.train.StopAtStepHook(last_step=last_step)]
+    # Collecting the hooks
+    hooks = [CoordHook(), stop_hook]
 
     # Hook to handle initialization and queues for sync replicas.
     if not server is None:
@@ -905,9 +926,6 @@ def train(server=None):
                 global_train_time = stopwatch(global_train_time)
                 train_time = stopwatch(train_time)
 
-            # As the entry check is done, we can now make the last one the current one.
-            last_epoch = epoch
-
             # Determine if we want to display and/or validate on this iteration/worker
             is_display_step = is_chief and FLAGS.display_step > 0 and ((epoch + 1) % FLAGS.display_step == 0 or epoch == FLAGS.epochs - 1)
             is_validation_step = FLAGS.validation_step > 0 and (epoch + 1) % FLAGS.validation_step == 0
@@ -916,7 +934,6 @@ def train(server=None):
             step, results = run_batches(session, data_sets.train, train=True, query_report=is_display_step)
 
             # Calculate (potentially next) epoch on base of global step
-            last_epoch = epoch
             epoch = get_epoch_from_step(step)
 
             if is_chief:
@@ -944,7 +961,7 @@ def train(server=None):
             if is_chief:
                 # Finishing last epoch
                 overall_time = stopwatch(overall_time)
-                print "FINISHED Epoch", '%04d' % (last_epoch),\
+                print "FINISHED Epoch", '%04d' % (epoch),\
                       "  Overall epoch time:", format_duration(overall_time),\
                       "  Training time:", format_duration(train_time)
                 print
@@ -1052,7 +1069,7 @@ def main(_) :
 
     # Set default relative data set directory based on importer name
     if FLAGS.dataset_path == '':
-        FLAGS.dataset_path = os.path.join('./data', FLAGS.importer)
+        FLAGS.dataset_path = os.path.join('data', FLAGS.importer)
 
     # Lazy-import data set module
     global importer_module
@@ -1067,9 +1084,19 @@ def main(_) :
     FLAGS.ps_hosts = filter(len, FLAGS.ps_hosts.split(","))
     FLAGS.worker_hosts = filter(len, FLAGS.worker_hosts.split(","))
 
+    # The absolute number of computing nodes - regardless of cluster or single mode
+    global num_workers
+    num_workers = max(1, len(FLAGS.worker_hosts))
+
     # Create a cluster from the parameter server and worker hosts.
     global cluster
     cluster = tf.train.ClusterSpec({"ps": FLAGS.ps_hosts, "worker": FLAGS.worker_hosts})
+
+    # If replica numbers are negative, we multiply their absolute values with the number of workers
+    if FLAGS.replicas < 0:
+        FLAGS.replicas = num_workers * -FLAGS.replicas
+    if FLAGS.replicas_to_agg < 0:
+        FLAGS.replicas_to_agg = num_workers * -FLAGS.replicas_to_agg
 
     # The device path base for this node
     global worker_device
