@@ -16,6 +16,11 @@ import tempfile
 import tensorflow as tf
 import time
 import importlib
+import BaseHTTPServer
+import urllib
+import urllib2
+import cgi
+import pickle
 
 from collections import OrderedDict
 from math import ceil, floor
@@ -29,6 +34,7 @@ from util.shared_lib import check_cupti
 from util.text import sparse_tensor_value_to_texts, wer
 from util.data_set_helpers import SwitchableDataSet
 from xdg import BaseDirectory as xdg
+from threading import Thread
 
 
 # Importer
@@ -47,6 +53,9 @@ tf.app.flags.DEFINE_string  ('job_name',         'localhost', 'job name - one of
 tf.app.flags.DEFINE_integer ('task_index',       0,           'index of task within the job - worker with index 0 will be the chief')
 tf.app.flags.DEFINE_integer ('replicas',         -1,          'total number of replicas - if negative, its absolute value is multiplied by the number of workers')
 tf.app.flags.DEFINE_integer ('replicas_to_agg',  -1,          'number of replicas to aggregate - if negative, its absolute value is multiplied by the number of workers')
+tf.app.flags.DEFINE_string  ('coord_host',       'localhost', 'coordination server host')
+tf.app.flags.DEFINE_integer ('coord_port',       4000,        'coordination server port')
+tf.app.flags.DEFINE_integer ('steps_per_worker', 1,           'train or inference steps per worker before results are sent back to coordinator')
 
 # Global Constants
 # ================
@@ -667,6 +676,289 @@ def format_duration(duration):
 # Execution
 # =========
 
+PREFIX_NEXT_INDEX = '/next_index_'
+PREFIX_GET_JOB = '/get_job_'
+
+class WorkerJob(object):
+    def __init__(self, id, set_name, steps, report):
+        self.id = id
+        self.worker = -1
+        self.set_name = set_name
+        self.steps = steps
+        self.report = report
+        self.result = None
+
+    def __str__(self):
+        return 'Job - id: %d, worker: %d, set_name: %s' % (self.id, self. worker, self.set_name)
+
+class TrainingCoordinator(object):
+
+    class TrainingCoordinationHandler(BaseHTTPServer.BaseHTTPRequestHandler):
+
+        def do_GET(self):
+            if self.path.startswith(PREFIX_NEXT_INDEX):
+                index = COORD.get_next_index(self.path[len(PREFIX_NEXT_INDEX):])
+                if index >= 0:
+                    self.send_response(200)
+                    self.send_header("Content-type", "text/plain")
+                    self.end_headers()
+                    self.wfile.write(str(index))
+                    return
+            elif self.path.startswith(PREFIX_GET_JOB):
+                job = COORD.get_job(worker=int(self.path[len(PREFIX_GET_JOB):]))
+                if job:
+                    self.send_response(200)
+                    self.send_header("Content-type", "text/plain")
+                    self.end_headers()
+                    self.wfile.write(pickle.dumps(job))
+                    return
+            self.send_response(404)
+            self.end_headers()
+
+        def parse_POST(self):
+            ctype, pdict = cgi.parse_header(self.headers['content-type'])
+            if ctype == 'multipart/form-data':
+                postvars = cgi.parse_multipart(self.rfile, pdict)
+            elif ctype == 'application/x-www-form-urlencoded':
+                length = int(self.headers['content-length'])
+                postvars = cgi.parse_qs(self.rfile.read(length), keep_blank_values=1)
+            else:
+                postvars = {}
+            return postvars
+
+        def do_POST(self):
+            src = self.parse_POST()['content'][0]
+            job = COORD.next_job(pickle.loads(urllib.unquote(src).decode('utf8')))
+            self.send_response(200)
+            self.send_header("Content-type", "text/plain")
+            self.end_headers()
+            if job:
+                self.wfile.write(pickle.dumps(job))
+
+        def log_message(self, format, *args):
+            return
+
+
+    def __init__(self):
+        self._id_counter = 0
+        self._init()
+        if is_chief:
+            self._httpd = BaseHTTPServer.HTTPServer((FLAGS.coord_host, FLAGS.coord_port), TrainingCoordinator.TrainingCoordinationHandler)
+
+    def _init(self):
+        self._jobs_open = []
+        self._jobs_running = []
+        self._jobs_done = []
+        self._index_train = 0
+        self._index_dev = 0
+        self._index_test = 0
+
+    def get_epoch_from_step(step):
+        r"""
+        Calculates the epoch from a given global ``step``
+        """
+        # Uncomment the next line for debugging distributed TF
+        print ('step: %d, epoch_factor: %d' % (step, self._epoch_factor))
+        return int(ceil(float(step) / float(self._epoch_factor)))
+
+    def log_wer(wer_type, wer):
+        r"""
+        Logs Train, Validation and Tst WERs to a WER log-file and publishes it.
+        """
+        hash = get_git_revision_hash()
+        time = datetime.datetime.utcnow().isoformat()
+        # Append to log file
+        with open(FLAGS.wer_log_file, 'a') as wer_log_file:
+            if wer_log_file.tell() > 0:
+                wer_log_file.write('\n')
+            wer_log_file.write('logwer("%s", "%s", "%s", %f)' % (hash, time, wer_type, wer))
+        # Publish to web server
+        if FLAGS.publish_wer_log:
+            maybe_publish()
+
+    def _log(self, message):
+        print(message)
+
+    def _log_epoch_state(self):
+        self._log('Jobs - open: %d, running: %d, done: %d' % (len(self._jobs_open), len(self._jobs_running), len(self._jobs_done)))
+
+    def _log_all_jobs(self):
+        self._log('Open jobs:')
+        for job in self._jobs_open:
+            self._log(' - ' + str(job))
+        self._log('Running jobs:')
+        for job in self._jobs_running:
+            self._log(' - ' + str(job))
+        self._log('Finished jobs:')
+        for job in self._jobs_done:
+            self._log(' - ' + str(job))
+
+    def start_training(self, data_sets, step=0):
+        self._init()
+        self._train_batches = data_sets.train.total_batches
+        self._dev_batches = data_sets.dev.total_batches
+        self._test_batches = data_sets.test.total_batches
+
+        # Compute an epoch factor - number of global steps per epoch.
+        # The number of workers is factored in to (re)compensate data set sharding.
+        # `replicas_to_agg` times `available_devices` (per node) is
+        # the number of batches trained during one global step
+        self._epoch_factor = int(ceil(float(self._train_batches * num_workers) / \
+                       float((max(1, FLAGS.replicas_to_agg) * len(available_devices)))))
+
+        # Parsing the steps specifier
+        step_unit = FLAGS.steps[0]
+        step_count = int(FLAGS.steps[1:])
+        absolute = step_unit.isupper()
+        if step_unit.lower() == 'e':
+            # Prefix e/E stands for epochs - so we multiply the given steps by the epoch_factor
+            step_count = step_count * self._epoch_factor
+
+        print ('Total batches: %d, Number of workers: %d, Replicas to aggregate: %d, Available Devices: %d => Epoch factor: %d' % (self._train_batches, num_workers, max(1, FLAGS.replicas_to_agg), len(available_devices), self._epoch_factor))
+
+        # Init recent word error rate levels
+        self._train_wer = 0.0
+        self._dev_wer = 0.0
+
+        self._epoch = -1
+
+        print "STARTING Optimization\n"
+        self._training_time = stopwatch()
+
+        self.start_epoch(step=step)
+
+    def start_epoch(self, step=0):
+        self._init()
+
+        steps = self._epoch_factor
+        action = 'STARTING'
+        if step > 0:
+            self._epoch = step / self._epoch_factor
+            steps = steps - (step % self._epoch_factor)
+            if steps < self._epoch_factor:
+                action = 'CONTINUING'
+        else:
+            self._epoch += 1
+
+        # Determine if we want to display and/or validate on this iteration/worker
+        self._is_display_step = FLAGS.display_step > 0 and ((self._epoch + 1) % FLAGS.display_step == 0 or self._epoch == FLAGS.epochs - 1)
+        self._is_validation_step = FLAGS.validation_step > 0 and (self._epoch + 1) % FLAGS.validation_step == 0
+
+        for i in xrange(steps):
+            self._id_counter += 1
+            self._jobs_open.append(WorkerJob(self._id_counter, 'train', FLAGS.steps_per_worker, self._is_display_step))
+
+        if self._is_validation_step:
+            for i in xrange(steps):
+                self._id_counter += 1
+                self._jobs_open.append(WorkerJob(self._id_counter, 'dev', FLAGS.steps_per_worker, True))
+
+        print('%s Epoch %04d' % (action, self._epoch))
+        self._epoch_time = stopwatch()
+
+    def end_epoch(self):
+        self._epoch_time = stopwatch(self._epoch_time)
+        et = format_duration(self._epoch_time)
+        print 'FINISHED Epoch %04d - epoch time: %s' % (self._epoch, et)
+        self.start_epoch()
+
+    def start_test(self):
+        self._init()
+
+        self._epoch = -2
+        for i in xrange(steps):
+            self._id_counter += 1
+            self._jobs_open.append(WorkerJob(self._id_counter, 'test', FLAGS.steps_per_worker, True))
+
+        print('STARTING Test')
+        self._epoch_time = stopwatch()
+
+    def end_test(self):
+        self._epoch_time = stopwatch(self._epoch_time)
+        et = format_duration(self._epoch_time)
+        print 'FINISHED Test - time: %s' % (et)
+        self.end_training()
+
+    def end_training(self):
+        self._training_time = stopwatch(self._training_time)
+        tt = format_duration(self._training_time)
+        print 'FINISHED Optimization - training time: %s' % (self._epoch, tt)
+
+    def _check_epoch_state(self):
+        if len(self._jobs_open) == 0:
+            if self._epoch < 0:
+                self.end_test()
+            else:
+                self.end_epoch()
+
+    def start(self):
+        if is_chief:
+            Thread(target=self._httpd.serve_forever).start()
+
+    def stop(self):
+        if is_chief:
+            self._httpd.shutdown()
+
+    def _talk_to_chief(self, path, data=None, default=None):
+        if data:
+            data = urllib.urlencode({ 'content': data })
+        tries = 0
+        while tries < 10:
+            tries += 1
+            try:
+                url = 'http://%s:%d%s' % (FLAGS.coord_host, FLAGS.coord_port, path)
+                res = urllib2.urlopen(urllib2.Request(url, data))
+                return res.read()
+            except:
+                time.sleep(1)
+                pass
+        return default
+
+    def get_next_index(self, set_name):
+        if is_chief:
+            member = '_index_' + set_name
+            value = getattr(self, member, -1)
+            if value >= 0:
+                value += 1
+                setattr(self, member, value)
+            return value
+        else:
+            return int(self._talk_to_chief(PREFIX_NEXT_INDEX + set_name))
+
+    def get_job(self, worker=0):
+        if is_chief:
+            if len(self._jobs_open) > 0:
+                job = self._jobs_open.pop(0)
+                self._jobs_running.append(job)
+                job.worker = worker
+                self._log('Moved job with ID %d for worker %d from open to running.' % (job.id, worker))
+                return job
+            self._log('Got no job for worker %d.' % (worker))
+            return None
+        else:
+            result = self._talk_to_chief(PREFIX_GET_JOB + str(FLAGS.task_index))
+            if result:
+                result = pickle.loads(result)
+            return result
+
+    def next_job(self, job):
+        if is_chief:
+            index = next((i for i in xrange(len(self._jobs_running)) if self._jobs_running[i].id == job.id), -1)
+            if index >= 0:
+                self._jobs_running.pop(index)
+                self._jobs_done.append(job)
+                self._log('Moved job with ID %d for worker %d from running to done.' % (job.id, job.worker))
+                self._check_epoch_state()
+            else:
+                self._log('Problem: There is no job with ID %d registered as running.' % (job.id))
+            return self.get_job(job.worker)
+        else:
+            result = self._talk_to_chief('', data=pickle.dumps(job))
+            if result:
+                result = pickle.loads(result)
+            return result
+
+
 def read_data_sets(set_names=['train', 'dev', 'test']):
     r"""
     Returns a :class:`DataSets` object of the selected importer, containing all available/selected sets.
@@ -677,8 +969,7 @@ def read_data_sets(set_names=['train', 'dev', 'test']):
                                           FLAGS.test_batch_size,
                                           n_input,
                                           n_context,
-                                          stride=num_workers,
-                                          offset=FLAGS.task_index,
+                                          next_index=lambda set_name, index: COORD.get_next_index(set_name),
                                           limit_dev=FLAGS.limit_dev,
                                           limit_test=FLAGS.limit_test,
                                           limit_train=FLAGS.limit_train,
@@ -696,43 +987,6 @@ def train(server=None):
 
     # Read all data sets
     data_sets = read_data_sets()
-
-    # Compute an epoch factor - number of global steps per epoch.
-    # The number of workers is factored in to (re)compensate data set sharding.
-    # `replicas_to_agg` times `available_devices` (per node) is
-    # the number of batches trained during one global step
-    epoch_factor = int(ceil(float(data_sets.train.total_batches * num_workers) / \
-                   float((max(1, FLAGS.replicas_to_agg) * len(available_devices)))))
-    print ('Total batches: %d, Number of workers: %d, Replicas to aggregate: %d, Available Devices: %d => Epoch factor: %d' % (data_sets.train.total_batches, num_workers, max(1, FLAGS.replicas_to_agg), len(available_devices), epoch_factor))
-
-
-    if data_sets.train.total_batches == 0:
-        print 'Zero batches in train data set - stopping...'
-        return
-
-
-    def get_epoch_from_step(step):
-        r"""
-        Calculates the epoch from a given global ``step``
-        """
-        # Uncomment the next line for debugging distributed TF
-        print ('step: %d, epoch_factor: %d' % (step, epoch_factor))
-        return int(ceil(float(step) / float(epoch_factor)))
-
-    def log_wer(wer_type, wer):
-        r"""
-        Logs Train, Validation and Tst WERs to a WER log-file and publishes it.
-        """
-        hash = get_git_revision_hash()
-        time = datetime.datetime.utcnow().isoformat()
-        # Append to log file
-        with open(FLAGS.wer_log_file, 'a') as wer_log_file:
-            if wer_log_file.tell() > 0:
-                wer_log_file.write('\n')
-            wer_log_file.write('logwer("%s", "%s", "%s", %f)' % (hash, time, wer_type, wer))
-        # Publish to web server
-        if FLAGS.publish_wer_log:
-            maybe_publish()
 
     # Get the data sets
     switchable_data_set = SwitchableDataSet(data_sets)
@@ -760,86 +1014,10 @@ def train(server=None):
     apply_gradient_op = optimizer.apply_gradients(avg_tower_gradients, global_step=global_step)
 
 
-    def run_batches(session, data_set, train=False, query_report=False):
-        r"""
-        It iterates over all batches ``data_set`` and
-        calculate the mean loss using the provided ``session``.
-        If ``train`` is set to ``True``, the data set will get trained.
-        If ``query_report`` is set to ``True``, data for a WER report will be gathered.
-        Returns batch set result tuple consisting of the current global step, the average loss, and,
-        if WER report data should be gathered, the average accuracy and a report results tuple.
-        During operation this method is using variables of the encapsulating Python context.
-        """
-
-        # The feed_dict (mainly for switching between queues)
-        feed_dict = {}
-
-        # Sets the current data_set on SwitchableDataSet switchable_data_set
-        # and the respective placeholder in feed_dict
-        switchable_data_set.set_data_set(feed_dict, data_set)
-
-        # The amount of batches per device (GPU) == ceiled number of loops in batch loop
-        batches_per_device = ceil(float(data_set.total_batches) / len(available_devices))
-
-        # Initialize loss aggregator
-        total_loss = 0.0
-
-        # Setting the training operation in case of training requested
-        train_op = apply_gradient_op if train else []
-
-        # Requirements to display a WER report
-        if query_report:
-            # Reset accuracy
-            total_accuracy = 0.0
-            # Create report results tuple
-            report_results = ([],[],[],[])
-            # Extend the session.run parameters
-            report_params = [results_tuple, accuracy]
-        else:
-            report_params = []
-
-        # So far the only extra parameter is the feed_dict
-        extra_params = { 'feed_dict': feed_dict }
-
-        # Loop over the batches
-        for batch in range(int(batches_per_device)):
-            # In case of the test set iteration from within the CoordHook,
-            # the provided session is (for some reason) not
-            # a MonitoredTrainingSession with a ``should_stop`` method.
-            if 'should_stop' in dir(session):
-                if session.should_stop():
-                    break
-
-            # Compute the batch
-            _, current_step, batch_loss, batch_report = session.run([train_op, global_step, loss, report_params], **extra_params)
-
-            # Uncomment the next line for debugging race conditions / distributed TF
-            print ('Batch step %d' % current_step)
-
-            # Add batch to loss
-            total_loss += batch_loss
-
-            if query_report:
-                # Collect individual sample results
-                collect_results(report_results, batch_report[0])
-                # Add batch to total_accuracy
-                total_accuracy += batch_report[1]
-
-        # Returning the batch set result tuple
-        avg_loss = total_loss / batches_per_device
-        if query_report:
-            return current_step, (avg_loss, total_accuracy / batches_per_device, report_results)
-        else:
-            return current_step, (avg_loss, None, None)
-
-
     class CoordHook(tf.train.SessionRunHook):
         r"""
         Embedded coordination hook-class that will use variables of the
         surrounding Python context.
-        It will start the importers queue threads after session creation.
-        Before the session ends, it will evaluate the final test data set and
-        send out this worker's stop token to all parameter servers.
         """
         def after_create_session(self, session, coord):
             print ('Starting queue runners...')
@@ -847,16 +1025,6 @@ def train(server=None):
             print ('Queue runners started.')
 
         def end(self, session):
-            # Iterate over test data set
-            _, results = run_batches(session, data_sets.test, query_report=True)
-
-            if is_chief:
-                # Print Test WER report
-                test_wer = print_report('Test', results)
-
-                # Append to WER-log
-                log_wer('test', test_wer)
-
             # Closing the data_set queues
             print ("Closing queues...")
             switchable_data_set.close_queue(session)
@@ -867,23 +1035,9 @@ def train(server=None):
                 session.run(enqueue, feed_dict={ token_placeholder: FLAGS.task_index })
                 print ('Sent stop token to ps.')
 
-    # Parsing the steps specifier
-    step_unit = FLAGS.steps[0]
-    step_count = int(FLAGS.steps[1:])
-    absolute = step_unit.isupper()
-    if step_unit.lower() == 'e':
-        # Prefix e/E stands for epochs - so we multiply the given steps by the epoch_factor
-        step_count = step_count * epoch_factor
-
-    if absolute:
-        # Training will stop at an absolute step that's persisted as a variable
-        stop_hook = tf.train.StopAtStepHook(last_step=step_count)
-    else:
-        # Training will stop after the given number of additional steps
-        stop_hook = tf.train.StopAtStepHook(num_steps=step_count)
 
     # Collecting the hooks
-    hooks = [CoordHook(), stop_hook]
+    hooks = [CoordHook()]
 
     # Hook to handle initialization and queues for sync replicas.
     if not server is None:
@@ -901,79 +1055,73 @@ def train(server=None):
                                            config=session_config) as session:
 
         if is_chief:
-            print "STARTING Optimization\n"
-            global_time = stopwatch()
-            global_train_time = 0
+            # Retrieving global_step from the (potentially restored) model
+            feed_dict = {}
+            switchable_data_set.set_data_set(feed_dict, data_sets.train)
+            step = session.run(global_step, feed_dict=feed_dict)
+            COORD.start_training(data_sets, step)
 
-            # Init recent word error rate levels
-            train_wer = 0.0
-            dev_wer = 0.0
+        # Get the first job
+        job = COORD.get_job()
 
-        # Retrieving global_step from the (potentially restored) model
-        feed_dict = {}
-        switchable_data_set.set_data_set(feed_dict, data_sets.train)
-        step = session.run(global_step, feed_dict=feed_dict)
-        epoch = get_epoch_from_step(step)
+        while job and not session.should_stop():
 
-        while not session.should_stop():
+            # The feed_dict (mainly for switching between queues)
+            feed_dict = {}
 
-            if is_chief:
-                print "STARTING Epoch", '%04d' % (epoch)
-                overall_time = stopwatch()
-                train_time = 0
+            # Sets the current data_set on SwitchableDataSet switchable_data_set
+            # and the respective placeholder in feed_dict
+            switchable_data_set.set_data_set(feed_dict, getattr(data_sets, job.set_name))
 
-                # (Re)start training stopwatches
-                global_train_time = stopwatch(global_train_time)
-                train_time = stopwatch(train_time)
+            # Initialize loss aggregator
+            total_loss = 0.0
 
-            # Determine if we want to display and/or validate on this iteration/worker
-            is_display_step = is_chief and FLAGS.display_step > 0 and ((epoch + 1) % FLAGS.display_step == 0 or epoch == FLAGS.epochs - 1)
-            is_validation_step = FLAGS.validation_step > 0 and (epoch + 1) % FLAGS.validation_step == 0
+            # Setting the training operation in case of training requested
+            train_op = apply_gradient_op if job.set_name == 'train' else []
 
-            # Train for one epoch, keep global step for next loop and report data
-            step, results = run_batches(session, data_sets.train, train=True, query_report=is_display_step)
+            # Requirements to display a WER report
+            if job.report:
+                # Reset accuracy
+                total_accuracy = 0.0
+                # Create report results tuple
+                report_results = ([],[],[],[])
+                # Extend the session.run parameters
+                report_params = [results_tuple, accuracy]
+            else:
+                report_params = []
 
-            # Calculate (potentially next) epoch on base of global step
-            epoch = get_epoch_from_step(step)
+            # So far the only extra parameter is the feed_dict
+            extra_params = { 'feed_dict': feed_dict }
 
-            if is_chief:
-                # Stop training stopwatches
-                global_train_time = stopwatch(global_train_time)
-                train_time = stopwatch(train_time)
+            # Loop over the batches
+            for job_step in xrange(job.steps):
+                if session.should_stop():
+                    break
 
-                # Print report and keep (potentially) calculated WER
-                train_wer = print_report('Training', results)
+                # Compute the batch
+                _, current_step, batch_loss, batch_report = session.run([train_op, global_step, loss, report_params], **extra_params)
 
-                # If we got a Training WER, we append it to the WER log
-                if train_wer:
-                    log_wer('train', train_wer)
+                # Uncomment the next line for debugging race conditions / distributed TF
+                print ('Batch step %d' % current_step)
 
-            if is_validation_step and not session.should_stop():
-                _, results = run_batches(session, data_sets.dev, query_report=True)
-                # Print report and keep (potentially) calculated WER
-                if is_chief:
-                    # Print Validation WER report
-                    dev_wer = print_report('Validation', results)
+                # Add batch to loss
+                total_loss += batch_loss
 
-                    # Append to WER log
-                    log_wer('dev', dev_wer)
+                if job.report:
+                    # Collect individual sample results
+                    collect_results(report_results, batch_report[0])
+                    # Add batch to total_accuracy
+                    total_accuracy += batch_report[1]
 
-            if is_chief:
-                # Finishing last epoch
-                overall_time = stopwatch(overall_time)
-                print "FINISHED Epoch", '%04d' % (epoch),\
-                      "  Overall epoch time:", format_duration(overall_time),\
-                      "  Training time:", format_duration(train_time)
-                print
+            # Returning the batch set result tuple
+            avg_loss = total_loss / job.steps
+            if job.report:
+                job.result = (current_step, avg_loss, total_accuracy / job.steps, report_results)
+            else:
+                job.result = (current_step, avg_loss, None, None)
 
-        if is_chief:
-            # Indicate optimization has concluded
-            global_time = stopwatch(global_time)
-            print "FINISHED Optimization",\
-                  "  Overall time:", format_duration(global_time),\
-                  "  Training time:", format_duration(global_train_time)
-            print
-
+            # Send the current job to coordinator and receive the next one
+            job = COORD.next_job(job)
 
     print ('Session closed.')
 
@@ -1066,6 +1214,10 @@ def main(_) :
     # Determine, if we are the chief worker
     global is_chief
     is_chief = len(FLAGS.worker_hosts) == 0 or (FLAGS.task_index == 0 and FLAGS.job_name == 'worker')
+
+    global COORD
+    COORD = TrainingCoordinator()
+    COORD.start()
 
     # Set default relative data set directory based on importer name
     if FLAGS.dataset_path == '':
@@ -1174,6 +1326,8 @@ def main(_) :
     global done_dequeues
     done_dequeues = [queue.dequeue() for queue in done_queues]
 
+    print(FLAGS.__dict__)
+
     if FLAGS.train:
         if len(FLAGS.worker_hosts) == 0:
             # Only one local task: this process (default case - no cluster)
@@ -1213,6 +1367,9 @@ def main(_) :
         # Exporting the model
         if FLAGS.export_dir:
             export()
+
+    # Stopping the coordinator
+    COORD.stop()
 
 if __name__ == '__main__' :
     tf.app.run()
