@@ -34,7 +34,7 @@ from util.shared_lib import check_cupti
 from util.text import sparse_tensor_value_to_texts, wer
 from util.data_set_helpers import SwitchableDataSet
 from xdg import BaseDirectory as xdg
-from threading import Thread
+from threading import Thread, Lock
 
 
 # Importer
@@ -111,6 +111,8 @@ tf.app.flags.DEFINE_boolean ('remove_export',    False,       'weather to remove
 
 # Reporting
 
+tf.app.flags.DEFINE_integer ('log_level',        1,           'log level for console logs - 0: INFO, 1: WARN, 2: ERROR, 3: FATAL')
+
 tf.app.flags.DEFINE_boolean ('publish_wer_log',  False,       'weather to publish the WER log')
 tf.app.flags.DEFINE_string  ('wer_log_file',     'werlog.js', 'log-file for keeping track of WER progress')
 
@@ -129,8 +131,26 @@ tf.app.flags.DEFINE_float   ('default_stddev',   0.046875,    'default standard 
 for var in ['b1', 'h1', 'b2', 'h2', 'b3', 'h3', 'b5', 'h5', 'b6', 'h6']:
     tf.app.flags.DEFINE_float('%s_stddev' % var, None, 'standard deviation to use when initialising %s' % var)
 
-
 FLAGS = tf.app.flags.FLAGS
+
+# Logging functions
+# =================
+
+def log_info(message):
+    if FLAGS.log_level == 0:
+        print('I ' + message)
+
+def log_warn(message):
+    if FLAGS.log_level <= 1:
+        print('W ' + message)
+
+def log_error(message):
+    if FLAGS.log_level <= 2:
+        print('E ' + message)
+
+def log_fatal(message):
+    if FLAGS.log_level <= 3:
+        print('F ' + message)
 
 
 # Geometric Constants
@@ -537,77 +557,36 @@ def get_git_branch():
 # Helpers
 # =======
 
-def calculate_and_print_wer_report(caption, results_tuple):
+def calculate_report(results_tuple):
     r"""
-    This routine will print a WER report with a given caption.
-    It'll print the `mean` WER plus summaries of the ``report_count`` top lowest
-    loss items from the provided WER results tuple
-    (only items with WER!=0 and ordered by their WER).
+    This routine will calculate a WER report.
+    It'll compute the `mean` WER and create ``Sample`` objects of the ``report_count`` top lowest
+    loss items from the provided WER results tuple (only items with WER!=0 and ordered by their WER).
     """
+    samples = []
     items = zip(*results_tuple)
-
-    count = len(items)
     mean_wer = 0.0
-    for i in xrange(count):
-        item = items[i]
-        # If distance > 0 we know that there is a WER > 0 and have to calculate it
-        if item[2] > 0:
-            # Replace result by language model corrected result
-            item = (item[0], correction(item[1]), item[2], item[3])
-            # Replacing accuracy tuple entry by the WER
-            item = (item[0], item[1], wer(item[0], item[1]), item[3])
-            # Replace items[i] with new item
-            items[i] = item
-            mean_wer = mean_wer + item[2]
+    for item in items:
+        sample = Sample(item[0], item[1], item[3], item[2])
+        samples.append(sample)
+        mean_wer += sample.wer
 
     # Getting the mean WER from the accumulated one
-    mean_wer = mean_wer / float(count)
+    mean_wer = mean_wer / float(len(items))
 
     # Filter out all items with WER=0
-    items = [a for a in items if a[2] > 0]
+    samples = [s for s in samples if s.wer > 0]
 
     # Order the remaining items by their loss (lowest loss on top)
-    items.sort(key=lambda a: a[3])
+    samples.sort(key=lambda s: s.loss)
 
     # Take only the first report_count items
-    items = items[:FLAGS.report_count]
+    samples = samples[:FLAGS.report_count]
 
     # Order this top ten items by their WER (lowest WER on top)
-    items.sort(key=lambda a: a[2])
+    samples.sort(key=lambda s: s.wer)
 
-    print "%s WER: %f" % (caption, mean_wer)
-    for a in items:
-        print "-" * 80
-        print "    WER:    %f" % a[2]
-        print "    loss:   %f" % a[3]
-        print "    source: \"%s\"" % a[0]
-        print "    result: \"%s\"" % a[1]
-
-    return mean_wer
-
-def print_report(caption, batch_set_result, no_wer=None):
-    r"""
-    This routine will print a report from a provided batch set result tuple.
-    It takes a caption for titling the output plus the batch set result tuple.
-    If the batch set result tuple contains accuracy and a report results tuple,
-    a complete WER report will be calculated, printed and its mean WER returned.
-    Otherwise it will just print the loss and return ``no_wer``.
-    """
-    # Unpacking batch set result tuple
-    loss, accuracy, results_tuple = batch_set_result
-
-    # We always have a loss value
-    title = caption + " loss=" + "{:.9f}".format(loss)
-
-    mean_wer = no_wer
-    if accuracy is not None and results_tuple is not None:
-        title += " avg_cer=" + "{:.9f}".format(accuracy)
-        mean_wer = calculate_and_print_wer_report(title, results_tuple)
-    else:
-        print title
-
-    return mean_wer
-
+    return mean_wer, samples
 
 def collect_results(results_tuple, returns):
     r"""
@@ -679,17 +658,136 @@ def format_duration(duration):
 PREFIX_NEXT_INDEX = '/next_index_'
 PREFIX_GET_JOB = '/get_job_'
 
+id_counter = 0
+def new_id():
+    global id_counter
+    id_counter += 1
+    return id_counter
+
+class Sample(object):
+    def __init__(self, src, res, loss, accuracy):
+        self.src = src
+        self.res = correction(res)
+        self.loss = loss
+        self.accuracy = accuracy
+        self.wer = wer(self.src, self.res)
+
+    def __str__(self):
+        return 'WER: %f, loss: %f, accuracy: %f\n - src: "%s"\n - res: "%s"' % (self.wer, self.loss, self.accuracy, self.src, self.res)
+
 class WorkerJob(object):
-    def __init__(self, id, set_name, steps, report):
-        self.id = id
+    def __init__(self, epoch_id, set_name, steps, report):
+        self.id = new_id()
+        self.epoch_id = epoch_id
         self.worker = -1
         self.set_name = set_name
         self.steps = steps
         self.report = report
-        self.result = None
+        self.loss = -1
+        self.accuracy = -1
+        self.wer = -1
+        self.samples = []
 
     def __str__(self):
         return 'Job - id: %d, worker: %d, set_name: %s' % (self.id, self. worker, self.set_name)
+
+class Epoch(object):
+    def __init__(self, index, steps, set_name='train', report=False):
+        self.id = new_id()
+        self.index = index
+        self.steps = steps
+        self.set_name = set_name
+        self.report = report
+        self.wer = -1
+        self.loss = -1
+        self.accuracy = -1
+        self.jobs_open = []
+        self.jobs_running = []
+        self.jobs_done = []
+        self.samples = []
+        for i in xrange(self.steps):
+            self.jobs_open.append(WorkerJob(self.id, self.set_name, FLAGS.steps_per_worker, self.report))
+
+    def name(self):
+        if self.set_name == 'train':
+            return 'Epoch %d (training)' % self.index
+        elif self.set_name == 'dev':
+            return 'Epoch %d (validation)' % self.index
+        else:
+            return 'Test (after epoch %d)' % self.index
+
+    def get_job(self, worker):
+        if len(self.jobs_open) > 0:
+            job = self.jobs_open.pop(0)
+            self.jobs_running.append(job)
+            job.worker = worker
+            return job
+        else:
+            return None
+
+    def finish_job(self, job):
+        index = next((i for i in xrange(len(self.jobs_running)) if self.jobs_running[i].id == job.id), -1)
+        if index >= 0:
+            self.jobs_running.pop(index)
+            self.jobs_done.append(job)
+            log_info('%s - Moved job with ID %d for worker %d from running to done.' % (self.name(), job.id, job.worker))
+        else:
+            log_warn('%s - There is no job with ID %d registered as running.' % (self.name(), job.id))
+
+    def done(self):
+        if len(self.jobs_open) == 0 and len(self.jobs_running) == 0:
+            num_jobs = len(self.jobs_done)
+            if num_jobs > 0:
+                jobs = self.jobs_done
+                self.jobs_done = []
+                if not self.steps == num_jobs:
+                    log_warn('%s - Number of steps not equal to number of jobs done.' % (self.name()))
+
+                agg_loss = 0.0
+                agg_wer = 0.0
+                agg_accuracy = 0.0
+
+                for i in xrange(num_jobs):
+                    job = jobs.pop(0)
+                    agg_loss += job.loss
+                    if self.report:
+                        agg_wer += job.wer
+
+                        agg_accuracy += job.accuracy
+                    self.samples.extend(job.samples)
+
+                self.loss = agg_loss / float(num_jobs)
+                self.wer = agg_wer / float(num_jobs)
+                self.accuracy = agg_accuracy / float(num_jobs)
+
+                # Order samles by their loss (lowest loss on top)
+                self.samples.sort(key=lambda s: s.loss)
+
+                # Take only the first report_count items
+                self.samples = self.samples[:FLAGS.report_count]
+
+                # Order this top ten items by their WER (lowest WER on top)
+                self.samples.sort(key=lambda s: s.wer)
+            return True
+        else:
+            return False
+
+    def __str__(self):
+        if self.done():
+            if self.report:
+                s = '%s - WER: %f, loss: %s, accuracy: %f' % (self.name(), self.wer, self.loss, self.accuracy)
+                if len(self.samples) > 0:
+                    line = '\n' + ('-' * 80)
+                    for sample in self.samples:
+                        s += line + '\n' + str(sample)
+                    s += line
+                return s
+            else:
+                return '%s - loss: %f' % (self.name(), self.loss)
+        else:
+            return '%s - jobs open: %d, jobs running: %d, jobs done: %d' % (self.name(), len(self.jobs_open), len(self.jobs_running), len(self.jobs_done))
+
+
 
 class TrainingCoordinator(object):
 
@@ -700,7 +798,7 @@ class TrainingCoordinator(object):
                 index = COORD.get_next_index(self.path[len(PREFIX_NEXT_INDEX):])
                 if index >= 0:
                     self.send_response(200)
-                    self.send_header("Content-type", "text/plain")
+                    self.send_header("content-type", "text/plain")
                     self.end_headers()
                     self.wfile.write(str(index))
                     return
@@ -708,29 +806,18 @@ class TrainingCoordinator(object):
                 job = COORD.get_job(worker=int(self.path[len(PREFIX_GET_JOB):]))
                 if job:
                     self.send_response(200)
-                    self.send_header("Content-type", "text/plain")
+                    self.send_header("content-type", "text/plain")
                     self.end_headers()
                     self.wfile.write(pickle.dumps(job))
                     return
             self.send_response(404)
             self.end_headers()
 
-        def parse_POST(self):
-            ctype, pdict = cgi.parse_header(self.headers['content-type'])
-            if ctype == 'multipart/form-data':
-                postvars = cgi.parse_multipart(self.rfile, pdict)
-            elif ctype == 'application/x-www-form-urlencoded':
-                length = int(self.headers['content-length'])
-                postvars = cgi.parse_qs(self.rfile.read(length), keep_blank_values=1)
-            else:
-                postvars = {}
-            return postvars
-
         def do_POST(self):
-            src = self.parse_POST()['content'][0]
-            job = COORD.next_job(pickle.loads(urllib.unquote(src).decode('utf8')))
+            src = self.rfile.read(int(self.headers['content-length']))
+            job = COORD.next_job(pickle.loads(src))
             self.send_response(200)
-            self.send_header("Content-type", "text/plain")
+            self.send_header("content-type", "text/plain")
             self.end_headers()
             if job:
                 self.wfile.write(pickle.dumps(job))
@@ -742,16 +829,19 @@ class TrainingCoordinator(object):
     def __init__(self):
         self._id_counter = 0
         self._init()
+        self._lock = Lock()
         if is_chief:
             self._httpd = BaseHTTPServer.HTTPServer((FLAGS.coord_host, FLAGS.coord_port), TrainingCoordinator.TrainingCoordinationHandler)
 
-    def _init(self):
-        self._jobs_open = []
-        self._jobs_running = []
-        self._jobs_done = []
+    def _reset_counters(self):
         self._index_train = 0
         self._index_dev = 0
         self._index_test = 0
+
+    def _init(self):
+        self._epochs_running = []
+        self._epochs_done = []
+        self._reset_counters()
 
     def get_epoch_from_step(step):
         r"""
@@ -780,56 +870,53 @@ class TrainingCoordinator(object):
         print(message)
 
     def _log_epoch_state(self):
-        self._log('Jobs - open: %d, running: %d, done: %d' % (len(self._jobs_open), len(self._jobs_running), len(self._jobs_done)))
+        self._log('Epochs - running: %d, done: %d' % (len(self._epochs_running), len(self._epochs_done)))
 
     def _log_all_jobs(self):
-        self._log('Open jobs:')
-        for job in self._jobs_open:
+        self._log('Running epochs:')
+        for epoch in self._epochs_running:
             self._log(' - ' + str(job))
-        self._log('Running jobs:')
-        for job in self._jobs_running:
-            self._log(' - ' + str(job))
-        self._log('Finished jobs:')
-        for job in self._jobs_done:
-            self._log(' - ' + str(job))
+        self._log('Finished epochs:')
+        for epoch in self._epochs_done:
+            self._log(' - ' + str(epoch))
 
     def start_training(self, data_sets, step=0):
-        self._init()
-        self._train_batches = data_sets.train.total_batches
-        self._dev_batches = data_sets.dev.total_batches
-        self._test_batches = data_sets.test.total_batches
+        with self._lock:
+            self._init()
+            self._train_batches = data_sets.train.total_batches
+            self._dev_batches = data_sets.dev.total_batches
+            self._test_batches = data_sets.test.total_batches
 
-        # Compute an epoch factor - number of global steps per epoch.
-        # The number of workers is factored in to (re)compensate data set sharding.
-        # `replicas_to_agg` times `available_devices` (per node) is
-        # the number of batches trained during one global step
-        self._epoch_factor = int(ceil(float(self._train_batches * num_workers) / \
-                       float((max(1, FLAGS.replicas_to_agg) * len(available_devices)))))
+            # Compute an epoch factor - number of global steps per epoch.
+            # The number of workers is factored in to (re)compensate data set sharding.
+            # `replicas_to_agg` times `available_devices` (per node) is
+            # the number of batches trained during one global step
+            self._epoch_factor = int(ceil(float(self._train_batches * num_workers) / \
+                           float((max(1, FLAGS.replicas_to_agg) * len(available_devices)))))
 
-        # Parsing the steps specifier
-        step_unit = FLAGS.steps[0]
-        step_count = int(FLAGS.steps[1:])
-        absolute = step_unit.isupper()
-        if step_unit.lower() == 'e':
-            # Prefix e/E stands for epochs - so we multiply the given steps by the epoch_factor
-            step_count = step_count * self._epoch_factor
+            # Parsing the steps specifier
+            step_unit = FLAGS.steps[0]
+            step_count = int(FLAGS.steps[1:])
+            absolute = step_unit.isupper()
+            if step_unit.lower() == 'e':
+                # Prefix e/E stands for epochs - so we multiply the given steps by the epoch_factor
+                step_count = step_count * self._epoch_factor
 
-        print ('Total batches: %d, Number of workers: %d, Replicas to aggregate: %d, Available Devices: %d => Epoch factor: %d' % (self._train_batches, num_workers, max(1, FLAGS.replicas_to_agg), len(available_devices), self._epoch_factor))
+            print ('Total batches: %d, Number of workers: %d, Replicas to aggregate: %d, Available Devices: %d => Epoch factor: %d' % (self._train_batches, num_workers, max(1, FLAGS.replicas_to_agg), len(available_devices), self._epoch_factor))
 
-        # Init recent word error rate levels
-        self._train_wer = 0.0
-        self._dev_wer = 0.0
+            # Init recent word error rate levels
+            self._train_wer = 0.0
+            self._dev_wer = 0.0
 
-        self._epoch = -1
+            self._epoch = -1
 
-        print "STARTING Optimization\n"
-        self._training_time = stopwatch()
+            print "STARTING Optimization\n"
+            self._training_time = stopwatch()
 
-        self.start_epoch(step=step)
+            self.next_epoch(step=step)
 
-    def start_epoch(self, step=0):
-        self._init()
-
+    def next_epoch(self, step=0):
+        self._reset_counters()
         steps = self._epoch_factor
         action = 'STARTING'
         if step > 0:
@@ -841,55 +928,20 @@ class TrainingCoordinator(object):
             self._epoch += 1
 
         # Determine if we want to display and/or validate on this iteration/worker
-        self._is_display_step = FLAGS.display_step > 0 and ((self._epoch + 1) % FLAGS.display_step == 0 or self._epoch == FLAGS.epochs - 1)
+        self._is_display_step = FLAGS.display_step > 0 and ((self._epoch + 1) % FLAGS.display_step == 0) # or self._epoch == FLAGS.epochs - 1
         self._is_validation_step = FLAGS.validation_step > 0 and (self._epoch + 1) % FLAGS.validation_step == 0
 
-        for i in xrange(steps):
-            self._id_counter += 1
-            self._jobs_open.append(WorkerJob(self._id_counter, 'train', FLAGS.steps_per_worker, self._is_display_step))
+        self._epochs_running.append(Epoch(self._epoch, steps, set_name='train', report=self._is_display_step))
 
         if self._is_validation_step:
-            for i in xrange(steps):
-                self._id_counter += 1
-                self._jobs_open.append(WorkerJob(self._id_counter, 'dev', FLAGS.steps_per_worker, True))
+            self._epochs_running.append(Epoch(self._epoch, steps, set_name='dev', report=True))
 
-        print('%s Epoch %04d' % (action, self._epoch))
-        self._epoch_time = stopwatch()
-
-    def end_epoch(self):
-        self._epoch_time = stopwatch(self._epoch_time)
-        et = format_duration(self._epoch_time)
-        print 'FINISHED Epoch %04d - epoch time: %s' % (self._epoch, et)
-        self.start_epoch()
-
-    def start_test(self):
-        self._init()
-
-        self._epoch = -2
-        for i in xrange(steps):
-            self._id_counter += 1
-            self._jobs_open.append(WorkerJob(self._id_counter, 'test', FLAGS.steps_per_worker, True))
-
-        print('STARTING Test')
-        self._epoch_time = stopwatch()
-
-    def end_test(self):
-        self._epoch_time = stopwatch(self._epoch_time)
-        et = format_duration(self._epoch_time)
-        print 'FINISHED Test - time: %s' % (et)
-        self.end_training()
+        return True
 
     def end_training(self):
         self._training_time = stopwatch(self._training_time)
         tt = format_duration(self._training_time)
         print 'FINISHED Optimization - training time: %s' % (self._epoch, tt)
-
-    def _check_epoch_state(self):
-        if len(self._jobs_open) == 0:
-            if self._epoch < 0:
-                self.end_test()
-            else:
-                self.end_epoch()
 
     def start(self):
         if is_chief:
@@ -900,14 +952,12 @@ class TrainingCoordinator(object):
             self._httpd.shutdown()
 
     def _talk_to_chief(self, path, data=None, default=None):
-        if data:
-            data = urllib.urlencode({ 'content': data })
         tries = 0
         while tries < 10:
             tries += 1
             try:
                 url = 'http://%s:%d%s' % (FLAGS.coord_host, FLAGS.coord_port, path)
-                res = urllib2.urlopen(urllib2.Request(url, data))
+                res = urllib2.urlopen(urllib2.Request(url, data, { 'content-type': 'text/plain' }))
                 return res.read()
             except:
                 time.sleep(1)
@@ -915,42 +965,58 @@ class TrainingCoordinator(object):
         return default
 
     def get_next_index(self, set_name):
-        if is_chief:
-            member = '_index_' + set_name
-            value = getattr(self, member, -1)
-            if value >= 0:
-                value += 1
-                setattr(self, member, value)
-            return value
-        else:
-            return int(self._talk_to_chief(PREFIX_NEXT_INDEX + set_name))
+        with self._lock:
+            if is_chief:
+                member = '_index_' + set_name
+                value = getattr(self, member, -1)
+                if value >= 0:
+                    value += 1
+                    setattr(self, member, value)
+                return value
+            else:
+                return int(self._talk_to_chief(PREFIX_NEXT_INDEX + set_name))
+
+    def _get_job(self, worker=0):
+        job = None
+        for epoch in self._epochs_running:
+            job = epoch.get_job(worker)
+            if job:
+                return job
+        return None
 
     def get_job(self, worker=0):
-        if is_chief:
-            if len(self._jobs_open) > 0:
-                job = self._jobs_open.pop(0)
-                self._jobs_running.append(job)
-                job.worker = worker
-                self._log('Moved job with ID %d for worker %d from open to running.' % (job.id, worker))
+        with self._lock:
+            if is_chief:
+                job = self._get_job(worker)
+                if job is None:
+                    if self.next_epoch():
+                        job = self._get_job(worker)
+                    else:
+                        log_info('No jobs left for worker %d.' % (worker))
+                        return None
+                if job is None:
+                    log_error('Unexpected case - no job for worker %d.' % (worker))
+                else:
+                    log_info('New job for worker %d.' % (worker))
                 return job
-            self._log('Got no job for worker %d.' % (worker))
-            return None
-        else:
-            result = self._talk_to_chief(PREFIX_GET_JOB + str(FLAGS.task_index))
-            if result:
-                result = pickle.loads(result)
-            return result
+            else:
+                result = self._talk_to_chief(PREFIX_GET_JOB + str(FLAGS.task_index))
+                if result:
+                    result = pickle.loads(result)
+                return result
 
     def next_job(self, job):
         if is_chief:
-            index = next((i for i in xrange(len(self._jobs_running)) if self._jobs_running[i].id == job.id), -1)
-            if index >= 0:
-                self._jobs_running.pop(index)
-                self._jobs_done.append(job)
-                self._log('Moved job with ID %d for worker %d from running to done.' % (job.id, job.worker))
-                self._check_epoch_state()
+            epoch = next((epoch for epoch in self._epochs_running if epoch.id == job.epoch_id), None)
+            if epoch:
+                with self._lock:
+                    epoch.finish_job(job)
+                    if epoch.done():
+                        self._epochs_running.remove(epoch)
+                        self._epochs_done.append(epoch)
+                        print (epoch)
             else:
-                self._log('Problem: There is no job with ID %d registered as running.' % (job.id))
+                log_warn('There is no running epoch of id %d for job with ID %d.' % (job.epoch_id, job.id))
             return self.get_job(job.worker)
         else:
             result = self._talk_to_chief('', data=pickle.dumps(job))
@@ -1102,7 +1168,7 @@ def train(server=None):
                 _, current_step, batch_loss, batch_report = session.run([train_op, global_step, loss, report_params], **extra_params)
 
                 # Uncomment the next line for debugging race conditions / distributed TF
-                print ('Batch step %d' % current_step)
+                # print ('Batch step %d' % current_step)
 
                 # Add batch to loss
                 total_loss += batch_loss
@@ -1113,12 +1179,11 @@ def train(server=None):
                     # Add batch to total_accuracy
                     total_accuracy += batch_report[1]
 
-            # Returning the batch set result tuple
-            avg_loss = total_loss / job.steps
+            # Gathering job results
+            job.loss = total_loss / job.steps
             if job.report:
-                job.result = (current_step, avg_loss, total_accuracy / job.steps, report_results)
-            else:
-                job.result = (current_step, avg_loss, None, None)
+                job.accuracy = total_accuracy / job.steps
+                job.wer, job.samples = calculate_report(report_results)
 
             # Send the current job to coordinator and receive the next one
             job = COORD.next_job(job)
@@ -1325,8 +1390,6 @@ def main(_) :
     # Dequeue operations for each parameter server
     global done_dequeues
     done_dequeues = [queue.dequeue() for queue in done_queues]
-
-    print(FLAGS.__dict__)
 
     if FLAGS.train:
         if len(FLAGS.worker_hosts) == 0:
