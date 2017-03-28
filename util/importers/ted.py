@@ -87,11 +87,11 @@ class DataSet(object):
     def _create_files_list(self):
         priorityQueue = PriorityQueue()
         for txt_file in self._txt_files:
-          stm_dir = path.sep + "stm" + path.sep
-          wav_dir = path.sep + "wav" + path.sep
-          wav_file = path.splitext(txt_file.replace(stm_dir, wav_dir))[0] + ".wav"
-          wav_file_size = getsize(wav_file)
-          priorityQueue.put((wav_file_size, (txt_file, wav_file)))
+            stm_dir = path.sep + "stm" + path.sep
+            wav_dir = path.sep + "wav" + path.sep
+            wav_file = path.splitext(txt_file.replace(stm_dir, wav_dir))[0] + ".wav"
+            wav_file_size = getsize(wav_file)
+            priorityQueue.put((wav_file_size, (txt_file, wav_file)))
         files_list = []
         while not priorityQueue.empty():
             priority, (txt_file, wav_file) = priorityQueue.get()

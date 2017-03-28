@@ -61,7 +61,8 @@ tf.app.flags.DEFINE_integer ('steps_per_worker', 1,           'train or inferenc
 # ================
 
 tf.app.flags.DEFINE_boolean ('train',            True,        'weather to train the network')
-tf.app.flags.DEFINE_string  ('steps',           'E75',        'number of iterations to train - prefix E or e: epochs, S or s: steps - upper/lower case for absolute/relative number')
+tf.app.flags.DEFINE_boolean ('test',             True,        'weather to test the network')
+tf.app.flags.DEFINE_integer ('epochs',           75,          'target epoch to train for - if negative, the absolute number of additional epochs will be trained')
 
 tf.app.flags.DEFINE_boolean ('use_warpctc',      False,       'weather to use GPU bound Warp-CTC')
 
@@ -136,21 +137,24 @@ FLAGS = tf.app.flags.FLAGS
 # Logging functions
 # =================
 
-def log_info(message):
+def prefix_print(prefix, message):
+    print(prefix + ('\n' + prefix).join(message.split('\n')))
+
+def log_debug(message):
     if FLAGS.log_level == 0:
-        print('I ' + message)
+        prefix_print('D ', str(message))
+
+def log_info(message):
+    if FLAGS.log_level <= 1:
+        prefix_print('I ', str(message))
 
 def log_warn(message):
-    if FLAGS.log_level <= 1:
-        print('W ' + message)
+    if FLAGS.log_level <= 2:
+        prefix_print('W ', str(message))
 
 def log_error(message):
-    if FLAGS.log_level <= 2:
-        print('E ' + message)
-
-def log_fatal(message):
     if FLAGS.log_level <= 3:
-        print('F ' + message)
+        prefix_print('E ', str(message))
 
 
 # Geometric Constants
@@ -187,11 +191,11 @@ n_hidden_6 = n_character
 # ==============
 
 def variable_on_cpu(name, shape, initializer):
-    r"""
+    r'''
     Next we concern ourselves with graph creation.
     However, before we do so we must introduce a utility function ``variable_on_cpu()``
     used to create a variable in CPU memory.
-    """
+    '''
     # Use the /cpu:0 device on worker_device for scoped operations
     if len(FLAGS.ps_hosts) == 0:
         device = worker_device
@@ -205,7 +209,7 @@ def variable_on_cpu(name, shape, initializer):
 
 
 def BiRNN(batch_x, seq_length, dropout):
-    r"""
+    r'''
     That done, we will define the learned variables, the weights and biases,
     within the method ``BiRNN()`` which also constructs the neural network.
     The variables named ``hn``, where ``n`` is an integer, hold the learned weight variables.
@@ -217,7 +221,7 @@ def BiRNN(batch_x, seq_length, dropout):
     an input vector of dimension ``n_hidden_1`` to one of dimension ``n_hidden_2``.
     The variables ``h3``, ``h5``, and ``h6`` are similar.
     Likewise, the biases, ``b1``, ``b2``..., hold the biases for the various layers.
-    """
+    '''
     # Input shape: [batch_size, n_steps, n_input + 2*n_input*n_context]
     batch_x_shape = tf.shape(batch_x)
 
@@ -307,7 +311,7 @@ def BiRNN(batch_x, seq_length, dropout):
 # Accuracy and Loss
 # =================
 
-# In accord with "Deep Speech: Scaling up end-to-end speech recognition"
+# In accord with 'Deep Speech: Scaling up end-to-end speech recognition'
 # (http://arxiv.org/abs/1412.5567),
 # the loss function used by our network should be the CTC loss function
 # (http://www.cs.toronto.edu/~graves/preprint.pdf).
@@ -315,11 +319,11 @@ def BiRNN(batch_x, seq_length, dropout):
 # Thus, we can simply make use of this implementation to define our loss.
 
 def calculate_accuracy_and_loss(batch_set, dropout):
-    r"""
+    r'''
     This routine beam search decodes a mini-batch and calculates the loss and accuracy.
     Next to total and average loss it returns the accuracy,
     the decoded result and the batch's original Y.
-    """
+    '''
     # Obtain the next batch of data
     batch_x, batch_seq_len, batch_y = batch_set.next_batch()
 
@@ -357,9 +361,9 @@ def calculate_accuracy_and_loss(batch_set, dropout):
 # Adam Optimization
 # =================
 
-# In constrast to "Deep Speech: Scaling up end-to-end speech recognition"
+# In constrast to 'Deep Speech: Scaling up end-to-end speech recognition'
 # (http://arxiv.org/abs/1412.5567),
-# in which "Nesterov's Accelerated Gradient Descent"
+# in which 'Nesterov's Accelerated Gradient Descent'
 # (www.cs.toronto.edu/~fritz/absps/momentum.pdf) was used,
 # we will use the Adam method for optimization (http://arxiv.org/abs/1412.6980),
 # because, generally, it requires less fine-tuning.
@@ -382,13 +386,13 @@ def create_optimizer():
 # A tower is specified by two properties:
 # * **Scope** - A scope, as provided by `tf.name_scope()`,
 # is a means to isolate the operations within a tower.
-# For example, all operations within "tower 0" could have their name prefixed with `tower_0/`.
+# For example, all operations within 'tower 0' could have their name prefixed with `tower_0/`.
 # * **Device** - A hardware device, as provided by `tf.device()`,
 # on which all operations within the tower execute.
-# For example, all operations of "tower 0" could execute on the first GPU `tf.device('/gpu:0')`.
+# For example, all operations of 'tower 0' could execute on the first GPU `tf.device('/gpu:0')`.
 
 def get_tower_results(batch_set, optimizer):
-    r"""
+    r'''
     With this preliminary step out of the way, we can for each GPU introduce a
     tower for which's batch we calculate
 
@@ -407,7 +411,7 @@ def get_tower_results(batch_set, optimizer):
     Finally this new method ``get_tower_results()`` will return those tower arrays.
     In case of ``tower_accuracies`` and ``tower_avg_losses``, it will return the
     averaged values instead of the arrays.
-    """
+    '''
     # Tower labels to return
     tower_labels = []
 
@@ -480,11 +484,11 @@ def get_tower_results(batch_set, optimizer):
 
 
 def average_gradients(tower_gradients):
-    r"""
+    r'''
     A routine for computing each variable's average of the gradients obtained from the GPUs.
     Note also that this code acts as a syncronization point as it requires all
     GPUs to be finished with their mini-batch before it can run to completion.
-    """
+    '''
     # List of average gradients to return to the caller
     average_grads = []
 
@@ -519,11 +523,11 @@ def average_gradients(tower_gradients):
 # =======
 
 def log_variable(variable, gradient=None):
-    r"""
+    r'''
     We introduce a function for logging a tensor variable's current state.
     It logs scalar values for the mean, standard deviation, minimum and maximum.
     Furthermore it logs a histogram of its state and (if given) of an optimization gradient.
-    """
+    '''
     name = variable.name
     mean = tf.reduce_mean(variable)
     tf.summary.scalar(name='%s/mean'   % name, tensor=mean)
@@ -541,9 +545,9 @@ def log_variable(variable, gradient=None):
 
 
 def log_grads_and_vars(grads_and_vars):
-    r"""
+    r'''
     Let's also introduce a helper function for logging collections of gradient/variable tuples.
-    """
+    '''
     for gradient, variable in grads_and_vars:
         log_variable(variable, gradient=gradient)
 
@@ -558,11 +562,11 @@ def get_git_branch():
 # =======
 
 def calculate_report(results_tuple):
-    r"""
+    r'''
     This routine will calculate a WER report.
     It'll compute the `mean` WER and create ``Sample`` objects of the ``report_count`` top lowest
     loss items from the provided WER results tuple (only items with WER!=0 and ordered by their WER).
-    """
+    '''
     samples = []
     items = zip(*results_tuple)
     mean_wer = 0.0
@@ -589,7 +593,7 @@ def calculate_report(results_tuple):
     return mean_wer, samples
 
 def collect_results(results_tuple, returns):
-    r"""
+    r'''
     This routine will help collecting partial results for the WER reports.
     The ``results_tuple`` is composed of an array of the original labels,
     an array of the corresponding decodings, an array of the corrsponding
@@ -599,7 +603,7 @@ def collect_results(results_tuple, returns):
     Labels and decodings are converted to text before splicing them into their
     corresponding results_tuple lists. In the case of decodings,
     for now we just pick the first available path.
-    """
+    '''
     # Each of the arrays within results_tuple will get extended by a batch of each available device
     for i in xrange(len(available_devices)):
         # Collect the labels
@@ -617,7 +621,7 @@ def collect_results(results_tuple, returns):
 
 # For reporting we also need a standard way to do time measurements.
 def stopwatch(start_duration=0):
-    r"""
+    r'''
     This function will toggle a stopwatch.
     The first call starts it, second call stops it, third call continues it etc.
     So if you want to measure the accumulated time spent in a certain area of the code,
@@ -636,20 +640,20 @@ def stopwatch(start_duration=0):
           fun_time = stopwatch(fun_time)
         [...]
         # The following line only makes sense after an even call of :code:`fun_time = stopwatch(fun_time)`.
-        print "Time spent in fun():", format_duration(fun_time)
+        print 'Time spent in fun():', format_duration(fun_time)
 
-    """
+    '''
     if start_duration == 0:
         return datetime.datetime.utcnow()
     else:
         return datetime.datetime.utcnow() - start_duration
 
 def format_duration(duration):
-    """Formats the result of an even stopwatch call as hours:minutes:seconds"""
+    '''Formats the result of an even stopwatch call as hours:minutes:seconds'''
     duration = duration if isinstance(duration, int) else duration.seconds
     m, s = divmod(duration, 60)
     h, m = divmod(m, 60)
-    return "%d:%02d:%02d" % (h, m, s)
+    return '%d:%02d:%02d' % (h, m, s)
 
 
 # Execution
@@ -676,9 +680,10 @@ class Sample(object):
         return 'WER: %f, loss: %f, accuracy: %f\n - src: "%s"\n - res: "%s"' % (self.wer, self.loss, self.accuracy, self.src, self.res)
 
 class WorkerJob(object):
-    def __init__(self, epoch_id, set_name, steps, report):
+    def __init__(self, epoch_id, index, set_name, steps, report):
         self.id = new_id()
         self.epoch_id = epoch_id
+        self.index = index
         self.worker = -1
         self.set_name = set_name
         self.steps = steps
@@ -689,7 +694,7 @@ class WorkerJob(object):
         self.samples = []
 
     def __str__(self):
-        return 'Job - id: %d, worker: %d, set_name: %s' % (self.id, self. worker, self.set_name)
+        return 'Job (id: %d, worker: %d, epoch: %d, set_name: %s)' % (self.id, self.worker, self.index, self.set_name)
 
 class Epoch(object):
     def __init__(self, index, steps, set_name='train', report=False):
@@ -706,15 +711,19 @@ class Epoch(object):
         self.jobs_done = []
         self.samples = []
         for i in xrange(self.steps):
-            self.jobs_open.append(WorkerJob(self.id, self.set_name, FLAGS.steps_per_worker, self.report))
+            self.jobs_open.append(WorkerJob(self.id, self.index, self.set_name, FLAGS.steps_per_worker, self.report))
 
     def name(self):
-        if self.set_name == 'train':
-            return 'Epoch %d (training)' % self.index
-        elif self.set_name == 'dev':
-            return 'Epoch %d (validation)' % self.index
+        if self.index >= 0:
+            ename = ' of Epoch %d' % self.index
         else:
-            return 'Test (after epoch %d)' % self.index
+            ename = ''
+        if self.set_name == 'train':
+            return 'Training%s' % ename
+        elif self.set_name == 'dev':
+            return 'Validation%s' % ename
+        else:
+            return 'Test%s' % ename
 
     def get_job(self, worker):
         if len(self.jobs_open) > 0:
@@ -730,7 +739,7 @@ class Epoch(object):
         if index >= 0:
             self.jobs_running.pop(index)
             self.jobs_done.append(job)
-            log_info('%s - Moved job with ID %d for worker %d from running to done.' % (self.name(), job.id, job.worker))
+            log_debug('%s - Moved %s from running to done.' % (self.name(), str(job)))
         else:
             log_warn('%s - There is no job with ID %d registered as running.' % (self.name(), job.id))
 
@@ -752,25 +761,43 @@ class Epoch(object):
                     agg_loss += job.loss
                     if self.report:
                         agg_wer += job.wer
-
                         agg_accuracy += job.accuracy
-                    self.samples.extend(job.samples)
+                        self.samples.extend(job.samples)
 
                 self.loss = agg_loss / float(num_jobs)
-                self.wer = agg_wer / float(num_jobs)
-                self.accuracy = agg_accuracy / float(num_jobs)
 
-                # Order samles by their loss (lowest loss on top)
-                self.samples.sort(key=lambda s: s.loss)
+                if self.report:
+                    self.wer = agg_wer / float(num_jobs)
+                    self.accuracy = agg_accuracy / float(num_jobs)
 
-                # Take only the first report_count items
-                self.samples = self.samples[:FLAGS.report_count]
+                    # Order samles by their loss (lowest loss on top)
+                    self.samples.sort(key=lambda s: s.loss)
 
-                # Order this top ten items by their WER (lowest WER on top)
-                self.samples.sort(key=lambda s: s.wer)
+                    # Take only the first report_count items
+                    self.samples = self.samples[:FLAGS.report_count]
+
+                    # Order this top ten items by their WER (lowest WER on top)
+                    self.samples.sort(key=lambda s: s.wer)
+
+                    # Append WER to WER log file
+                    if len(FLAGS.wer_log_file) > 0:
+                        hash = get_git_revision_hash()
+                        time = datetime.datetime.utcnow().isoformat()
+                        # Append to log file
+                        with open(FLAGS.wer_log_file, 'a') as wer_log_file:
+                            if wer_log_file.tell() > 0:
+                                wer_log_file.write('\n')
+                            wer_log_file.write('logwer("%s", "%s", "%s", %f)' % (hash, time, self.set_name, self.wer))
+                        # Publish to web server
+                        if FLAGS.publish_wer_log:
+                            maybe_publish()
+
             return True
         else:
             return False
+
+    def job_status(self):
+        return '%s - jobs open: %d, jobs running: %d, jobs done: %d' % (self.name(), len(self.jobs_open), len(self.jobs_running), len(self.jobs_done))
 
     def __str__(self):
         if self.done():
@@ -785,7 +812,7 @@ class Epoch(object):
             else:
                 return '%s - loss: %f' % (self.name(), self.loss)
         else:
-            return '%s - jobs open: %d, jobs running: %d, jobs done: %d' % (self.name(), len(self.jobs_open), len(self.jobs_running), len(self.jobs_done))
+            return self.job_status()
 
 
 
@@ -793,22 +820,23 @@ class TrainingCoordinator(object):
 
     class TrainingCoordinationHandler(BaseHTTPServer.BaseHTTPRequestHandler):
 
+        def send_answer(self, data=None):
+            self.send_response(200)
+            self.send_header('content-type', 'text/plain')
+            self.end_headers()
+            if data:
+                self.wfile.write(data)
+
         def do_GET(self):
             if self.path.startswith(PREFIX_NEXT_INDEX):
                 index = COORD.get_next_index(self.path[len(PREFIX_NEXT_INDEX):])
                 if index >= 0:
-                    self.send_response(200)
-                    self.send_header("content-type", "text/plain")
-                    self.end_headers()
-                    self.wfile.write(str(index))
+                    self.send_answer(str(index))
                     return
             elif self.path.startswith(PREFIX_GET_JOB):
                 job = COORD.get_job(worker=int(self.path[len(PREFIX_GET_JOB):]))
                 if job:
-                    self.send_response(200)
-                    self.send_header("content-type", "text/plain")
-                    self.end_headers()
-                    self.wfile.write(pickle.dumps(job))
+                    self.send_answer(pickle.dumps(job))
                     return
             self.send_response(404)
             self.end_headers()
@@ -816,18 +844,13 @@ class TrainingCoordinator(object):
         def do_POST(self):
             src = self.rfile.read(int(self.headers['content-length']))
             job = COORD.next_job(pickle.loads(src))
-            self.send_response(200)
-            self.send_header("content-type", "text/plain")
-            self.end_headers()
-            if job:
-                self.wfile.write(pickle.dumps(job))
+            self.send_answer(pickle.dumps(job))
 
         def log_message(self, format, *args):
             return
 
 
     def __init__(self):
-        self._id_counter = 0
         self._init()
         self._lock = Lock()
         if is_chief:
@@ -843,113 +866,93 @@ class TrainingCoordinator(object):
         self._epochs_done = []
         self._reset_counters()
 
-    def get_epoch_from_step(step):
-        r"""
-        Calculates the epoch from a given global ``step``
-        """
-        # Uncomment the next line for debugging distributed TF
-        print ('step: %d, epoch_factor: %d' % (step, self._epoch_factor))
-        return int(ceil(float(step) / float(self._epoch_factor)))
-
-    def log_wer(wer_type, wer):
-        r"""
-        Logs Train, Validation and Tst WERs to a WER log-file and publishes it.
-        """
-        hash = get_git_revision_hash()
-        time = datetime.datetime.utcnow().isoformat()
-        # Append to log file
-        with open(FLAGS.wer_log_file, 'a') as wer_log_file:
-            if wer_log_file.tell() > 0:
-                wer_log_file.write('\n')
-            wer_log_file.write('logwer("%s", "%s", "%s", %f)' % (hash, time, wer_type, wer))
-        # Publish to web server
-        if FLAGS.publish_wer_log:
-            maybe_publish()
-
-    def _log(self, message):
-        print(message)
-
-    def _log_epoch_state(self):
-        self._log('Epochs - running: %d, done: %d' % (len(self._epochs_running), len(self._epochs_done)))
-
     def _log_all_jobs(self):
-        self._log('Running epochs:')
+        log_debug('Running epochs:')
         for epoch in self._epochs_running:
-            self._log(' - ' + str(job))
-        self._log('Finished epochs:')
-        for epoch in self._epochs_done:
-            self._log(' - ' + str(epoch))
+            log_debug(' - ' + epoch.job_status())
+        log_debug('Finished epochs: %d' % len(self._epochs_done))
 
     def start_training(self, data_sets, step=0):
         with self._lock:
             self._init()
-            self._train_batches = data_sets.train.total_batches
-            self._dev_batches = data_sets.dev.total_batches
-            self._test_batches = data_sets.test.total_batches
+            self._batches_per_job  = len(available_devices) * max(1, FLAGS.steps_per_worker)
+            self._batches_per_step = len(available_devices) * max(1, FLAGS.replicas_to_agg)
+            self._num_jobs_train = max(1, data_sets.train.total_batches / self._batches_per_job)
+            self._num_jobs_dev   = max(1, data_sets.dev.total_batches   / self._batches_per_job)
+            self._num_jobs_test  = max(1, data_sets.test.total_batches  / self._batches_per_job)
 
-            # Compute an epoch factor - number of global steps per epoch.
-            # The number of workers is factored in to (re)compensate data set sharding.
-            # `replicas_to_agg` times `available_devices` (per node) is
-            # the number of batches trained during one global step
-            self._epoch_factor = int(ceil(float(self._train_batches * num_workers) / \
-                           float((max(1, FLAGS.replicas_to_agg) * len(available_devices)))))
+            self._steps_per_epoch = max(1, data_sets.train.total_batches / self._batches_per_step)
+            self._epoch = step / self._steps_per_epoch
 
-            # Parsing the steps specifier
-            step_unit = FLAGS.steps[0]
-            step_count = int(FLAGS.steps[1:])
-            absolute = step_unit.isupper()
-            if step_unit.lower() == 'e':
-                # Prefix e/E stands for epochs - so we multiply the given steps by the epoch_factor
-                step_count = step_count * self._epoch_factor
+            jobs_trained = (step % self._steps_per_epoch) * self._batches_per_step / self._batches_per_job
 
-            print ('Total batches: %d, Number of workers: %d, Replicas to aggregate: %d, Available Devices: %d => Epoch factor: %d' % (self._train_batches, num_workers, max(1, FLAGS.replicas_to_agg), len(available_devices), self._epoch_factor))
+            if FLAGS.epochs < 0:
+                self._target_epoch = self._epoch + abs(FLAGS.epochs)
+            else:
+                self._target_epoch = FLAGS.epochs
 
-            # Init recent word error rate levels
-            self._train_wer = 0.0
-            self._dev_wer = 0.0
+            log_debug('step: %d' % step)
+            log_debug('self._batches_per_job: %d' % self._batches_per_job)
+            log_debug('self._batches_per_step: %d' % self._batches_per_step)
+            log_debug('self._steps_per_epoch: %d' % self._steps_per_epoch)
+            log_debug('self._num_jobs_train: %d' % self._num_jobs_train)
+            log_debug('self._epoch: %d' % self._epoch)
+            log_debug('jobs_trained: %d' % jobs_trained)
+            log_debug('self._target_epoch: %d' % self._target_epoch)
 
-            self._epoch = -1
+            self._num_jobs_train_left = 0
+            if FLAGS.train and self._target_epoch > self._epoch:
+                self._num_jobs_train_left = (self._target_epoch - self._epoch) * self._num_jobs_train - jobs_trained
+                log_info('STARTING Optimization')
+                log_debug('start step: %d, current epoch: %d, target epoch: %d, total open jobs: %d' % (step, self._epoch, self._target_epoch, self._num_jobs_train_left))
+                self._training_time = stopwatch()
 
-            print "STARTING Optimization\n"
-            self._training_time = stopwatch()
+            self.next_epoch()
 
-            self.next_epoch(step=step)
+    def next_epoch(self):
+        result = False
 
-    def next_epoch(self, step=0):
-        self._reset_counters()
-        steps = self._epoch_factor
-        action = 'STARTING'
-        if step > 0:
-            self._epoch = step / self._epoch_factor
-            steps = steps - (step % self._epoch_factor)
-            if steps < self._epoch_factor:
-                action = 'CONTINUING'
-        else:
-            self._epoch += 1
+        if FLAGS.train and self._num_jobs_train_left > 0:
+            num_jobs_train = min(self._num_jobs_train_left, self._num_jobs_train)
+            self._num_jobs_train_left -= num_jobs_train
+            self._reset_counters()
 
-        # Determine if we want to display and/or validate on this iteration/worker
-        self._is_display_step = FLAGS.display_step > 0 and ((self._epoch + 1) % FLAGS.display_step == 0) # or self._epoch == FLAGS.epochs - 1
-        self._is_validation_step = FLAGS.validation_step > 0 and (self._epoch + 1) % FLAGS.validation_step == 0
+            is_display_step = FLAGS.display_step > 0 and (self._epoch % FLAGS.display_step == 0 or self._epoch == self._target_epoch)
+            is_validation_step = FLAGS.validation_step > 0 and self._epoch % FLAGS.validation_step == 0
 
-        self._epochs_running.append(Epoch(self._epoch, steps, set_name='train', report=self._is_display_step))
+            self._epochs_running.append(Epoch(self._epoch, num_jobs_train, set_name='train', report=is_display_step))
+            if is_validation_step:
+                self._epochs_running.append(Epoch(self._epoch, self._num_jobs_dev, set_name='dev', report=True))
+            result = True
 
-        if self._is_validation_step:
-            self._epochs_running.append(Epoch(self._epoch, steps, set_name='dev', report=True))
+        if FLAGS.test and self._epoch == self._target_epoch:
+            self._epochs_running.append(Epoch(self._epoch, self._num_jobs_test, set_name='test', report=True))
+            result = True
 
-        return True
+        self._epoch += 1
+        return result
 
     def end_training(self):
         self._training_time = stopwatch(self._training_time)
         tt = format_duration(self._training_time)
-        print 'FINISHED Optimization - training time: %s' % (self._epoch, tt)
+        log_info('FINISHED Optimization - training time: %s' % (self._epoch, tt))
 
     def start(self):
         if is_chief:
-            Thread(target=self._httpd.serve_forever).start()
+            log_debug('Starting coordinator...')
+            self._thread = Thread(target=self._httpd.serve_forever)
+            self._thread.daemon = True
+            self._thread.start()
+            log_debug('Coordinator started.')
 
     def stop(self):
         if is_chief:
+            while len(self._epochs_running) > 0:
+                log_debug('Coordinator is waiting for epochs to finish...')
+                time.sleep(5)
+            log_debug('Stopping coordinator...')
             self._httpd.shutdown()
+            log_debug('Coordinator stopped.')
 
     def _talk_to_chief(self, path, data=None, default=None):
         tries = 0
@@ -957,6 +960,7 @@ class TrainingCoordinator(object):
             tries += 1
             try:
                 url = 'http://%s:%d%s' % (FLAGS.coord_host, FLAGS.coord_port, path)
+                # log_debug('Trying to reach coordinator...')
                 res = urllib2.urlopen(urllib2.Request(url, data, { 'content-type': 'text/plain' }))
                 return res.read()
             except:
@@ -974,7 +978,10 @@ class TrainingCoordinator(object):
                     setattr(self, member, value)
                 return value
             else:
-                return int(self._talk_to_chief(PREFIX_NEXT_INDEX + set_name))
+                log_debug('Asking for next index...')
+                value = int(self._talk_to_chief(PREFIX_NEXT_INDEX + set_name))
+                log_debug('Got index %d.' % value)
+                return value
 
     def _get_job(self, worker=0):
         job = None
@@ -992,12 +999,14 @@ class TrainingCoordinator(object):
                     if self.next_epoch():
                         job = self._get_job(worker)
                     else:
-                        log_info('No jobs left for worker %d.' % (worker))
+                        log_debug('No jobs left for worker %d.' % (worker))
+                        self._log_all_jobs()
                         return None
                 if job is None:
                     log_error('Unexpected case - no job for worker %d.' % (worker))
                 else:
-                    log_info('New job for worker %d.' % (worker))
+                    log_debug('New %s' % str(job))
+                self._log_all_jobs()
                 return job
             else:
                 result = self._talk_to_chief(PREFIX_GET_JOB + str(FLAGS.task_index))
@@ -1014,7 +1023,7 @@ class TrainingCoordinator(object):
                     if epoch.done():
                         self._epochs_running.remove(epoch)
                         self._epochs_done.append(epoch)
-                        print (epoch)
+                        log_info(epoch)
             else:
                 log_warn('There is no running epoch of id %d for job with ID %d.' % (job.epoch_id, job.id))
             return self.get_job(job.worker)
@@ -1026,9 +1035,9 @@ class TrainingCoordinator(object):
 
 
 def read_data_sets(set_names=['train', 'dev', 'test']):
-    r"""
+    r'''
     Returns a :class:`DataSets` object of the selected importer, containing all available/selected sets.
-    """
+    '''
     return importer_module.read_data_sets(FLAGS.dataset_path,
                                           FLAGS.train_batch_size,
                                           FLAGS.dev_batch_size,
@@ -1042,10 +1051,10 @@ def read_data_sets(set_names=['train', 'dev', 'test']):
                                           sets=set_names)
 
 def train(server=None):
-    r"""
+    r'''
     Trains the network on a given server of a cluster.
     If no server provided, it performs single process training.
-    """
+    '''
 
     # Create a variable to hold the global_step.
     # It will automgically get incremented by the optimizer.
@@ -1081,25 +1090,25 @@ def train(server=None):
 
 
     class CoordHook(tf.train.SessionRunHook):
-        r"""
+        r'''
         Embedded coordination hook-class that will use variables of the
         surrounding Python context.
-        """
+        '''
         def after_create_session(self, session, coord):
-            print ('Starting queue runners...')
+            log_debug('Starting queue runners...')
             self.threads = switchable_data_set.start_queue_threads(session, coord)
-            print ('Queue runners started.')
+            log_debug('Queue runners started.')
 
         def end(self, session):
             # Closing the data_set queues
-            print ("Closing queues...")
+            log_debug('Closing queues...')
             switchable_data_set.close_queue(session)
 
             # Sending our token (the task_index as a debug opportunity) to each parameter server.
             for enqueue in done_enqueues:
-                print ('Sending stop token to ps...')
+                log_debug('Sending stop token to ps...')
                 session.run(enqueue, feed_dict={ token_placeholder: FLAGS.task_index })
-                print ('Sent stop token to ps.')
+                log_debug('Sent stop token to ps.')
 
 
     # Collecting the hooks
@@ -1131,6 +1140,7 @@ def train(server=None):
         job = COORD.get_job()
 
         while job and not session.should_stop():
+            log_debug('Computing %s...' % str(job))
 
             # The feed_dict (mainly for switching between queues)
             feed_dict = {}
@@ -1164,11 +1174,12 @@ def train(server=None):
                 if session.should_stop():
                     break
 
+                log_debug('Starting batch...')
                 # Compute the batch
                 _, current_step, batch_loss, batch_report = session.run([train_op, global_step, loss, report_params], **extra_params)
 
                 # Uncomment the next line for debugging race conditions / distributed TF
-                # print ('Batch step %d' % current_step)
+                log_debug('Finished batch step %d.' % current_step)
 
                 # Add batch to loss
                 total_loss += batch_loss
@@ -1186,16 +1197,17 @@ def train(server=None):
                 job.wer, job.samples = calculate_report(report_results)
 
             # Send the current job to coordinator and receive the next one
+            log_debug('Sending %s...' % str(job))
             job = COORD.next_job(job)
 
-    print ('Session closed.')
+    log_debug('Session closed.')
 
 
 def export():
-    r"""
+    r'''
     Restores the trained variables into a simpler graph that will be exported for serving.
-    """
-    print ('Exporting the model...')
+    '''
+    log_info('Exporting the model...')
     with tf.device('/cpu:0'):
 
         tf.reset_default_graph()
@@ -1233,7 +1245,7 @@ def export():
         checkpoint = tf.train.get_checkpoint_state(FLAGS.checkpoint_dir)
         checkpoint_path = checkpoint.model_checkpoint_path
         saver.restore(session, checkpoint_path)
-        print 'Restored checkpoint at training epoch %d' % (int(checkpoint_path.split('-')[-1]) + 1)
+        log_info('Restored checkpoint at training epoch %d' % (int(checkpoint_path.split('-')[-1]) + 1))
 
         # Initialise the model exporter and export the model
         model_exporter.init(session.graph.as_graph_def(),
@@ -1245,7 +1257,7 @@ def export():
         if FLAGS.remove_export:
             actual_export_dir = os.path.join(FLAGS.export_dir, '%08d' % FLAGS.export_version)
             if os.path.isdir(actual_export_dir):
-                print 'Removing old export'
+                log_info('Removing old export')
                 shutil.rmtree(actual_FLAGS.export_dir)
         try:
             # Export serving model
@@ -1269,9 +1281,9 @@ def export():
                                       restore_op_name, filename_tensor_name,
                                       output_graph_path, clear_devices, '')
 
-            print 'Models exported at %s' % (FLAGS.export_dir)
+            log_info('Models exported at %s' % (FLAGS.export_dir))
         except RuntimeError:
-            print sys.exc_info()[1]
+            log_error(sys.exc_info()[1])
 
 
 def main(_) :
@@ -1292,14 +1304,13 @@ def main(_) :
     global importer_module
     importer_module = importlib.import_module('util.importers.%s' % FLAGS.importer)
 
-
     from util.website import maybe_publish
     if FLAGS.fulltrace:
         check_cupti()
 
     # ps and worker hosts required for p2p cluster setup
-    FLAGS.ps_hosts = filter(len, FLAGS.ps_hosts.split(","))
-    FLAGS.worker_hosts = filter(len, FLAGS.worker_hosts.split(","))
+    FLAGS.ps_hosts = filter(len, FLAGS.ps_hosts.split(','))
+    FLAGS.worker_hosts = filter(len, FLAGS.worker_hosts.split(','))
 
     # The absolute number of computing nodes - regardless of cluster or single mode
     global num_workers
@@ -1307,7 +1318,7 @@ def main(_) :
 
     # Create a cluster from the parameter server and worker hosts.
     global cluster
-    cluster = tf.train.ClusterSpec({"ps": FLAGS.ps_hosts, "worker": FLAGS.worker_hosts})
+    cluster = tf.train.ClusterSpec({'ps': FLAGS.ps_hosts, 'worker': FLAGS.worker_hosts})
 
     # If replica numbers are negative, we multiply their absolute values with the number of workers
     if FLAGS.replicas < 0:
@@ -1356,7 +1367,7 @@ def main(_) :
 
     # Current log sub-directory
     global log_dir
-    log_dir = os.path.join(FLAGS.logs_dir, time.strftime("%Y%m%d-%H%M%S"))
+    log_dir = os.path.join(FLAGS.logs_dir, time.strftime('%Y%m%d-%H%M%S'))
 
     # Standard session configuration that'll be used for all new sessions.
     global session_config
@@ -1391,11 +1402,11 @@ def main(_) :
     global done_dequeues
     done_dequeues = [queue.dequeue() for queue in done_queues]
 
-    if FLAGS.train:
+    if FLAGS.train or FLAGS.test:
         if len(FLAGS.worker_hosts) == 0:
             # Only one local task: this process (default case - no cluster)
             train()
-            print "Done."
+            log_debug('Done.')
 
         else:
             # Create and start a server for the local task.
@@ -1406,10 +1417,10 @@ def main(_) :
                 # by waiting for their stop tokens.
                 with tf.Session(server.target) as session:
                     for worker in FLAGS.worker_hosts:
-                        print ('Waiting for stop token...')
+                        log_debug('Waiting for stop token...')
                         token = session.run(done_dequeues[FLAGS.task_index])
-                        print ('Got a stop token from worker %i' %token)
-                print ('Session closed.')
+                        log_debug('Got a stop token from worker %i' %token)
+                log_debug('Session closed.')
 
             elif FLAGS.job_name == 'worker':
                 # We are a worker and therefore we have to do some work.
@@ -1422,7 +1433,7 @@ def main(_) :
                     # Do the training
                     train(server)
 
-            print ('Server stopped.')
+            log_debug('Server stopped.')
 
     # Are we the main process?
     if is_chief:
