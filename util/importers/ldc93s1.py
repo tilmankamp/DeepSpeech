@@ -7,30 +7,8 @@ from threading import Thread
 from util.gpu import get_available_gpus
 from util.text import text_to_char_array, ctc_label_dense_to_sparse
 from util.audio import audiofile_to_input_vector
+from util.data_set_helpers import DataSets
 from tensorflow.contrib.learn.python.learn.datasets import base
-
-class DataSets(object):
-    def __init__(self, train, dev, test):
-        self._dev = dev
-        self._test = test
-        self._train = train
-
-    def start_queue_threads(self, sesssion):
-        self._dev.start_queue_threads(sesssion)
-        self._test.start_queue_threads(sesssion)
-        self._train.start_queue_threads(sesssion)
-
-    @property
-    def train(self):
-        return self._train
-
-    @property
-    def dev(self):
-        return self._dev
-
-    @property
-    def test(self):
-        return self._test
 
 class DataSet(object):
     def __init__(self, txt_files, thread_count, batch_size, numcep, numcontext):
@@ -104,7 +82,7 @@ class DataSet(object):
         return int(ceil(float(len(self._txt_files)) /float(self._batch_size)))
 
 
-def read_data_sets(data_dir, train_batch_size, dev_batch_size, test_batch_size, numcep, numcontext, thread_count=1, stride=1, offset=0, limit_dev=0, limit_test=0, limit_train=0, sets=[]):
+def read_data_sets(data_dir, train_batch_size, dev_batch_size, test_batch_size, numcep, numcontext, thread_count=1, stride=1, offset=0, next_index=lambda s, i: i + 1, limit_dev=0, limit_test=0, limit_train=0, sets=[]):
     # Conditionally download data
     LDC93S1_BASE = "LDC93S1"
     LDC93S1_BASE_URL = "https://catalog.ldc.upenn.edu/desc/addenda/"

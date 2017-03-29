@@ -24,30 +24,8 @@ from util.gpu import get_available_gpus
 from util.text import text_to_char_array, ctc_label_dense_to_sparse
 from tensorflow.python.platform import gfile
 from util.audio import audiofile_to_input_vector
+from util.data_set_helpers import DataSets
 from tensorflow.contrib.learn.python.learn.datasets import base
-
-class DataSets(object):
-    def __init__(self, train, dev, test):
-        self._dev = dev
-        self._test = test
-        self._train = train
-
-    def start_queue_threads(self, session):
-        self._dev.start_queue_threads(session)
-        self._test.start_queue_threads(session)
-        self._train.start_queue_threads(session)
-
-    @property
-    def train(self):
-        return self._train
-
-    @property
-    def dev(self):
-        return self._dev
-
-    @property
-    def test(self):
-        return self._test
 
 class DataSet(object):
     def __init__(self, txt_files, thread_count, batch_size, numcep, numcontext, next_index=lambda x: x + 1):

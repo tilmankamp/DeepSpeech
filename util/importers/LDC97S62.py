@@ -14,34 +14,11 @@ from Queue import Queue
 from threading import Thread
 from util.audio import audiofile_to_input_vector
 from util.gpu import get_available_gpus
+from util.data_set_helpers import DataSets
 from util.text import text_to_char_array, ctc_label_dense_to_sparse, validate_label
 
-class DataSets(object):
-    def __init__(self, train, dev, test):
-        self._dev = dev
-        self._test = test
-        self._train = train
-
-    def start_queue_threads(self, session):
-        self._dev.start_queue_threads(session)
-        self._test.start_queue_threads(session)
-        self._train.start_queue_threads(session)
-
-    @property
-    def train(self):
-        return self._train
-
-    @property
-    def dev(self):
-        return self._dev
-
-    @property
-    def test(self):
-        return self._test
-
-
 class DataSet(object):
-    def __init__(self, txt_files, thread_count, batch_size, numcep, numcontext):
+    def __init__(self, txt_files, thread_count, batch_size, numcep, numcontext, next_index=lambda x: x + 1):
         self._coord = None
         self._numcep = numcep
         self._x = tf.placeholder(tf.float32, [None, numcep + (2 * numcep * numcontext)])
@@ -57,7 +34,8 @@ class DataSet(object):
         self._batch_size = batch_size
         self._numcontext = numcontext
         self._thread_count = thread_count
-        self._files_circular_list = self._create_files_circular_list()
+        self._files_list = self._create_files_list()
+        self._next_index = next_index
 
     def _get_device_count(self):
         available_gpus = get_available_gpus()
@@ -74,7 +52,7 @@ class DataSet(object):
     def close_queue(self, session):
         session.run(self._close_op)
 
-    def _create_files_circular_list(self):
+    def _create_files_list(self):
         priorityQueue = PriorityQueue()
         for txt_file in self._txt_files:
             wav_file = os.path.splitext(txt_file)[0] + ".wav"
@@ -84,12 +62,16 @@ class DataSet(object):
         while not priorityQueue.empty():
             priority, (txt_file, wav_file) = priorityQueue.get()
             files_list.append((txt_file, wav_file))
-        return cycle(files_list)
+        return files_list
+
+    def _indices(self):
+        index = -1
+        while not self._coord.should_stop():
+            index = self._next_index(index) % len(self._files_list)
+            yield self._files_list[index]
 
     def _populate_batch_queue(self, session):
-        for txt_file, wav_file in self._files_circular_list:
-            if self._coord.should_stop():
-                return
+        for txt_file, wav_file in self._indices():
             source = audiofile_to_input_vector(wav_file, self._numcep, self._numcontext)
             source_len = len(source)
             with codecs.open(txt_file, encoding="utf-8") as open_txt_file:
@@ -116,7 +98,7 @@ class DataSet(object):
         return int(ceil(float(len(self._txt_files)) / float(self._batch_size)))
 
 
-def read_data_sets(data_dir, train_batch_size, dev_batch_size, test_batch_size, numcep, numcontext, thread_count=8, stride=1, offset=0, limit_dev=0, limit_test=0, limit_train=0, sets=[]):
+def read_data_sets(data_dir, train_batch_size, dev_batch_size, test_batch_size, numcep, numcontext, thread_count=8, stride=1, offset=0, next_index=lambda s, i: i + 1, limit_dev=0, limit_test=0, limit_train=0, sets=[]):
     data_dir = os.path.join(data_dir, "LDC97S62")
 
     # Conditionally convert swb sph data to wav
@@ -144,19 +126,19 @@ def read_data_sets(data_dir, train_batch_size, dev_batch_size, test_batch_size, 
     dev = None
     if "dev" in sets:
         dev = _read_data_set(data_dir, "final_sets/dev", thread_count, dev_batch_size, numcep,
-                             numcontext, stride=stride, offset=offset, limit=limit_dev)
+                             numcontext, stride=stride, offset=offset, next_index=lambda i: next_index('dev', i), limit=limit_dev)
 
     # Create test DataSet
     test = None
     if "test" in sets:
         test = _read_data_set(data_dir, "final_sets/test", thread_count, test_batch_size, numcep,
-                             numcontext, stride=stride, offset=offset, limit=limit_test)
+                             numcontext, stride=stride, offset=offset, next_index=lambda i: next_index('test', i), limit=limit_test)
 
     # Create train DataSet
     train = None
     if "train" in sets:
         train = _read_data_set(data_dir, "final_sets/train", thread_count, train_batch_size, numcep,
-                             numcontext, stride=stride, offset=offset, limit=limit_train)
+                             numcontext, stride=stride, offset=offset, next_index=lambda i: next_index('train', i), limit=limit_train)
 
     # Return DataSets
     return DataSets(train, dev, test)
@@ -356,7 +338,7 @@ def _maybe_split_dataset(filelist, target_dir):
             os.rename(wav_file, new_wav_file)
 
 
-def _read_data_set(work_dir, data_set, thread_count, batch_size, numcep, numcontext, stride=1, offset=0, limit=0):
+def _read_data_set(work_dir, data_set, thread_count, batch_size, numcep, numcontext, stride=1, offset=0, next_index=lambda i: i + 1, limit=0):
     # Obtain list of txt files
     txt_files = glob(os.path.join(work_dir, data_set, "*.txt"))
     if limit > 0:
@@ -364,4 +346,4 @@ def _read_data_set(work_dir, data_set, thread_count, batch_size, numcep, numcont
     txt_files = txt_files[offset::stride]
 
     # Return DataSet
-    return DataSet(txt_files, thread_count, batch_size, numcep, numcontext)
+    return DataSet(txt_files, thread_count, batch_size, numcep, numcontext, next_index=next_index)

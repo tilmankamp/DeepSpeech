@@ -5,6 +5,29 @@ import tensorflow as tf
 
 from util.text import ctc_label_dense_to_sparse
 
+class DataSets(object):
+    def __init__(self, train, dev, test):
+        self._dev = dev
+        self._test = test
+        self._train = train
+
+    def start_queue_threads(self, session):
+        self._dev.start_queue_threads(session)
+        self._test.start_queue_threads(session)
+        self._train.start_queue_threads(session)
+
+    @property
+    def train(self):
+        return self._train
+
+    @property
+    def dev(self):
+        return self._dev
+
+    @property
+    def test(self):
+        return self._test
+
 class SwitchableDataSet(object):
     def __init__(self, data_sets):
         self._data_sets = data_sets
