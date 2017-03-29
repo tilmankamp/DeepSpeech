@@ -55,14 +55,14 @@ tf.app.flags.DEFINE_integer ('replicas',         -1,          'total number of r
 tf.app.flags.DEFINE_integer ('replicas_to_agg',  -1,          'number of replicas to aggregate - if negative, its absolute value is multiplied by the number of workers')
 tf.app.flags.DEFINE_string  ('coord_host',       'localhost', 'coordination server host')
 tf.app.flags.DEFINE_integer ('coord_port',       4000,        'coordination server port')
-tf.app.flags.DEFINE_integer ('steps_per_worker', 1,           'train or inference steps per worker before results are sent back to coordinator')
+tf.app.flags.DEFINE_integer ('iters_per_worker', 1,           'number of train or inference iterations per worker before results are sent back to coordinator')
 
 # Global Constants
 # ================
 
 tf.app.flags.DEFINE_boolean ('train',            True,        'weather to train the network')
 tf.app.flags.DEFINE_boolean ('test',             True,        'weather to test the network')
-tf.app.flags.DEFINE_integer ('epochs',           75,          'target epoch to train for - if negative, the absolute number of additional epochs will be trained')
+tf.app.flags.DEFINE_integer ('epoch',            75,          'target epoch to train - if negative, the absolute number of additional epochs will be trained')
 
 tf.app.flags.DEFINE_boolean ('use_warpctc',      False,       'weather to use GPU bound Warp-CTC')
 
@@ -113,6 +113,7 @@ tf.app.flags.DEFINE_boolean ('remove_export',    False,       'weather to remove
 # Reporting
 
 tf.app.flags.DEFINE_integer ('log_level',        1,           'log level for console logs - 0: INFO, 1: WARN, 2: ERROR, 3: FATAL')
+tf.app.flags.DEFINE_boolean ('log_traffic',      False,       'log cluster transaction and traffic information during debug logging')
 
 tf.app.flags.DEFINE_boolean ('publish_wer_log',  False,       'weather to publish the WER log')
 tf.app.flags.DEFINE_string  ('wer_log_file',     'werlog.js', 'log-file for keeping track of WER progress')
@@ -143,6 +144,10 @@ def prefix_print(prefix, message):
 def log_debug(message):
     if FLAGS.log_level == 0:
         prefix_print('D ', str(message))
+
+def log_traffic(message):
+    if FLAGS.log_traffic:
+        log_debug(message)
 
 def log_info(message):
     if FLAGS.log_level <= 1:
@@ -659,17 +664,33 @@ def format_duration(duration):
 # Execution
 # =========
 
+# String constants for different services of the web handler
 PREFIX_NEXT_INDEX = '/next_index_'
 PREFIX_GET_JOB = '/get_job_'
 
+# Global ID counter for all objects requiring an ID
 id_counter = 0
+
 def new_id():
+    '''Returns a new ID that is unique on process level. Not thread-safe.
+
+    Returns:
+        int. The new ID
+    '''
     global id_counter
     id_counter += 1
     return id_counter
 
 class Sample(object):
     def __init__(self, src, res, loss, accuracy):
+        '''Represents one item of a WER report.
+
+        Args:
+            src (str): source text
+            res (str): resulting text
+            loss (float): computed loss of this item
+            accuracy (float): computed accuracy of this item
+        '''
         self.src = src
         self.res = correction(res)
         self.loss = loss
@@ -681,6 +702,15 @@ class Sample(object):
 
 class WorkerJob(object):
     def __init__(self, epoch_id, index, set_name, steps, report):
+        '''Represents a job that should be executed by a worker.
+
+        Args:
+            epoch_id (int): the ID of the 'parent' epoch
+            index (int): the epoch index of the 'parent' epoch
+            set_name (str): the name of the data-set - one of 'train', 'dev', 'test'
+            steps (int): the number of `session.run` calls
+            report (bool): if this job should produce a WER report
+        '''
         self.id = new_id()
         self.epoch_id = epoch_id
         self.index = index
@@ -697,10 +727,21 @@ class WorkerJob(object):
         return 'Job (id: %d, worker: %d, epoch: %d, set_name: %s)' % (self.id, self.worker, self.index, self.set_name)
 
 class Epoch(object):
-    def __init__(self, index, steps, set_name='train', report=False):
+    '''Represents an epoch that should be executed by the Training Coordinator.
+    Creates `num_jobs` `WorkerJob` instances in state 'open'.
+
+    Args:
+        index (int): the epoch index of the 'parent' epoch
+        num_jobs (int): the number of jobs in this epoch
+
+    Kwargs:
+        set_name (str): the name of the data-set - one of 'train', 'dev', 'test'
+        report (bool): if this job should produce a WER report
+    '''
+    def __init__(self, index, num_jobs, set_name='train', report=False):
         self.id = new_id()
         self.index = index
-        self.steps = steps
+        self.num_jobs = num_jobs
         self.set_name = set_name
         self.report = report
         self.wer = -1
@@ -710,10 +751,15 @@ class Epoch(object):
         self.jobs_running = []
         self.jobs_done = []
         self.samples = []
-        for i in xrange(self.steps):
-            self.jobs_open.append(WorkerJob(self.id, self.index, self.set_name, FLAGS.steps_per_worker, self.report))
+        for i in xrange(self.num_jobs):
+            self.jobs_open.append(WorkerJob(self.id, self.index, self.set_name, FLAGS.iters_per_worker, self.report))
 
     def name(self):
+        '''Gets a printable name for this epoch.
+
+        Returns:
+            str. printable name for this epoch
+        '''
         if self.index >= 0:
             ename = ' of Epoch %d' % self.index
         else:
@@ -726,6 +772,14 @@ class Epoch(object):
             return 'Test%s' % ename
 
     def get_job(self, worker):
+        '''Gets the next open job from this epoch. The job will be marked as 'running'.
+
+        Args:
+            worker (int): index of the worker that takes the job
+
+        Returns:
+            WorkerJob. job that has been marked as running for this worker
+        '''
         if len(self.jobs_open) > 0:
             job = self.jobs_open.pop(0)
             self.jobs_running.append(job)
@@ -735,21 +789,33 @@ class Epoch(object):
             return None
 
     def finish_job(self, job):
+        '''Finishes a running job. Removes running representant from the epoch
+        and adds the provided `job` as 'done' to the epoch.
+
+        Args:
+            job (WorkerJob): the job to put into state 'done'
+        '''
         index = next((i for i in xrange(len(self.jobs_running)) if self.jobs_running[i].id == job.id), -1)
         if index >= 0:
             self.jobs_running.pop(index)
             self.jobs_done.append(job)
-            log_debug('%s - Moved %s from running to done.' % (self.name(), str(job)))
+            log_traffic('%s - Moved %s from running to done.' % (self.name(), str(job)))
         else:
             log_warn('%s - There is no job with ID %d registered as running.' % (self.name(), job.id))
 
     def done(self):
+        '''Checks, if all jobs of the epoch are in state 'done'.
+        It also lazy-prepares a WER report from the result data of all jobs.
+
+        Returns:
+            bool. if all jobs of the epoch are 'done'
+        '''
         if len(self.jobs_open) == 0 and len(self.jobs_running) == 0:
             num_jobs = len(self.jobs_done)
             if num_jobs > 0:
                 jobs = self.jobs_done
                 self.jobs_done = []
-                if not self.steps == num_jobs:
+                if not self.num_jobs == num_jobs:
                     log_warn('%s - Number of steps not equal to number of jobs done.' % (self.name()))
 
                 agg_loss = 0.0
@@ -797,6 +863,11 @@ class Epoch(object):
             return False
 
     def job_status(self):
+        '''Provides a printable overview of the states of the jobs of this epoch.
+
+        Returns:
+            str. printable overall job state
+        '''
         return '%s - jobs open: %d, jobs running: %d, jobs done: %d' % (self.name(), len(self.jobs_open), len(self.jobs_running), len(self.jobs_done))
 
     def __str__(self):
@@ -819,8 +890,10 @@ class Epoch(object):
 class TrainingCoordinator(object):
 
     class TrainingCoordinationHandler(BaseHTTPServer.BaseHTTPRequestHandler):
+        '''Handles HTTP requests from remote workers to the Training Coordinator.
+        '''
 
-        def send_answer(self, data=None):
+        def _send_answer(self, data=None):
             self.send_response(200)
             self.send_header('content-type', 'text/plain')
             self.end_headers()
@@ -831,12 +904,12 @@ class TrainingCoordinator(object):
             if self.path.startswith(PREFIX_NEXT_INDEX):
                 index = COORD.get_next_index(self.path[len(PREFIX_NEXT_INDEX):])
                 if index >= 0:
-                    self.send_answer(str(index))
+                    self._send_answer(str(index))
                     return
             elif self.path.startswith(PREFIX_GET_JOB):
                 job = COORD.get_job(worker=int(self.path[len(PREFIX_GET_JOB):]))
                 if job:
-                    self.send_answer(pickle.dumps(job))
+                    self._send_answer(pickle.dumps(job))
                     return
             self.send_response(404)
             self.end_headers()
@@ -844,13 +917,20 @@ class TrainingCoordinator(object):
         def do_POST(self):
             src = self.rfile.read(int(self.headers['content-length']))
             job = COORD.next_job(pickle.loads(src))
-            self.send_answer(pickle.dumps(job))
+            self._send_answer(pickle.dumps(job))
 
         def log_message(self, format, *args):
+            '''Overriding base method to suppress web handler messages on stdout.
+            '''
             return
 
 
     def __init__(self):
+        ''' Central training coordination class.
+        Used for distributing jobs among workers of a cluster.
+        Instantiated on all workers, calls of non-chief workers will transparently
+        HTTP-forwarded to the chief worker instance.
+        '''
         self._init()
         self._lock = Lock()
         if is_chief:
@@ -867,77 +947,130 @@ class TrainingCoordinator(object):
         self._reset_counters()
 
     def _log_all_jobs(self):
-        log_debug('Running epochs:')
+        '''Use this to debug-print epoch state'''
+        log_debug('Epochs - running: %d, done: %d' % (len(self._epochs_done), len(self._epochs_running)))
         for epoch in self._epochs_running:
-            log_debug(' - ' + epoch.job_status())
-        log_debug('Finished epochs: %d' % len(self._epochs_done))
+            log_debug('       - running: ' + epoch.job_status())
 
-    def start_training(self, data_sets, step=0):
+    def start_coordination(self, data_sets, step=0):
+        '''Starts to coordinate epochs and jobs among workers on base of
+        data-set sizes, the (global) step and FLAGS parameters.
+
+        Args:
+            data_sets (DataSets): data-sets to be used for coordinated training
+
+        Kwargs:
+            step (int): global step of a loaded model to determine starting point
+        '''
         with self._lock:
             self._init()
-            self._batches_per_job  = len(available_devices) * max(1, FLAGS.steps_per_worker)
-            self._batches_per_step = len(available_devices) * max(1, FLAGS.replicas_to_agg)
-            self._num_jobs_train = max(1, data_sets.train.total_batches / self._batches_per_job)
-            self._num_jobs_dev   = max(1, data_sets.dev.total_batches   / self._batches_per_job)
-            self._num_jobs_test  = max(1, data_sets.test.total_batches  / self._batches_per_job)
 
-            self._steps_per_epoch = max(1, data_sets.train.total_batches / self._batches_per_step)
-            self._epoch = step / self._steps_per_epoch
+            # Number of GPUs per worker - fixed for now by local reality or cluster setup
+            gpus_per_worker = len(available_devices)
 
-            jobs_trained = (step % self._steps_per_epoch) * self._batches_per_step / self._batches_per_job
+            # Number of batches processed per job per worker
+            batches_per_job  = gpus_per_worker * max(1, FLAGS.iters_per_worker)
 
-            if FLAGS.epochs < 0:
-                self._target_epoch = self._epoch + abs(FLAGS.epochs)
+            # Number of batches per global step
+            batches_per_step = gpus_per_worker * max(1, FLAGS.replicas_to_agg)
+
+            # Number of global steps per epoch - to be at least 1
+            steps_per_epoch = max(1, data_sets.train.total_batches / batches_per_step)
+
+            # The start epoch of our training
+            self._epoch = step / steps_per_epoch
+
+            # Number of additional 'jobs' trained already 'on top of' our start epoch
+            jobs_trained = (step % steps_per_epoch) * batches_per_step / batches_per_job
+
+            # Total number of train/dev/test jobs covering their respective whole sets (one epoch)
+            self._num_jobs_train = max(1, data_sets.train.total_batches / batches_per_job)
+            self._num_jobs_dev   = max(1, data_sets.dev.total_batches   / batches_per_job)
+            self._num_jobs_test  = max(1, data_sets.test.total_batches  / batches_per_job)
+
+            if FLAGS.epoch < 0:
+                # A negative epoch means to add its absolute number to the epochs already computed
+                self._target_epoch = self._epoch + abs(FLAGS.epoch)
             else:
-                self._target_epoch = FLAGS.epochs
+                self._target_epoch = FLAGS.epoch
 
-            log_debug('step: %d' % step)
-            log_debug('self._batches_per_job: %d' % self._batches_per_job)
-            log_debug('self._batches_per_step: %d' % self._batches_per_step)
-            log_debug('self._steps_per_epoch: %d' % self._steps_per_epoch)
-            log_debug('self._num_jobs_train: %d' % self._num_jobs_train)
-            log_debug('self._epoch: %d' % self._epoch)
-            log_debug('jobs_trained: %d' % jobs_trained)
-            log_debug('self._target_epoch: %d' % self._target_epoch)
+            # State variables
+            # We only have to train, if we are told so and are not at the target epoch yet
+            self._train = FLAGS.train and self._target_epoch > self._epoch
+            self._test = FLAGS.test
 
-            self._num_jobs_train_left = 0
-            if FLAGS.train and self._target_epoch > self._epoch:
+            if self._train:
+                self._train = True
+                # The total number of jobs for all additional epochs to be trained
+                # Will be decremented for each job that is produced/put into state 'open'
                 self._num_jobs_train_left = (self._target_epoch - self._epoch) * self._num_jobs_train - jobs_trained
                 log_info('STARTING Optimization')
-                log_debug('start step: %d, current epoch: %d, target epoch: %d, total open jobs: %d' % (step, self._epoch, self._target_epoch, self._num_jobs_train_left))
                 self._training_time = stopwatch()
 
-            self.next_epoch()
+            # Important for debugging
+            log_debug('step: %d' % step)
+            log_debug('epoch: %d' % self._epoch)
+            log_debug('target epoch: %d' % self._target_epoch)
+            log_debug('steps per epoch: %d' % steps_per_epoch)
+            log_debug('batches per job: %d' % batches_per_job)
+            log_debug('batches per step: %d' % batches_per_step)
+            log_debug('number of jobs in train set: %d' % self._num_jobs_train)
+            log_debug('number of jobs already trained in first epoch: %d' % jobs_trained)
 
-    def next_epoch(self):
+            self._next_epoch()
+
+    def _next_epoch(self):
+        # State-machine of the coodination process
+
+        # Indicates, if there were 'new' epoch(s) provided
         result = False
 
-        if FLAGS.train and self._num_jobs_train_left > 0:
-            num_jobs_train = min(self._num_jobs_train_left, self._num_jobs_train)
-            self._num_jobs_train_left -= num_jobs_train
-            self._reset_counters()
+        if self._train:
+            # We are in train mode
+            if self._num_jobs_train_left > 0:
+                # There are still jobs left
+                num_jobs_train = min(self._num_jobs_train_left, self._num_jobs_train)
+                self._num_jobs_train_left -= num_jobs_train
 
-            is_display_step = FLAGS.display_step > 0 and (self._epoch % FLAGS.display_step == 0 or self._epoch == self._target_epoch)
-            is_validation_step = FLAGS.validation_step > 0 and self._epoch % FLAGS.validation_step == 0
+                # Let's try our best to keep the notion of curriculum learning
+                self._reset_counters()
 
-            self._epochs_running.append(Epoch(self._epoch, num_jobs_train, set_name='train', report=is_display_step))
-            if is_validation_step:
-                self._epochs_running.append(Epoch(self._epoch, self._num_jobs_dev, set_name='dev', report=True))
-            result = True
+                # If the training part of the current epoch should generate a WER report
+                is_display_step = FLAGS.display_step > 0 and (self._epoch % FLAGS.display_step == 0 or self._epoch == self._target_epoch)
+                # Append the training epoch
+                self._epochs_running.append(Epoch(self._epoch, num_jobs_train, set_name='train', report=is_display_step))
 
-        if FLAGS.test and self._epoch == self._target_epoch:
+                if FLAGS.validation_step > 0 and self._epoch % FLAGS.validation_step == 0:
+                    # The current epoch should also have a validation part - it will always generate a WER report
+                    self._epochs_running.append(Epoch(self._epoch, self._num_jobs_dev, set_name='dev', report=True))
+
+                # Indicating that there were 'new' epoch(s) provided
+                result = True
+            else:
+                # No jobs left, but still in train mode: concluding training
+                self._end_training()
+                self._train = False
+
+        if self._test and not self._train:
+            # We shall test, and are not in train mode anymore
+            self._test = False
             self._epochs_running.append(Epoch(self._epoch, self._num_jobs_test, set_name='test', report=True))
+            # Indicating that there were 'new' epoch(s) provided
             result = True
 
-        self._epoch += 1
+        if result:
+            # Increment the epoch index - shared among train and test 'state'
+            self._epoch += 1
         return result
 
-    def end_training(self):
+    def _end_training(self):
         self._training_time = stopwatch(self._training_time)
-        tt = format_duration(self._training_time)
-        log_info('FINISHED Optimization - training time: %s' % (self._epoch, tt))
+        log_info('FINISHED Optimization - training time: %s' % format_duration(self._training_time))
 
     def start(self):
+        '''Starts Training Coordinator. If chief, it starts a web server for
+        communication with non-chief instances.
+        '''
         if is_chief:
             log_debug('Starting coordinator...')
             self._thread = Thread(target=self._httpd.serve_forever)
@@ -946,9 +1079,12 @@ class TrainingCoordinator(object):
             log_debug('Coordinator started.')
 
     def stop(self):
+        '''Stops Training Coordinator. If chief, it waits for all epochs to be
+        'done' and then shuts down the web server.
+        '''
         if is_chief:
             while len(self._epochs_running) > 0:
-                log_debug('Coordinator is waiting for epochs to finish...')
+                log_traffic('Coordinator is waiting for epochs to finish...')
                 time.sleep(5)
             log_debug('Stopping coordinator...')
             self._httpd.shutdown()
@@ -960,15 +1096,24 @@ class TrainingCoordinator(object):
             tries += 1
             try:
                 url = 'http://%s:%d%s' % (FLAGS.coord_host, FLAGS.coord_port, path)
-                # log_debug('Trying to reach coordinator...')
                 res = urllib2.urlopen(urllib2.Request(url, data, { 'content-type': 'text/plain' }))
                 return res.read()
             except:
                 time.sleep(1)
+                log_traffic('Problem reaching coordinator - trying another time...')
                 pass
         return default
 
     def get_next_index(self, set_name):
+        '''Retrives a new cluster-unique batch index for a given set-name.
+        Prevents applying one batch multiple times per epoch.
+
+        Args:
+            set_name (str): name of the data set - one of 'train', 'dev', 'test'
+
+        Returns:
+            int. new data set index
+        '''
         with self._lock:
             if is_chief:
                 member = '_index_' + set_name
@@ -978,56 +1123,96 @@ class TrainingCoordinator(object):
                     setattr(self, member, value)
                 return value
             else:
-                log_debug('Asking for next index...')
+                # We are a remote worker and have to hand over to the chief worker by HTTP
+                log_traffic('Asking for next index...')
                 value = int(self._talk_to_chief(PREFIX_NEXT_INDEX + set_name))
-                log_debug('Got index %d.' % value)
+                log_traffic('Got index %d.' % value)
                 return value
 
     def _get_job(self, worker=0):
         job = None
+        # Find first running epoch that provides a next job
         for epoch in self._epochs_running:
             job = epoch.get_job(worker)
             if job:
                 return job
+        # No next job found
         return None
 
     def get_job(self, worker=0):
+        '''Retrieves the first job for a worker.
+
+        Kwargs:
+            worker (int): index of the worker to get the first job for
+
+        Returns:
+            WorkerJob. a job of one of the running epochs that will get
+                associated with the given worker and put into state 'running'
+        '''
+        # Let's ensure that this does not interfer with other workers/requests
         with self._lock:
             if is_chief:
+                # First try to get a next job
                 job = self._get_job(worker)
                 if job is None:
-                    if self.next_epoch():
+                    # If there was no next job, we give it a second chance by triggering the epoch state machine
+                    if self._next_epoch():
+                        # Epoch state machine got a new epoch
+                        # Second try to get a next job
                         job = self._get_job(worker)
+                        if job is None:
+                            # Albeit the epoch state machine got a new epoch, the epoch had no new job for us
+                            log_error('Unexpected case - no job for worker %d.' % (worker))
+                        return job
                     else:
-                        log_debug('No jobs left for worker %d.' % (worker))
+                        # Epoch state machine has no new epoch
+                        # This happens at the end of the whole training - nothing to worry about
+                        log_traffic('No jobs left for worker %d.' % (worker))
                         self._log_all_jobs()
                         return None
-                if job is None:
-                    log_error('Unexpected case - no job for worker %d.' % (worker))
                 else:
-                    log_debug('New %s' % str(job))
-                self._log_all_jobs()
-                return job
+                    # We got a new jub from one of the currently running epochs
+                    log_traffic('Got new %s' % str(job))
+                    return job
             else:
+                # We are a remote worker and have to hand over to the chief worker by HTTP
                 result = self._talk_to_chief(PREFIX_GET_JOB + str(FLAGS.task_index))
                 if result:
                     result = pickle.loads(result)
                 return result
 
     def next_job(self, job):
+        '''Sends a finished job back to the coordinator and retrieves in exchange the next one.
+
+        Kwargs:
+            job (WorkerJob): job that was finished by a worker and who's results are to be
+                digested by the coordinator
+
+        Returns:
+            WorkerJob. next job of one of the running epochs that will get
+                associated with the worker from the finished job and put into state 'running'
+        '''
         if is_chief:
+            # Try to find the epoch the job belongs to
             epoch = next((epoch for epoch in self._epochs_running if epoch.id == job.epoch_id), None)
             if epoch:
+                # We are going to manipulate things - let's avoid undefined state
                 with self._lock:
+                    # Let the epoch finish the job
                     epoch.finish_job(job)
+                    # Check, if epoch is done now
                     if epoch.done():
+                        # If it declares itself done, move it from 'running' to 'done' collection
                         self._epochs_running.remove(epoch)
                         self._epochs_done.append(epoch)
+                        # Show the short and/or full WER report
                         log_info(epoch)
             else:
-                log_warn('There is no running epoch of id %d for job with ID %d.' % (job.epoch_id, job.id))
+                # There was no running epoch found for this job - this should never happen.
+                log_error('There is no running epoch of id %d for job with ID %d.' % (job.epoch_id, job.id))
             return self.get_job(job.worker)
         else:
+            # We are a remote worker and have to hand over to the chief worker by HTTP
             result = self._talk_to_chief('', data=pickle.dumps(job))
             if result:
                 result = pickle.loads(result)
@@ -1134,7 +1319,7 @@ def train(server=None):
             feed_dict = {}
             switchable_data_set.set_data_set(feed_dict, data_sets.train)
             step = session.run(global_step, feed_dict=feed_dict)
-            COORD.start_training(data_sets, step)
+            COORD.start_coordination(data_sets, step)
 
         # Get the first job
         job = COORD.get_job()
