@@ -7,12 +7,9 @@ class MBTestClient(MessageBusClient):
     def __init__(self, cluster, job, task):
         MessageBusClient.__init__(self, cluster, job, task)
 
-    def test(self, caller, data):
-        print('[%r] >>>>> %r from %r <<<<<' % (self.id, data, caller))
-        return 'hola!!!!!!!!!'
-
-def receive(caller, function, content):
-    print('%r responded for function %r with result %r.' % (caller, function, content))
+    def test(self, data):
+        print('>>>>> %r <<<<<' % data)
+        return 'hola - I am worker %d' % self.task
 
 task_index = int(sys.argv[1])
 cluster = tf.train.ClusterSpec({'worker': ['localhost:5656', 'localhost:5757']})
@@ -27,4 +24,5 @@ with tf.Session(server.target) as session:
         time.sleep(0)
         counter = counter + 1
         print('Calling! %d' % counter)
-        mbc.call_function(session, 'worker', int(sys.argv[2]), 'test', receive, sys.argv[3])
+        result = mbc.call(session, 'worker', int(sys.argv[2]), 'test', sys.argv[3])
+        print(result)
