@@ -27,11 +27,12 @@ import multiprocessing
 from six.moves import zip, range, filter, urllib, BaseHTTPServer
 from tensorflow.contrib.session_bundle import exporter
 from tensorflow.python.tools import freeze_graph
-from threading import Thread, Lock
+from threading import Thread, Lock, Event
 from util.feeding import DataSet, ModelFeeder
 from util.shared_lib import check_cupti
 from util.spell import correction
 from util.text import sparse_tensor_value_to_texts, wer, Alphabet
+from util.message_bus import MessageBusClient
 from urlparse import parse_qs
 from xdg import BaseDirectory as xdg
 import numpy as np
@@ -65,16 +66,8 @@ tf.app.flags.DEFINE_boolean ('test_ascending',   True,        'process samples i
 # Cluster configuration
 # =====================
 
-tf.app.flags.DEFINE_string  ('ps_hosts',         '',          'parameter servers - comma separated list of hostname:port pairs')
-tf.app.flags.DEFINE_string  ('worker_hosts',     '',          'workers - comma separated list of hostname:port pairs')
-tf.app.flags.DEFINE_string  ('job_name',         'localhost', 'job name - one of localhost (default), worker, ps')
-tf.app.flags.DEFINE_integer ('task_index',       0,           'index of task within the job - worker with index 0 will be the chief')
-tf.app.flags.DEFINE_integer ('replicas',         -1,          'total number of replicas - if negative, its absolute value is multiplied by the number of workers')
-tf.app.flags.DEFINE_integer ('replicas_to_agg',  -1,          'number of replicas to aggregate - if negative, its absolute value is multiplied by the number of workers')
-tf.app.flags.DEFINE_string  ('coord_retries',    100,         'number of tries of workers connecting to training coordinator before failing')
-tf.app.flags.DEFINE_string  ('coord_host',       'localhost', 'coordination server host')
-tf.app.flags.DEFINE_integer ('coord_port',       2500,        'coordination server port')
-tf.app.flags.DEFINE_integer ('iters_per_worker', 1,           'number of train or inference iterations per worker before results are sent back to coordinator')
+tf.app.flags.DEFINE_string  ('nodes',            '',          'comma separated list of hostname:port pairs of cluster worker nodes')
+tf.app.flags.DEFINE_integer ('task_index',       0,           'index of this worker within the cluster - worker with index 0 will be the chief')
 
 # Global Constants
 # ================
@@ -150,9 +143,9 @@ tf.app.flags.DEFINE_boolean ('early_stop',       True,        'enable early stop
 # It is possible that early stopping is triggered far after the best checkpoint is already replaced by checkpoint saving interval mechanism.
 # One has to align the parameters (earlystop_nsteps, checkpoint_secs) accordingly as per the time taken by an epoch on different datasets.
 
-tf.app.flags.DEFINE_integer ('earlystop_nsteps',  4,          'number of steps to consider for early stopping. Loss is not stored in the checkpoint so when checkpoint is revived it starts the loss calculation from start at that point')
-tf.app.flags.DEFINE_float   ('estop_mean_thresh', 0.5,        'mean threshold for loss to determine the condition if early stopping is required')
-tf.app.flags.DEFINE_float   ('estop_std_thresh',  0.5,        'standard deviation threshold for loss to determine the condition if early stopping is required')
+tf.app.flags.DEFINE_integer ('es_steps',         4,           'number of steps to consider for early stopping. Loss is not stored in the checkpoint so when checkpoint is revived it starts the loss calculation from start at that point')
+tf.app.flags.DEFINE_float   ('es_mean_th',       0.5,         'mean threshold for loss to determine the condition if early stopping is required')
+tf.app.flags.DEFINE_float   ('es_std_th',        0.5,         'standard deviation threshold for loss to determine the condition if early stopping is required')
 
 # Decoder
 
@@ -173,47 +166,21 @@ FLAGS = tf.app.flags.FLAGS
 def initialize_globals():
 
     # ps and worker hosts required for p2p cluster setup
-    FLAGS.ps_hosts = list(filter(len, FLAGS.ps_hosts.split(',')))
-    FLAGS.worker_hosts = list(filter(len, FLAGS.worker_hosts.split(',')))
+    FLAGS.nodes = list(filter(len, FLAGS.nodes.split(',')))
+    if len(FLAGS.nodes) == 0:
+        FLAGS.nodes.append('localhost:3987')
 
     # Determine, if we are the chief worker
     global is_chief
-    is_chief = len(FLAGS.worker_hosts) == 0 or (FLAGS.task_index == 0 and FLAGS.job_name == 'worker')
-
-    # Initializing and starting the training coordinator
-    global COORD
-    COORD = TrainingCoordinator()
-    COORD.start()
+    is_chief = FLAGS.task_index == 0
 
     # The absolute number of computing nodes - regardless of cluster or single mode
     global num_workers
-    num_workers = max(1, len(FLAGS.worker_hosts))
+    num_workers = max(1, len(FLAGS.nodes))
 
-    # Create a cluster from the parameter server and worker hosts.
-    global cluster
-    cluster = tf.train.ClusterSpec({'ps': FLAGS.ps_hosts, 'worker': FLAGS.worker_hosts})
-
-    # If replica numbers are negative, we multiply their absolute values with the number of workers
-    if FLAGS.replicas < 0:
-        FLAGS.replicas = num_workers * -FLAGS.replicas
-    if FLAGS.replicas_to_agg < 0:
-        FLAGS.replicas_to_agg = num_workers * -FLAGS.replicas_to_agg
-
-    # The device path base for this node
-    global worker_device
-    worker_device = '/job:%s/task:%d' % (FLAGS.job_name, FLAGS.task_index)
-
-    # This node's CPU device
-    global cpu_device
-    cpu_device = worker_device + '/cpu:0'
-
-    # This node's available GPU devices
-    global available_devices
-    available_devices = [worker_device + gpu.name for gpu in get_available_gpus()]
-
-    # If there is no GPU available, we fall back to CPU based operation
-    if 0 == len(available_devices):
-        available_devices = [cpu_device]
+    # Create a cluster_spec from the parameter server and worker hosts.
+    global cluster_spec
+    cluster_spec = tf.train.ClusterSpec({ 'worker': FLAGS.nodes })
 
     # By default we run as many sample loading threads per set as CPU cores
     # (as there is only one set active at a time)
@@ -313,30 +280,6 @@ def initialize_globals():
         if val is None:
             setattr(FLAGS, '%s_stddev' % var, FLAGS.default_stddev)
 
-    # Queues that are used to gracefully stop parameter servers.
-    # Each queue stands for one ps. A finishing worker sends a token to each queue befor joining/quitting.
-    # Each ps will dequeue as many tokens as there are workers before joining/quitting.
-    # This ensures parameter servers won't quit, if still required by at least one worker and
-    # also won't wait forever (like with a standard `server.join()`).
-    global done_queues
-    done_queues = []
-    for i, ps in enumerate(FLAGS.ps_hosts):
-        # Queues are hosted by their respective owners
-        with tf.device('/job:ps/task:%d' % i):
-            done_queues.append(tf.FIFOQueue(1, tf.int32, shared_name=('queue%i' % i)))
-
-    # Placeholder to pass in the worker's index as token
-    global token_placeholder
-    token_placeholder = tf.placeholder(tf.int32)
-
-    # Enqueue operations for each parameter server
-    global done_enqueues
-    done_enqueues = [queue.enqueue(token_placeholder) for queue in done_queues]
-
-    # Dequeue operations for each parameter server
-    global done_dequeues
-    done_dequeues = [queue.dequeue() for queue in done_queues]
-
 
 # Logging functions
 # =================
@@ -364,29 +307,17 @@ def log_error(message):
     if FLAGS.log_level <= 3:
         prefix_print('E ', message)
 
-
 # Graph Creation
 # ==============
 
-def variable_on_ps_level(name, shape, initializer, trainable=True):
-    r'''
-    Next we concern ourselves with graph creation.
-    However, before we do so we must introduce a utility function ``variable_on_ps_level()``
-    used to create a variable in CPU memory.
+def model_variable(name, shape, initializer, trainable=True):
     '''
-    # Use the /cpu:0 device on worker_device for scoped operations
-    if len(FLAGS.ps_hosts) == 0:
-        device = worker_device
-    else:
-        device = tf.train.replica_device_setter(worker_device=worker_device, cluster=cluster)
+    Creates a model variable on chief worker's CPU
+    '''
+    with tf.device('/job:worker/task:0/cpu'):
+        return tf.get_variable(name=name, shape=shape, initializer=initializer, trainable=trainable)
 
-    with tf.device(device):
-        # Create or get apropos variable
-        var = tf.get_variable(name=name, shape=shape, initializer=initializer, trainable=trainable)
-    return var
-
-
-def BiRNN(batch_x, seq_length, dropout):
+def BiRNN(batch_x, seq_length):
     r'''
     That done, we will define the learned variables, the weights and biases,
     within the method ``BiRNN()`` which also constructs the neural network.
@@ -416,22 +347,22 @@ def BiRNN(batch_x, seq_length, dropout):
     # clipped RELU activation and dropout.
 
     # 1st layer
-    b1 = variable_on_ps_level('b1', [n_hidden_1], tf.random_normal_initializer(stddev=FLAGS.b1_stddev))
-    h1 = variable_on_ps_level('h1', [n_input + 2*n_input*n_context, n_hidden_1], tf.contrib.layers.xavier_initializer(uniform=False))
+    b1 = model_variable('b1', [n_hidden_1], tf.random_normal_initializer(stddev=FLAGS.b1_stddev))
+    h1 = model_variable('h1', [n_input + 2*n_input*n_context, n_hidden_1], tf.contrib.layers.xavier_initializer(uniform=False))
     layer_1 = tf.minimum(tf.nn.relu(tf.add(tf.matmul(batch_x, h1), b1)), FLAGS.relu_clip)
-    layer_1 = tf.nn.dropout(layer_1, (1.0 - dropout[0]))
+    layer_1 = tf.nn.dropout(layer_1, (1.0 - dropout_rates[0]))
 
     # 2nd layer
-    b2 = variable_on_ps_level('b2', [n_hidden_2], tf.random_normal_initializer(stddev=FLAGS.b2_stddev))
-    h2 = variable_on_ps_level('h2', [n_hidden_1, n_hidden_2], tf.random_normal_initializer(stddev=FLAGS.h2_stddev))
+    b2 = model_variable('b2', [n_hidden_2], tf.random_normal_initializer(stddev=FLAGS.b2_stddev))
+    h2 = model_variable('h2', [n_hidden_1, n_hidden_2], tf.random_normal_initializer(stddev=FLAGS.h2_stddev))
     layer_2 = tf.minimum(tf.nn.relu(tf.add(tf.matmul(layer_1, h2), b2)), FLAGS.relu_clip)
-    layer_2 = tf.nn.dropout(layer_2, (1.0 - dropout[1]))
+    layer_2 = tf.nn.dropout(layer_2, (1.0 - dropout_rates[1]))
 
     # 3rd layer
-    b3 = variable_on_ps_level('b3', [n_hidden_3], tf.random_normal_initializer(stddev=FLAGS.b3_stddev))
-    h3 = variable_on_ps_level('h3', [n_hidden_2, n_hidden_3], tf.random_normal_initializer(stddev=FLAGS.h3_stddev))
+    b3 = model_variable('b3', [n_hidden_3], tf.random_normal_initializer(stddev=FLAGS.b3_stddev))
+    h3 = model_variable('h3', [n_hidden_2, n_hidden_3], tf.random_normal_initializer(stddev=FLAGS.h3_stddev))
     layer_3 = tf.minimum(tf.nn.relu(tf.add(tf.matmul(layer_2, h3), b3)), FLAGS.relu_clip)
-    layer_3 = tf.nn.dropout(layer_3, (1.0 - dropout[2]))
+    layer_3 = tf.nn.dropout(layer_3, (1.0 - dropout_rates[2]))
 
     # Now we create the forward and backward LSTM units.
     # Both of which have inputs of length `n_cell_dim` and bias `1.0` for the forget gate of the LSTM.
@@ -441,16 +372,16 @@ def BiRNN(batch_x, seq_length, dropout):
                    if 'reuse' not in inspect.getargspec(tf.contrib.rnn.BasicLSTMCell.__init__).args else \
                    tf.contrib.rnn.BasicLSTMCell(n_cell_dim, forget_bias=1.0, state_is_tuple=True, reuse=tf.get_variable_scope().reuse)
     lstm_fw_cell = tf.contrib.rnn.DropoutWrapper(lstm_fw_cell,
-                                                input_keep_prob=1.0 - dropout[3],
-                                                output_keep_prob=1.0 - dropout[3],
+                                                input_keep_prob=1.0 - dropout_rates[3],
+                                                output_keep_prob=1.0 - dropout_rates[3],
                                                 seed=FLAGS.random_seed)
     # Backward direction cell: (if else required for TF 1.0 and 1.1 compat)
     lstm_bw_cell = tf.contrib.rnn.BasicLSTMCell(n_cell_dim, forget_bias=1.0, state_is_tuple=True) \
                    if 'reuse' not in inspect.getargspec(tf.contrib.rnn.BasicLSTMCell.__init__).args else \
                    tf.contrib.rnn.BasicLSTMCell(n_cell_dim, forget_bias=1.0, state_is_tuple=True, reuse=tf.get_variable_scope().reuse)
     lstm_bw_cell = tf.contrib.rnn.DropoutWrapper(lstm_bw_cell,
-                                                input_keep_prob=1.0 - dropout[4],
-                                                output_keep_prob=1.0 - dropout[4],
+                                                input_keep_prob=1.0 - dropout_rates[4],
+                                                output_keep_prob=1.0 - dropout_rates[4],
                                                 seed=FLAGS.random_seed)
 
     # `layer_3` is now reshaped into `[n_steps, batch_size, 2*n_cell_dim]`,
@@ -471,15 +402,15 @@ def BiRNN(batch_x, seq_length, dropout):
     outputs = tf.reshape(outputs, [-1, 2*n_cell_dim])
 
     # Now we feed `outputs` to the fifth hidden layer with clipped RELU activation and dropout
-    b5 = variable_on_ps_level('b5', [n_hidden_5], tf.random_normal_initializer(stddev=FLAGS.b5_stddev))
-    h5 = variable_on_ps_level('h5', [(2 * n_cell_dim), n_hidden_5], tf.random_normal_initializer(stddev=FLAGS.h5_stddev))
+    b5 = model_variable('b5', [n_hidden_5], tf.random_normal_initializer(stddev=FLAGS.b5_stddev))
+    h5 = model_variable('h5', [(2 * n_cell_dim), n_hidden_5], tf.random_normal_initializer(stddev=FLAGS.h5_stddev))
     layer_5 = tf.minimum(tf.nn.relu(tf.add(tf.matmul(outputs, h5), b5)), FLAGS.relu_clip)
-    layer_5 = tf.nn.dropout(layer_5, (1.0 - dropout[5]))
+    layer_5 = tf.nn.dropout(layer_5, (1.0 - dropout_rates[5]))
 
     # Now we apply the weight matrix `h6` and bias `b6` to the output of `layer_5`
     # creating `n_classes` dimensional vectors, the logits.
-    b6 = variable_on_ps_level('b6', [n_hidden_6], tf.random_normal_initializer(stddev=FLAGS.b6_stddev))
-    h6 = variable_on_ps_level('h6', [n_hidden_5, n_hidden_6], tf.contrib.layers.xavier_initializer(uniform=False))
+    b6 = model_variable('b6', [n_hidden_6], tf.random_normal_initializer(stddev=FLAGS.b6_stddev))
+    h6 = model_variable('h6', [n_hidden_5, n_hidden_6], tf.contrib.layers.xavier_initializer(uniform=False))
     layer_6 = tf.add(tf.matmul(layer_5, h6), b6)
 
     # Finally we reshape layer_6 from a tensor of shape [n_steps*batch_size, n_hidden_6]
@@ -491,7 +422,7 @@ def BiRNN(batch_x, seq_length, dropout):
     return layer_6
 
 if not os.path.exists(os.path.abspath(FLAGS.decoder_library_path)):
-    print('ERROR: The decoder library file does not exist. Make sure you have ' \
+    log_error('ERROR: The decoder library file does not exist. Make sure you have ' \
           'downloaded or built the native client binaries and pass the ' \
           'appropriate path to the binaries in the --decoder_library_path parameter.')
 
@@ -523,44 +454,40 @@ def decode_with_lm(inputs, sequence_length, beam_width=100,
 # Conveniently, this loss function is implemented in TensorFlow.
 # Thus, we can simply make use of this implementation to define our loss.
 
-def calculate_mean_edit_distance_and_loss(tower, model_feeder, dropout):
+def calculate_mean_edit_distance_and_loss(model_feeder, worker_index, tower_index):
     r'''
     This routine beam search decodes a mini-batch and calculates the loss and mean edit distance.
     Next to batch size, total and average loss it returns the mean edit distance,
     the decoded result and the batch's original Y.
     '''
     # Obtain the next batch of data
-    batch_size, batch_x, batch_seq_len, batch_y = model_feeder.next_batch(tower)
+    batch_size, batch_x, batch_seq_len, batch_y = model_feeder.next_batch(worker_index, tower_index)
 
     # Calculate the logits of the batch using BiRNN
-    logits = BiRNN(batch_x, tf.to_int64(batch_seq_len), dropout)
-
+    logits = BiRNN(batch_x, tf.to_int64(batch_seq_len))
     # Compute the CTC loss using either TensorFlow's `ctc_loss` or Baidu's `warp_ctc_loss`.
     if FLAGS.use_warpctc:
         total_loss = tf.contrib.warpctc.warp_ctc_loss(labels=batch_y, inputs=logits, sequence_length=batch_seq_len)
     else:
         total_loss = tf.nn.ctc_loss(labels=batch_y, inputs=logits, sequence_length=batch_seq_len)
-
     # Calculate the average loss across the batch
     avg_loss = tf.reduce_mean(total_loss)
-
     # Beam search decode the batch
     decoded, _ = decode_with_lm(logits, batch_seq_len, merge_repeated=False, beam_width=FLAGS.beam_width)
 
     # Compute the edit (Levenshtein) distance
     distance = tf.edit_distance(tf.cast(decoded[0], tf.int32), batch_y)
-
     # Compute the mean edit distance
     mean_edit_distance = tf.reduce_mean(distance)
-
     # Finally we return the
+    # - worker and tower indices
     # - calculated total and
     # - average losses,
     # - the Levenshtein distance,
     # - the recognition mean edit distance,
     # - the decoded batch and
     # - the original batch_y (which contains the verified transcriptions).
-    return batch_size, total_loss, avg_loss, distance, mean_edit_distance, decoded, batch_y
+    return worker_index, tower_index, batch_size, total_loss, avg_loss, distance, mean_edit_distance, decoded, batch_y
 
 
 # Adam Optimization
@@ -577,13 +504,7 @@ def create_optimizer(weight):
                                        beta1=FLAGS.beta1,
                                        beta2=FLAGS.beta2,
                                        epsilon=FLAGS.epsilon)
-    # Synchronous distributed training is facilitated by a special proxy-optimizer
-    if len(FLAGS.ps_hosts) > 0:
-        optimizer = tf.train.SyncReplicasOptimizer(optimizer,
-                                                   replicas_to_aggregate=FLAGS.replicas_to_agg,
-                                                   total_num_replicas=FLAGS.replicas)
     return optimizer
-
 
 # Towers
 # ======
@@ -601,26 +522,61 @@ def create_optimizer(weight):
 # on which all operations within the tower execute.
 # For example, all operations of 'tower 0' could execute on the first GPU `tf.device('/gpu:0')`.
 
-def for_each_tower(callback, params):
+def for_each_tower(model_feeder, callback, former=None):
     results = []
     with tf.variable_scope(tf.get_variable_scope()):
         # Loop over available_devices
-        for i in range(len(available_devices)):
-            # Execute operations of tower i on device i
-            if len(FLAGS.ps_hosts) == 0:
-                device = available_devices[i]
-            else:
-                device = tf.train.replica_device_setter(worker_device=available_devices[i], cluster=cluster)
+        for i, wtq in enumerate(model_feeder.tower_queues):
+            wt = (wtq[0], wtq[1])
+            # Execute operations of tower t on worker w
+            device = '/job:worker/task:%d/gpu:%d' % wt
             with tf.device(device):
-                # Create a scope for all operations of tower i
-                with tf.name_scope('tower_%d' % i) as scope:
-                    results.append(callback(i, *params[i]))
+                # Create a scope for all operations of tower t
+                with tf.name_scope('tower_%d_%d' % wt) as scope:
+                    params = former[i] if former else wt
+                    results.append(callback(model_feeder, *params))
                     # Allow for variables to be re-used by the next tower
                     tf.get_variable_scope().reuse_variables()
     return results
 
+def average_gradients(device, gradients, batch_sizes):
+    '''
+    A routine for computing each variable's average of the gradients obtained from the GPUs.
+    Note also that this code acts as a syncronization point as it requires all
+    GPUs to be finished with their mini-batch before it can run to completion.
+    '''
+    # List of average gradients to return to the caller
+    average_grads = []
+    # Run this on cpu_device to conserve GPU memory
+    with tf.device(device):
+        # Compute sum of all tower batch sizes
+        batch_size_sum = tf.reduce_sum(batch_sizes, 0)
+        sample_number = tf.maximum(1, batch_size_sum)
+        # Loop over gradient/variable pairs from all towers
+        for grad_and_vars in zip(*gradients):
+            # Introduce grads to store the gradients for the current variable
+            grads = []
+            # Loop over the gradients for the current variable
+            for gv, batch_size in zip(grad_and_vars, batch_sizes):
+                # Weighted gradient - batch size is 0 for dummy sample
+                g = gv[0] * tf.to_float(batch_size)
+                # Add 0 dimension to the gradients to represent the tower.
+                expanded_g = tf.expand_dims(g, 0)
+                # Append on a 'tower' dimension which we will average over below.
+                grads.append(expanded_g)
+            # Average over the 'tower' dimension
+            grad = tf.concat(grads, 0)
+            grad = tf.reduce_mean(grad, 0)
+            grad = grad / tf.to_float(sample_number)
+            # Create a gradient/variable tuple for the current variable with its average gradient
+            grad_and_var = (grad, grad_and_vars[0][1])
+            # Add the current tuple to average_grads
+            average_grads.append(grad_and_var)
+    # Return result to caller
+    return average_grads, batch_size_sum
+
 def get_tower_results(model_feeder):
-    r'''
+    '''
     With this preliminary step out of the way, we can for each GPU introduce a
     tower for which's batch we calculate
 
@@ -631,87 +587,51 @@ def get_tower_results(model_feeder):
     * The Levenshtein distances between the decodings and their transcriptions ``distance``,
     * The mean edit distance of the outcome averaged over the whole batch ``mean_edit_distance``
     '''
-
-    results = for_each_tower(calculate_mean_edit_distance_and_loss, \
-                             [[model_feeder, dropout_rates]] * len(available_devices))
-
-    # Compute sum of all tower batch sizes
+    # building the graph
+    results = for_each_tower(model_feeder, calculate_mean_edit_distance_and_loss)
+    # constructing sum of all tower batch sizes
     batch_sizes = [result[0] for result in results]
     batch_size_sum = tf.to_float(tf.maximum(1, tf.reduce_sum(batch_sizes)))
-
+    # creating the optimizer by passing it the sum of all batch sizes for weighting
     optimizer = create_optimizer(batch_size_sum)
 
-    def weight_and_compute_gradients(index, batch_size, total_loss, avg_loss, distance, \
+    def weight_and_compute_gradients(model_feeder, worker_index, tower_index, \
+                                     batch_size, total_loss, avg_loss, distance, \
                                      mean_edit_distance, decoded, labels):
         batch_size_float = tf.to_float(batch_size)
-        return batch_size, \
+        return worker_index, \
+               tower_index, \
+               optimizer.compute_gradients(avg_loss), \
+               batch_size, \
                total_loss, \
                avg_loss * batch_size_float, \
                distance, \
                mean_edit_distance * batch_size_float, \
                decoded, \
-               labels, \
-               optimizer.compute_gradients(avg_loss)
+               labels
 
-    results = for_each_tower(weight_and_compute_gradients, results)
+    results = for_each_tower(model_feeder, weight_and_compute_gradients, results)
+    # compute gradients and weight loss and edit-distance
+    _, _, _, _, total_losses, avg_losses, distances, mean_edit_distances, decodings, labels = zip(*results)
 
-    batch_sizes, total_losses, avg_losses, distances, mean_edit_distances, decodings, labels, gradients = zip(*results)
-
-    # Return the optimizer, the results tuple, batch sizes, the gradients, and the means of mean edit distances and average losses
+    worker_averages = []
+    # saving transport bandwidth: first iterate over workers to compute averaged worker gradients...
+    for wi in range(len(model_feeder.tower_queues_per_worker)):
+        # pick worker wi's gradients and batch_sizes from results
+        gradients, batch_sizes = zip(*[(r[2], r[3]) for r in results if r[0] == wi])
+        # average weighted tower gradients to weighted worker gradients
+        worker_averages.append(average_gradients('/job:worker/task:%d/cpu' % wi, gradients, batch_sizes))
+    # ... and then average weighted worker gradients to overall step gradients
+    # Note: This avoids transporting all tower gradients to chief node before averaging
+    gradients, batch_size = average_gradients('/cpu:0', *zip(*worker_averages))
+    # return the optimizer, the results tuple, gradients, the batch size,
+    # and the means of mean edit distances and average losses
     return optimizer, \
            (labels, decodings, distances, total_losses), \
-           batch_sizes, \
            gradients, \
+           batch_size, \
            tf.reduce_mean(mean_edit_distances, 0) / batch_size_sum, \
            tf.reduce_mean(avg_losses, 0) / batch_size_sum
-
-
-def average_gradients(batch_sizes, tower_gradients):
-    r'''
-    A routine for computing each variable's average of the gradients obtained from the GPUs.
-    Note also that this code acts as a syncronization point as it requires all
-    GPUs to be finished with their mini-batch before it can run to completion.
-    '''
-    # List of average gradients to return to the caller
-    average_grads = []
-
-    # Run this on cpu_device to conserve GPU memory
-    with tf.device(cpu_device):
-        # Compute sum of all tower batch sizes
-        sample_number = tf.maximum(1, tf.reduce_sum(batch_sizes))
-
-        # Loop over gradient/variable pairs from all towers
-        for grad_and_vars in zip(*tower_gradients):
-            # Introduce grads to store the gradients for the current variable
-            grads = []
-
-            # Loop over the gradients for the current variable
-            for gv, batch_size in zip(grad_and_vars, batch_sizes):
-                # Weighted gradient - batch size is 0 for dummy sample
-                g = gv[0] * tf.to_float(batch_size)
-                # Add 0 dimension to the gradients to represent the tower.
-                expanded_g = tf.expand_dims(g, 0)
-                # Append on a 'tower' dimension which we will average over below.
-                grads.append(expanded_g)
-
-            # Average over the 'tower' dimension
-            grad = tf.concat(grads, 0)
-            grad = tf.reduce_mean(grad, 0)
-            grad = grad / tf.to_float(sample_number)
-
-            # Create a gradient/variable tuple for the current variable with its average gradient
-            grad_and_var = (grad, grad_and_vars[0][1])
-
-            # Add the current tuple to average_grads
-            average_grads.append(grad_and_var)
-
-    # Return result to caller
-    return average_grads, sample_number
-
-
-
-# Logging
-# =======
 
 def log_variable(variable, gradient=None):
     r'''
@@ -734,914 +654,12 @@ def log_variable(variable, gradient=None):
         if grad_values is not None:
             tf.summary.histogram(name='%s/gradients' % name, values=grad_values)
 
-
 def log_grads_and_vars(grads_and_vars):
     r'''
     Let's also introduce a helper function for logging collections of gradient/variable tuples.
     '''
     for gradient, variable in grads_and_vars:
         log_variable(variable, gradient=gradient)
-
-def get_git_revision_hash():
-    return subprocess.check_output(['git', 'rev-parse', 'HEAD']).strip()
-
-def get_git_branch():
-    return subprocess.check_output(['git', 'rev-parse', '--abbrev-ref', 'HEAD']).strip()
-
-
-# Helpers
-# =======
-
-def calculate_report(results_tuple):
-    r'''
-    This routine will calculate a WER report.
-    It'll compute the `mean` WER and create ``Sample`` objects of the ``report_count`` top lowest
-    loss items from the provided WER results tuple (only items with WER!=0 and ordered by their WER).
-    '''
-    samples = []
-    items = list(zip(*results_tuple))
-    mean_wer = 0.0
-    for label, decoding, distance, loss in items:
-        if len(label) == 1 and label[0] == 0:
-            # skip dummy sample
-            continue
-        sample_wer = wer(label, decoding)
-        sample = Sample(label, decoding, loss, distance, sample_wer)
-        samples.append(sample)
-        mean_wer += sample_wer
-
-    # Getting the mean WER from the accumulated one
-    mean_wer = mean_wer / len(items)
-
-    # Filter out all items with WER=0
-    samples = [s for s in samples if s.wer > 0]
-
-    # Order the remaining items by their loss (lowest loss on top)
-    samples.sort(key=lambda s: s.loss)
-
-    # Take only the first report_count items
-    samples = samples[:FLAGS.report_count]
-
-    # Order this top FLAGS.report_count items by their WER (lowest WER on top)
-    samples.sort(key=lambda s: s.wer)
-
-    return mean_wer, samples
-
-def collect_results(results_tuple, returns):
-    r'''
-    This routine will help collecting partial results for the WER reports.
-    The ``results_tuple`` is composed of an array of the original labels,
-    an array of the corresponding decodings, an array of the corrsponding
-    distances and an array of the corresponding losses. ``returns`` is built up
-    in a similar way, containing just the unprocessed results of one
-    ``session.run`` call (effectively of one batch).
-    Labels and decodings are converted to text before splicing them into their
-    corresponding results_tuple lists. In the case of decodings,
-    for now we just pick the first available path.
-    '''
-    # Each of the arrays within results_tuple will get extended by a batch of each available device
-    for i in range(len(available_devices)):
-        # Collect the labels
-        results_tuple[0].extend(sparse_tensor_value_to_texts(returns[0][i], alphabet))
-
-        # Collect the decodings - at the moment we default to the first one
-        results_tuple[1].extend(sparse_tensor_value_to_texts(returns[1][i][0], alphabet))
-
-        # Collect the distances
-        results_tuple[2].extend(returns[2][i])
-
-        # Collect the losses
-        results_tuple[3].extend(returns[3][i])
-
-
-# For reporting we also need a standard way to do time measurements.
-def stopwatch(start_duration=0):
-    r'''
-    This function will toggle a stopwatch.
-    The first call starts it, second call stops it, third call continues it etc.
-    So if you want to measure the accumulated time spent in a certain area of the code,
-    you can surround that code by stopwatch-calls like this:
-
-    .. code:: python
-
-        fun_time = 0 # initializes a stopwatch
-        [...]
-        for i in range(10):
-          [...]
-          # Starts/continues the stopwatch - fun_time is now a point in time (again)
-          fun_time = stopwatch(fun_time)
-          fun()
-          # Pauses the stopwatch - fun_time is now a duration
-          fun_time = stopwatch(fun_time)
-        [...]
-        # The following line only makes sense after an even call of :code:`fun_time = stopwatch(fun_time)`.
-        print 'Time spent in fun():', format_duration(fun_time)
-
-    '''
-    if start_duration == 0:
-        return datetime.datetime.utcnow()
-    else:
-        return datetime.datetime.utcnow() - start_duration
-
-def format_duration(duration):
-    '''Formats the result of an even stopwatch call as hours:minutes:seconds'''
-    duration = duration if isinstance(duration, int) else duration.seconds
-    m, s = divmod(duration, 60)
-    h, m = divmod(m, 60)
-    return '%d:%02d:%02d' % (h, m, s)
-
-
-# Execution
-# =========
-
-# String constants for different services of the web handler
-PREFIX_GET_INDICES = '/get_indices/?'
-PREFIX_GET_JOB = '/get_job/?'
-
-# Global ID counter for all objects requiring an ID
-id_counter = 0
-
-def new_id():
-    '''Returns a new ID that is unique on process level. Not thread-safe.
-
-    Returns:
-        int. The new ID
-    '''
-    global id_counter
-    id_counter += 1
-    return id_counter
-
-class Sample(object):
-    def __init__(self, src, res, loss, mean_edit_distance, sample_wer):
-        '''Represents one item of a WER report.
-
-        Args:
-            src (str): source text
-            res (str): resulting text
-            loss (float): computed loss of this item
-            mean_edit_distance (float): computed mean edit distance of this item
-        '''
-        self.src = src
-        self.res = res
-        self.loss = loss
-        self.mean_edit_distance = mean_edit_distance
-        self.wer = sample_wer
-
-    def __str__(self):
-        return 'WER: %f, loss: %f, mean edit distance: %f\n - src: "%s"\n - res: "%s"' % (self.wer, self.loss, self.mean_edit_distance, self.src, self.res)
-
-class WorkerJob(object):
-    def __init__(self, epoch_id, index, set_name, steps, report):
-        '''Represents a job that should be executed by a worker.
-
-        Args:
-            epoch_id (int): the ID of the 'parent' epoch
-            index (int): the epoch index of the 'parent' epoch
-            set_name (str): the name of the data-set - one of 'train', 'dev', 'test'
-            steps (int): the number of `session.run` calls
-            report (bool): if this job should produce a WER report
-        '''
-        self.id = new_id()
-        self.epoch_id = epoch_id
-        self.index = index
-        self.worker = -1
-        self.set_name = set_name
-        self.steps = steps
-        self.report = report
-        self.loss = -1
-        self.mean_edit_distance = -1
-        self.wer = -1
-        self.sample_number = 0
-        self.samples = []
-
-    def __str__(self):
-        return 'Job (ID: %d, worker: %d, epoch: %d, set_name: %s)' % (self.id, self.worker, self.index, self.set_name)
-
-class Epoch(object):
-    '''Represents an epoch that should be executed by the Training Coordinator.
-    Creates `num_jobs` `WorkerJob` instances in state 'open'.
-
-    Args:
-        index (int): the epoch index of the 'parent' epoch
-        num_jobs (int): the number of jobs in this epoch
-
-    Kwargs:
-        set_name (str): the name of the data-set - one of 'train', 'dev', 'test'
-        report (bool): if this job should produce a WER report
-    '''
-    def __init__(self, index, samples_to_compute, set_name='train', report=False):
-        self.id = new_id()
-        self.index = index
-        self.samples_to_compute = samples_to_compute
-        self.set_name = set_name
-        self.report = report
-        self.wer = -1
-        self.loss = -1
-        self.mean_edit_distance = -1
-        self.jobs_running = []
-        self.jobs_done = []
-        self.samples = []
-
-    def name(self):
-        '''Gets a printable name for this epoch.
-
-        Returns:
-            str. printable name for this epoch
-        '''
-        if self.index >= 0:
-            ename = ' of Epoch %d' % self.index
-        else:
-            ename = ''
-        if self.set_name == 'train':
-            return 'Training%s' % ename
-        elif self.set_name == 'dev':
-            return 'Validation%s' % ename
-        else:
-            return 'Test%s' % ename
-
-    def get_job(self, worker):
-        '''Gets the next open job from this epoch. The job will be marked as 'running'.
-
-        Args:
-            worker (int): index of the worker that takes the job
-
-        Returns:
-            WorkerJob. job that has been marked as running for this worker
-        '''
-        if self.samples_to_compute > 0:
-            job = WorkerJob(self.id, self.index, self.set_name, FLAGS.iters_per_worker, self.report)
-            job.worker = worker
-            self.jobs_running.append(job)
-            return job
-        else:
-            return None
-
-    def finish_job(self, job):
-        '''Finishes a running job. Removes it from the running jobs list and adds it to the done jobs list.
-
-        Args:
-            job (WorkerJob): the job to put into state 'done'
-        '''
-        index = next((i for i in range(len(self.jobs_running)) if self.jobs_running[i].id == job.id), -1)
-        if index >= 0:
-            self.jobs_running.pop(index)
-            self.jobs_done.append(job)
-            self.samples_to_compute -= job.sample_number
-            log_traffic('%s - Moved %s (loss %f) from running to done.' % (self.name(), job, job.loss))
-        else:
-            log_warn('%s - There is no job with ID %d registered as running.' % (self.name(), job.id))
-
-    def done(self):
-        '''Checks, if all jobs of the epoch are in state 'done'.
-        It also lazy-prepares a WER report from the result data of all jobs.
-
-        Returns:
-            bool. if all jobs of the epoch are 'done'
-        '''
-        if self.samples_to_compute <= 0:
-            num_jobs = len(self.jobs_done)
-            if num_jobs > 0:
-                jobs = self.jobs_done
-                self.jobs_done = []
-
-                total_number_of_samples = 0.0
-                agg_loss = 0.0
-                agg_wer = 0.0
-                agg_mean_edit_distance = 0.0
-
-                for i in range(num_jobs):
-                    job = jobs.pop(0)
-                    total_number_of_samples += job.sample_number
-                    agg_loss += job.loss * job.sample_number
-                    if self.report:
-                        agg_wer += job.wer * job.sample_number
-                        agg_mean_edit_distance += job.mean_edit_distance * job.sample_number
-                        self.samples.extend(job.samples)
-
-                self.loss = agg_loss / total_number_of_samples
-
-                # if the job was for validation dataset then append it to the COORD's _loss for early stop verification
-                if (FLAGS.early_stop is True) and (self.set_name == 'dev'):
-                    COORD._dev_losses.append(self.loss)
-
-                if self.report:
-                    self.wer = agg_wer / total_number_of_samples
-                    self.mean_edit_distance = agg_mean_edit_distance / total_number_of_samples
-
-                    # Order samles by their loss (lowest loss on top)
-                    self.samples.sort(key=lambda s: s.loss)
-
-                    # Take only the first report_count items
-                    self.samples = self.samples[:FLAGS.report_count]
-
-                    # Order this top FLAGS.report_count items by their WER (lowest WER on top)
-                    self.samples.sort(key=lambda s: s.wer)
-
-                    # Append WER to WER log file
-                    if len(FLAGS.wer_log_pattern) > 0:
-                        time = datetime.datetime.utcnow().isoformat()
-                        # Log WER progress
-                        print(FLAGS.wer_log_pattern % (time, self.set_name, self.wer))
-
-            return True
-        return False
-
-    def job_status(self):
-        '''Provides a printable overview of the states of the jobs of this epoch.
-
-        Returns:
-            str. printable overall job state
-        '''
-        return '%s - jobs running: %d, jobs done: %d' % (self.name(), len(self.jobs_running), len(self.jobs_done))
-
-    def __str__(self):
-        if not self.done():
-            return self.job_status()
-
-        if not self.report:
-            return '%s - loss: %f' % (self.name(), self.loss)
-
-        s = '%s - WER: %f, loss: %s, mean edit distance: %f' % (self.name(), self.wer, self.loss, self.mean_edit_distance)
-        if len(self.samples) > 0:
-            line = '\n' + ('-' * 80)
-            for sample in self.samples:
-                s += '%s\n%s' % (line, sample)
-            s += line
-        return s
-
-
-class TrainingCoordinator(object):
-    class TrainingCoordinationHandler(BaseHTTPServer.BaseHTTPRequestHandler):
-        '''Handles HTTP requests from remote workers to the Training Coordinator.
-        '''
-        def _send_answer(self, data=None):
-            self.send_response(200)
-            self.send_header('content-type', 'text/plain')
-            self.end_headers()
-            if data:
-                self.wfile.write(data)
-
-        def do_GET(self):
-            if COORD.started:
-                if self.path.startswith(PREFIX_GET_INDICES):
-                    params = parse_qs(self.path[len(PREFIX_GET_INDICES):])
-                    index = COORD._get_indices(params['set'][0], int(params['number'][0]))
-                    if index >= 0:
-                        self._send_answer(str(index).encode("utf-8"))
-                        return
-                elif self.path.startswith(PREFIX_GET_JOB):
-                    params = parse_qs(self.path[len(PREFIX_GET_JOB):])
-                    job = COORD.get_job(worker=int(params['worker'][0]))
-                    if job:
-                        self._send_answer(pickle.dumps(job))
-                        return
-                self.send_response(204) # end of training
-            else:
-                self.send_response(202) # not ready yet
-            self.end_headers()
-
-        def do_POST(self):
-            if COORD.started:
-                src = self.rfile.read(int(self.headers['content-length']))
-                job = COORD.next_job(pickle.loads(src))
-                if job:
-                    self._send_answer(pickle.dumps(job))
-                    return
-                self.send_response(204) # end of training
-            else:
-                self.send_response(202) # not ready yet
-            self.end_headers()
-
-        def log_message(self, format, *args):
-            '''Overriding base method to suppress web handler messages on stdout.
-            '''
-            return
-
-
-    def __init__(self):
-        ''' Central training coordination class.
-        Used for distributing jobs among workers of a cluster.
-        Instantiated on all workers, calls of non-chief workers will transparently
-        HTTP-forwarded to the chief worker instance.
-        '''
-        self._init()
-        self._lock = Lock()
-        self.started = False
-        if is_chief:
-            self._httpd = BaseHTTPServer.HTTPServer((FLAGS.coord_host, FLAGS.coord_port), TrainingCoordinator.TrainingCoordinationHandler)
-
-    def _set_counters(self, value):
-        self._index_train = value
-        self._index_dev = value
-        self._index_test = value
-
-    def _init(self):
-        self._epochs_running = []
-        self._epochs_done = []
-        self._set_counters(-1)
-        self._dev_losses = []
-
-    def _log_all_jobs(self):
-        '''Use this to debug-print epoch state'''
-        log_debug('Epochs - running: %d, done: %d' % (len(self._epochs_running), len(self._epochs_done)))
-        for epoch in self._epochs_running:
-            log_debug('       - running: ' + epoch.job_status())
-
-    def start_coordination(self, model_feeder, sample_number=0):
-        '''Starts to coordinate epochs and jobs among workers on base of
-        data-set sizes, the (global) step and FLAGS parameters.
-
-        Args:
-            model_feeder (ModelFeeder): data-sets to be used for coordinated training
-
-        Kwargs:
-            step (int): global step of a loaded model to determine starting point
-        '''
-        with self._lock:
-            self._init()
-
-            # Number of samples per epoch - to be at least 1
-            self._samples_train = max(1, len(model_feeder.train.files))
-            self._samples_dev =   max(1, len(model_feeder.dev.files))
-            self._samples_test =  max(1, len(model_feeder.test.files))
-
-            # The start epoch of our training
-            self._epoch = sample_number // self._samples_train
-
-            # Number of additional 'jobs' trained already 'on top of' our start epoch
-            samples_trained = (sample_number % self._samples_train)
-
-            if FLAGS.epoch < 0:
-                # A negative epoch means to add its absolute number to the epochs already computed
-                self._target_epoch = self._epoch + abs(FLAGS.epoch)
-            else:
-                self._target_epoch = FLAGS.epoch
-
-            # State variables
-            # We only have to train, if we are told so and are not at the target epoch yet
-            self._train = FLAGS.train and self._target_epoch > self._epoch
-            self._test = FLAGS.test
-
-            if self._train:
-                # The total number of jobs for all additional epochs to be trained
-                # Will be decremented for each job that is produced/put into state 'open'
-                self._samples_left = (self._target_epoch - self._epoch) * self._samples_train - samples_trained
-                log_info('STARTING Optimization')
-                self._training_time = stopwatch()
-
-            # Important for debugging
-            log_debug('epoch: %d' % self._epoch)
-            log_debug('target epoch: %d' % self._target_epoch)
-            log_debug('samples per epoch: %d' % self._samples_train)
-            log_debug('number of samples already trained in first epoch: %d' % samples_trained)
-
-            self._next_epoch()
-
-        # The coordinator is ready to serve
-        self.started = True
-
-    def _next_epoch(self):
-        # State-machine of the coodination process
-
-        # Indicates, if there were 'new' epoch(s) provided
-        result = False
-
-        # Make sure that early stop is enabled and validation part is enabled
-        if (FLAGS.early_stop is True) and (FLAGS.validation_step > 0) and (len(self._dev_losses) >= FLAGS.earlystop_nsteps):
-
-            # Calculate the mean of losses for past epochs
-            mean_loss = np.mean(self._dev_losses[-FLAGS.earlystop_nsteps:-1])
-            # Calculate the standard deviation for losses from validation part in the past epochs
-            std_loss = np.std(self._dev_losses[-FLAGS.earlystop_nsteps:-1])
-            # Update the list of losses incurred
-            self._dev_losses = self._dev_losses[-FLAGS.earlystop_nsteps:]
-            log_debug('Checking for early stopping (last %d steps) validation loss: %f, with standard deviation: %f and mean: %f' % (FLAGS.earlystop_nsteps, self._dev_losses[-1], std_loss, mean_loss))
-
-            # Check if validation loss has started increasing or is not decreasing substantially, making sure slight fluctuations don't bother the early stopping from working
-            if self._dev_losses[-1] > np.max(self._dev_losses[:-1]) or (abs(self._dev_losses[-1] - mean_loss) < FLAGS.estop_mean_thresh and std_loss < FLAGS.estop_std_thresh):
-                # Time to early stop
-                log_info('Early stop triggered as (for last %d steps) validation loss: %f with standard deviation: %f and mean: %f' % (FLAGS.earlystop_nsteps, self._dev_losses[-1], std_loss, mean_loss))
-                self._dev_losses = []
-                self._end_training()
-                self._train = False
-
-        if self._train:
-            # We are in train mode
-            if self._samples_left > 0:
-                # There are still jobs left
-                remainig_samples_of_first_epoch = self._samples_left % self._samples_train
-                if remainig_samples_of_first_epoch > 0:
-                    samples_train = remainig_samples_of_first_epoch
-                else:
-                    samples_train = self._samples_train
-                self._samples_left -= samples_train
-
-                # Let's keep the notion of curriculum learning
-                self._set_counters(0)
-                self._index_train = self._samples_train - samples_train
-
-                # If the training part of the current epoch should generate a WER report
-                is_display_step = FLAGS.display_step > 0 and (FLAGS.display_step == 1 or self._epoch > 0) and (self._epoch % FLAGS.display_step == 0 or self._epoch == self._target_epoch)
-                # Append the training epoch
-                self._epochs_running.append(Epoch(self._epoch, samples_train, set_name='train', report=is_display_step))
-
-                if FLAGS.validation_step > 0 and (FLAGS.validation_step == 1 or self._epoch > 0) and self._epoch % FLAGS.validation_step == 0:
-                    # The current epoch should also have a validation part
-                    self._epochs_running.append(Epoch(self._epoch, self._samples_dev, set_name='dev', report=is_display_step))
-
-                # Indicating that there were 'new' epoch(s) provided
-                result = True
-            else:
-                # No jobs left, but still in train mode: concluding training
-                self._end_training()
-                self._train = False
-
-        if self._test and not self._train:
-            # We shall test, and are not in train mode anymore
-            self._test = False
-            self._epochs_running.append(Epoch(self._epoch, self._samples_test, set_name='test', report=True))
-            # Indicating that there were 'new' epoch(s) provided
-            result = True
-
-        if result:
-            # Increment the epoch index - shared among train and test 'state'
-            self._epoch += 1
-        return result
-
-    def _end_training(self):
-        self._training_time = stopwatch(self._training_time)
-        log_info('FINISHED Optimization - training time: %s' % format_duration(self._training_time))
-
-    def start(self):
-        '''Starts Training Coordinator. If chief, it starts a web server for
-        communication with non-chief instances.
-        '''
-        if is_chief:
-            log_debug('Starting coordinator...')
-            self._thread = Thread(target=self._httpd.serve_forever)
-            self._thread.daemon = True
-            self._thread.start()
-            log_debug('Coordinator started.')
-
-    def stop(self, wait_for_running_epochs=True):
-        '''Stops Training Coordinator. If chief, it waits for all epochs to be
-        'done' and then shuts down the web server.
-        '''
-        if is_chief:
-            if wait_for_running_epochs:
-                while len(self._epochs_running) > 0:
-                    log_traffic('Coordinator is waiting for epochs to finish...')
-                    time.sleep(5)
-            log_debug('Stopping coordinator...')
-            self._httpd.shutdown()
-            log_debug('Coordinator stopped.')
-
-    def _talk_to_chief(self, path, data=None, default=None):
-        tries = 0
-        while tries < FLAGS.coord_retries:
-            tries += 1
-            try:
-                url = 'http://%s:%d%s' % (FLAGS.coord_host, FLAGS.coord_port, path)
-                log_traffic('Contacting coordinator - url: %s, tries: %d ...' % (url, tries-1))
-                res = urllib.request.urlopen(urllib.request.Request(url, data, { 'content-type': 'text/plain' }))
-                str = res.read()
-                status = res.getcode()
-                log_traffic('Coordinator responded - url: %s, status: %s' % (url, status))
-                if status == 200:
-                    return str
-                if status == 204: # We use 204 (no content) to indicate end of training
-                    return default
-            except urllib.error.HTTPError as error:
-                log_traffic('Problem reaching coordinator - url: %s, HTTP code: %d' % (url, error.code))
-                pass
-            time.sleep(10)
-        return default
-
-    def _get_indices(self, set_name, number):
-        with self._lock:
-            member = '_index_' + set_name
-            value = getattr(self, member, -1)
-            if value < 0:
-                return -1
-            setattr(self, member, value + number)
-            return value
-
-    def get_indices(self, set_name, number):
-        '''Retrives a new cluster-unique batch index a given set-name from central coodinator.
-        Prevents applying one batch multiple times per epoch.
-
-        Args:
-            set_name (str): name of the data set - one of 'train', 'dev', 'test'
-            number (int): number of sample indices to allocate
-
-        Returns:
-            int. new data set index of allocation's first sample
-        '''
-        log_traffic('Asking for next index...')
-        if is_chief:
-            value = self._get_indices(set_name, number)
-        else:
-            # We are a remote worker and have to hand over to the chief worker by HTTP
-            value = int(self._talk_to_chief(PREFIX_GET_INDICES + 'set=' + set_name + '&number=' + str(number)))
-        log_traffic('Got index %d.' % value)
-        return value
-
-    def _get_job(self, worker=0):
-        job = None
-        # Find first running epoch that provides a next job
-        for epoch in self._epochs_running:
-            job = epoch.get_job(worker)
-            if job:
-                return job
-        # No next job found
-        return None
-
-    def get_job(self, worker=0):
-        '''Retrieves the first job for a worker.
-
-        Kwargs:
-            worker (int): index of the worker to get the first job for
-
-        Returns:
-            WorkerJob. a job of one of the running epochs that will get
-                associated with the given worker and put into state 'running'
-        '''
-        # Let's ensure that this does not interfer with other workers/requests
-        with self._lock:
-            if is_chief:
-                # First try to get a next job
-                job = self._get_job(worker)
-
-                if job is None:
-                    # If there was no next job, we give it a second chance by triggering the epoch state machine
-                    if self._next_epoch():
-                        # Epoch state machine got a new epoch
-                        # Second try to get a next job
-                        job = self._get_job(worker)
-                        if job is None:
-                            # Albeit the epoch state machine got a new epoch, the epoch had no new job for us
-                            log_error('Unexpected case - no job for worker %d.' % (worker))
-                        return job
-
-                    # Epoch state machine has no new epoch
-                    # This happens at the end of the whole training - nothing to worry about
-                    log_traffic('No jobs left for worker %d.' % (worker))
-                    self._log_all_jobs()
-                    return None
-
-                # We got a new job from one of the currently running epochs
-                log_traffic('Got new %s' % job)
-                return job
-
-            # We are a remote worker and have to hand over to the chief worker by HTTP
-            result = self._talk_to_chief(PREFIX_GET_JOB + 'worker=' + str(FLAGS.task_index))
-            if result:
-                result = pickle.loads(result)
-            return result
-
-    def next_job(self, job):
-        '''Sends a finished job back to the coordinator and retrieves in exchange the next one.
-
-        Kwargs:
-            job (WorkerJob): job that was finished by a worker and who's results are to be
-                digested by the coordinator
-
-        Returns:
-            WorkerJob. next job of one of the running epochs that will get
-                associated with the worker from the finished job and put into state 'running'
-        '''
-        if is_chief:
-            # Try to find the epoch the job belongs to
-            epoch = next((epoch for epoch in self._epochs_running if epoch.id == job.epoch_id), None)
-            if epoch:
-                # We are going to manipulate things - let's avoid undefined state
-                with self._lock:
-                    # Let the epoch finish the job
-                    epoch.finish_job(job)
-                    # Check, if epoch is done now
-                    if epoch.done():
-                        # If it declares itself done, move it from 'running' to 'done' collection
-                        self._epochs_running.remove(epoch)
-                        self._epochs_done.append(epoch)
-                        log_info('%s' % epoch)
-            else:
-                # There was no running epoch found for this job - this should never happen.
-                log_error('There is no running epoch of ID %d for job with ID %d. This should never happen.' % (job.epoch_id, job.id))
-            return self.get_job(job.worker)
-
-        # We are a remote worker and have to hand over to the chief worker by HTTP
-        result = self._talk_to_chief('', data=pickle.dumps(job))
-        if result:
-            result = pickle.loads(result)
-        return result
-
-def send_token_to_ps(session, kill=False):
-    # Sending our token (the task_index as a debug opportunity) to each parameter server.
-    # kill switch tokens are negative and decremented by 1 to deal with task_index 0
-    token = -FLAGS.task_index-1 if kill else FLAGS.task_index
-    kind = 'kill switch' if kill else 'stop'
-    for index, enqueue in enumerate(done_enqueues):
-        log_debug('Sending %s token to ps %d...' % (kind, index))
-        session.run(enqueue, feed_dict={ token_placeholder: token })
-        log_debug('Sent %s token to ps %d.' % (kind, index))
-
-def train(server=None):
-    r'''
-    Trains the network on a given server of a cluster.
-    If no server provided, it performs single process training.
-    '''
-
-    # Create a variable to hold the global_step.
-    # It will automgically get incremented by the optimizer.
-    global_step = tf.Variable(0, trainable=False, name='global_step')
-
-    # Reading training set
-    train_set = DataSet(FLAGS.train_files.split(','),
-                        limit=FLAGS.limit_train,
-                        skip=FLAGS.skip_train,
-                        ascending=FLAGS.train_ascending,
-                        get_indices=lambda n: COORD.get_indices('train', n))
-
-    # Reading validation set
-    dev_set = DataSet(FLAGS.dev_files.split(','),
-                      limit=FLAGS.limit_dev,
-                      skip=FLAGS.skip_dev,
-                      ascending=FLAGS.dev_ascending,
-                      get_indices=lambda n: COORD.get_indices('dev', n))
-
-    # Reading test set
-    test_set = DataSet(FLAGS.test_files.split(','),
-                       limit=FLAGS.limit_test,
-                       skip=FLAGS.skip_test,
-                       ascending=FLAGS.test_ascending,
-                       get_indices=lambda n: COORD.get_indices('test', n))
-
-    # Combining all sets to a multi set model feeder
-    model_feeder = ModelFeeder(train_set,
-                               dev_set,
-                               test_set,
-                               n_input,
-                               n_context,
-                               alphabet,
-                               len(available_devices),
-                               FLAGS.threads_per_set,
-                               FLAGS.loader_buffer,
-                               min(memory_limits),
-                               FLAGS.queue_capacity)
-
-    # Get the data_set specific graph end-points
-    optimizer, results_tuple, batch_sizes, gradients, mean_edit_distance, loss = get_tower_results(model_feeder)
-
-    # Average tower gradients across GPUs
-    avg_tower_gradients, sample_number = average_gradients(batch_sizes, gradients)
-
-    # Add summaries of all variables and gradients to log
-    log_grads_and_vars(avg_tower_gradients)
-
-    # Op to merge all summaries for the summary hook
-    merge_all_summaries_op = tf.summary.merge_all()
-
-    # Apply gradients to modify the model
-    apply_gradient_op = optimizer.apply_gradients(avg_tower_gradients, global_step=global_step)
-
-    # Increment global sample counter
-    sample_counter = variable_on_ps_level('sample_counter', None, 0, trainable=False)
-    sample_inc_op = tf.assign_add(sample_counter, sample_number)
-
-    if FLAGS.early_stop is True and not FLAGS.validation_step > 0:
-        log_warn('Parameter --validation_step needs to be >0 for early stopping to work')
-
-    class CoordHook(tf.train.SessionRunHook):
-        r'''
-        Embedded coordination hook-class that will use variables of the
-        surrounding Python context.
-        '''
-        def after_create_session(self, session, coord):
-            log_debug('Starting queue runners...')
-            model_feeder.start_queue_threads(session, coord)
-            log_debug('Queue runners started.')
-
-        def end(self, session):
-            # Closing the data_set queues
-            log_debug('Closing queues...')
-            model_feeder.close_queues(session)
-            log_debug('Queues closed.')
-
-            # Telling the ps that we are done
-            send_token_to_ps(session)
-
-    # Collecting the hooks
-    hooks = [CoordHook()]
-
-    # Hook to handle initialization and queues for sync replicas.
-    if server:
-        hooks.append(optimizer.make_session_run_hook(is_chief))
-
-    # Hook to save TensorBoard summaries
-    if FLAGS.summary_secs > 0:
-        hooks.append(tf.train.SummarySaverHook(save_secs=FLAGS.summary_secs, output_dir=FLAGS.summary_dir, summary_op=merge_all_summaries_op))
-
-    # Hook wih number of checkpoint files to save in checkpoint_dir
-    if FLAGS.max_to_keep > 0:
-        saver = tf.train.Saver(max_to_keep=FLAGS.max_to_keep)
-        hooks.append(tf.train.CheckpointSaverHook(checkpoint_dir=FLAGS.checkpoint_dir, save_secs=FLAGS.checkpoint_secs, saver=saver))
-
-    # The MonitoredTrainingSession takes care of session initialization,
-    # restoring from a checkpoint, saving to a checkpoint, and closing when done
-    # or an error occurs.
-    try:
-        with tf.train.MonitoredTrainingSession(master=server.target if server else '',
-                                               is_chief=is_chief,
-                                               hooks=hooks,
-                                               checkpoint_dir=FLAGS.checkpoint_dir,
-                                               save_checkpoint_secs=FLAGS.checkpoint_secs,
-                                               config=session_config) as session:
-            try:
-                if is_chief:
-                    # Retrieving global_step from the (potentially restored) model
-                    feed_dict = {}
-                    model_feeder.set_data_set(feed_dict, None)
-                    current_sample_number = session.run(sample_counter, feed_dict=feed_dict)
-                    COORD.start_coordination(model_feeder, current_sample_number)
-
-                # Get the first job
-                job = COORD.get_job()
-                print ('Session should stop: %r' % session.should_stop())
-
-                while job and not session.should_stop():
-                    log_debug('Computing %s...' % job)
-
-                    # The feed_dict (mainly for switching between queues)
-                    feed_dict = {}
-
-                    # Sets the current data_set for the respective placeholder in feed_dict
-                    model_feeder.set_data_set(feed_dict, getattr(model_feeder, job.set_name))
-
-                    # Setting the training operation in case of training requested
-                    train_ops = [apply_gradient_op, sample_inc_op] if job.set_name == 'train' else []
-
-                    # Requirements to display a WER report
-                    if job.report:
-                        # Reset mean edit distance
-                        total_mean_edit_distance = 0.0
-                        # Create report results tuple
-                        report_results = ([],[],[],[])
-                        # Extend the session.run parameters
-                        report_params = [results_tuple, mean_edit_distance]
-                    else:
-                        report_params = []
-
-                    # So far the only extra parameter is the feed_dict
-                    extra_params = { 'feed_dict': feed_dict }
-
-                    # Loop over the batches
-                    for job_step in range(job.steps):
-                        if session.should_stop():
-                            break
-
-                        log_debug('Starting batch...')
-                        # Compute the batch
-                        _, current_sample_number, current_loss, current_report = session.run([train_ops, sample_number, loss, report_params], **extra_params)
-
-                        # Collect results
-                        job.sample_number += current_sample_number
-                        job.loss += current_loss * current_sample_number
-
-                        if job.report:
-                            # Collect individual sample results
-                            collect_results(report_results, current_report[0])
-                            # Add batch to total_mean_edit_distance
-                            total_mean_edit_distance += current_report[1] * current_sample_number
-
-                    # Gathering job results
-                    job.loss = job.loss / job.sample_number
-                    if job.report:
-                        job.mean_edit_distance = total_mean_edit_distance / job.sample_number
-                        job.wer, job.samples = calculate_report(report_results)
-
-                    # Send the current job to coordinator and receive the next one
-                    log_debug('Sending %s...' % job)
-                    job = COORD.next_job(job)
-            except Exception as e:
-                log_error(str(e))
-                traceback.print_exc()
-                # Calling all hook's end() methods to end blocking calls
-                for hook in hooks:
-                    hook.end(session)
-                # Only chief has a SyncReplicasOptimizer queue runner that needs to be stopped for unblocking process exit.
-                # A rather graceful way to do this is by stopping the ps.
-                # Only one party can send it w/o failing.
-                if is_chief:
-                    send_token_to_ps(session, kill=True)
-                sys.exit(1)
-
-        log_debug('Session closed.')
-
-    except tf.errors.InvalidArgumentError as e:
-        log_error(str(e))
-        log_error("Provide a --checkpoint_dir argument to work with models of different shapes.")
-        sys.exit(1)
-
 
 def export():
     r'''
@@ -1721,52 +739,271 @@ def export():
         except RuntimeError:
             log_error(sys.exc_info()[1])
 
+class ClusterEndPoint(MessageBusClient):
+    def __init__(self, cluster_spec, task):
+        MessageBusClient.__init__(self, cluster_spec, 'worker', task)
+        self._get_gpus_per_worker_lock = Lock()
+        self._index = 0
+        self._event = Event()
+        self.on_start_data_set = None
+        self.gpus_per_worker = []
+
+    def _start_data_set(self, data_set_index):
+        if self.on_start_data_set:
+            self.on_start_data_set(data_set_index)
+
+    def start_data_set(self, data_set_index, index_offset=0):
+        self._index = index_offset
+        for i in self.cluster_spec.task_indices('worker'):
+            self.call('worker', i, '_start_data_set', data_set_index)
+
+    def _allocate_indices(self, number):
+        with self._lock:
+            value = self._index
+            self._index = self._index + number
+            #print ('Allocated %d indices.' % number)
+            return value
+
+    def allocate_indices(self, number):
+        return self.call('worker', 0, '_allocate_indices', number)
+
+    def _get_gpus(self):
+        return memory_limits
+
+    def _get_gpus_per_worker(self):
+        with self._get_gpus_per_worker_lock:
+            if len(self.gpus_per_worker) == 0:
+                for i in self.cluster_spec.task_indices('worker'):
+                    self.gpus_per_worker.append(self.call('worker', i, '_get_gpus'))
+        return self.gpus_per_worker
+
+    def get_gpus_per_worker(self):
+        return self.call('worker', 0, '_get_gpus_per_worker')
+
+    def _quit(self):
+        log_debug('Quitting...')
+        self._event.set()
+
+    def quit(self):
+        for i in self.cluster_spec.task_indices('worker'):
+            log_debug('Calling worker %d to quit...' % i)
+            self.call_async('worker', i, '_quit', None)
+
+    def wait(self):
+        self._event.wait()
 
 def main(_) :
-
     initialize_globals()
+    is_chief = FLAGS.task_index == 0
+    server = tf.train.Server(cluster_spec, job_name='worker', task_index=FLAGS.task_index)
+    # preparing local instances of all required data sets
+    train_set = DataSet(FLAGS.train_files.split(','),
+                        limit=FLAGS.limit_train,
+                        skip=FLAGS.skip_train,
+                        ascending=FLAGS.train_ascending)
+    dev_set =   DataSet(FLAGS.dev_files.split(','),
+                        limit=FLAGS.limit_dev,
+                        skip=FLAGS.skip_dev,
+                        ascending=FLAGS.dev_ascending)
+    test_set =  DataSet(FLAGS.test_files.split(','),
+                        limit=FLAGS.limit_test,
+                        skip=FLAGS.skip_test,
+                        ascending=FLAGS.test_ascending)
+    data_sets = [train_set, dev_set, test_set]
 
-    if FLAGS.train or FLAGS.test:
-        if len(FLAGS.worker_hosts) == 0:
-            # Only one local task: this process (default case - no cluster)
-            train()
-            log_debug('Done.')
+    with tf.Session(server.target, config=session_config) as session:
+        # starting the cluster end point / connecting to message bus
+        cluster = ClusterEndPoint(cluster_spec, FLAGS.task_index)
+        # central thread coordinator
+        coord = tf.train.Coordinator()
+        # starting worker services's queue thrads
+        cluster.start_queue_threads(session, coord)
+        # query all GPU configurations across the cluster
+        gpus_per_worker = cluster.get_gpus_per_worker()
+        # finally the local model feeder can be initialized
+        model_feeder = ModelFeeder(gpus_per_worker,
+                                   FLAGS.task_index,
+                                   n_input,
+                                   n_context,
+                                   FLAGS.threads_per_set,
+                                   FLAGS.loader_buffer,
+                                   min(memory_limits),
+                                   FLAGS.queue_capacity,
+                                   allocate_indices=cluster.allocate_indices)
+        # react on data set (re-)starting (cluster wide event)
+        cluster.on_start_data_set = \
+            lambda data_set_index: model_feeder.start_data_set(data_sets[data_set_index])
+
+        # get all training relevant graph end-points
+        optimizer, results_tuple, gradients, sample_number, mean_edit_distance, loss = \
+            get_tower_results(model_feeder)
+        # add summaries of all variables and gradients to log
+        log_grads_and_vars(gradients)
+        # op to merge all summaries for the summary hook
+        merge_all_summaries_op = tf.summary.merge_all()
+        # apply gradients to modify the model
+        apply_gradient_op = optimizer.apply_gradients(gradients)
+        # increment global sample counter
+        sample_counter = model_variable('sample_counter', None, 0, trainable=False)
+        sample_inc_op = tf.assign_add(sample_counter, sample_number)
+        # op to initialize variables
+        init_op = tf.global_variables_initializer()
+
+        # starting feeding
+        model_feeder.start_queue_threads(session, coord)
+
+        # in-graph replication approach
+        # all graph evaluation initiated by chief worker only
+        if is_chief:
+            # Initialize all variables
+            session.run(init_op)
+            # retrieving number of applied samples from (potentially restored) model
+            n_samples_trained_on_model = session.run(sample_counter)
+            # number of samples per epoch - to be at least 1
+            n_samples_per_epoch = len(train_set.files)
+            assert n_samples_per_epoch > 0
+            # start epoch of our training
+            start_epoch = (n_samples_trained_on_model // n_samples_per_epoch) + 1
+            # number of samples trained already 'on top of' our start epoch
+            n_samples_already_trained = (n_samples_trained_on_model % n_samples_per_epoch)
+            # a negative epoch means to add its absolute number to the epochs already computed
+            target_epoch = (start_epoch + abs(FLAGS.epoch)) if FLAGS.epoch < 0 else FLAGS.epoch
+            # important debug info
+            log_debug('start epoch: %d' % start_epoch)
+            log_debug('target epoch: %d' % target_epoch)
+            log_debug('number of samples per epoch: %d' % n_samples_per_epoch)
+            log_debug('number of samples already trained in start epoch: %d' % n_samples_already_trained)
+
+            def apply_set(data_set_index, should_train, should_report, label, offset=0):
+                # start feeding requested data set on every worker
+                cluster.start_data_set(data_set_index, offset)
+                # adding training operation in case of training requested
+                train_ops = [apply_gradient_op, sample_inc_op] if should_train else []
+                # requirements for computing a WER report
+                if should_report:
+                    # initialize mean edit distance aggregator
+                    total_mean_edit_distance = 0.0
+                    # create report results tuple
+                    report_results = ([],[],[],[])
+                    # extend the session.run parameters
+                    report_params = [results_tuple, mean_edit_distance]
+                else:
+                    report_params = []
+                # initializing all aggregators
+                n_samples_applied = 0
+                total_loss = 0
+                total_mean_edit_distance = 0
+                # total number of samples to apply for current data set
+                n_samples_to_apply = len(data_sets[data_set_index].files)
+                # looping over batches till every sample got applied
+                while n_samples_applied < n_samples_to_apply:
+                    log_debug('Total sample number: %d, Target sample number: %d' % \
+                        (n_samples_applied, n_samples_to_apply))
+                    log_debug(model_feeder.get_state_report())
+                    # run one step
+                    _, n_samples_in_step, current_loss, current_report = \
+                        session.run([train_ops, sample_number, loss, report_params])
+                    log_debug('Finished step with %d samples.' % n_samples_in_step)
+                    # collect results
+                    n_samples_applied += n_samples_in_step
+                    # aggregate loss (weighted by number of samples)
+                    total_loss += current_loss * n_samples_in_step
+                    if should_report:
+                        samples, current_mean_edit_distance = current_report
+                        # collect individual sample results
+                        for i in range(len(model_feeder.tower_queues)):
+                            # collect the labels
+                            report_results[0].extend(sparse_tensor_value_to_texts(samples[0][i], alphabet))
+                            # collect the decodings - at the moment we default to the first one
+                            report_results[1].extend(sparse_tensor_value_to_texts(samples[1][i][0], alphabet))
+                            # collect the distances
+                            report_results[2].extend(samples[2][i])
+                            # collect the losses
+                            report_results[3].extend(samples[3][i])
+                        # aggregate mean edit distance (weighted by number of samples)
+                        total_mean_edit_distance += current_mean_edit_distance * n_samples_in_step
+
+                # gathering results (dividing weighted aggregates by total number of samples)
+                total_loss = total_loss / n_samples_applied
+                if should_report:
+                    total_mean_edit_distance = total_mean_edit_distance / n_samples_applied
+                    samples = []
+                    mean_wer = 0.0
+                    report_results = list(zip(*report_results))
+                    for s_label, s_decoding, s_distance, s_loss in report_results:
+                        if len(s_label) == 1 and s_label[0] == ' ':
+                            # skip dummy sample
+                            continue
+                        print('%s ----> %s' % (s_label, s_decoding))
+                        s_decoding = correction(s_decoding)
+                        s_wer = wer(s_label, s_decoding)
+                        mean_wer += s_wer
+                        if s_wer > 0:
+                            samples.append((s_label, s_decoding, s_loss, s_distance, s_wer))
+                    # get the mean WER from the accumulated one
+                    mean_wer = mean_wer / len(report_results)
+                    # order the remaining items by their loss (lowest loss on top)
+                    samples.sort(key=lambda s: s[2])
+                    # take only the first report_count items
+                    samples = samples[:FLAGS.report_count]
+                    # order this top FLAGS.report_count items by their WER (lowest WER on top)
+                    samples.sort(key=lambda s: s[4])
+                    # printing
+                    splitter = '  ' + '-' * 20
+                    log_info('%s result - average WER: %.2f, average loss: %.2f, average edit distance: %.2f' % \
+                             (label, mean_wer, total_loss, s_distance))
+                    log_info(splitter)
+                    for s_label, s_decoding, s_loss, s_distance, s_wer in samples:
+                        log_info('- WER: %.2f, loss: %.2f, edit distance: %.2f' % (s_wer, s_loss, s_distance))
+                        log_info('  expected: %s' % s_label)
+                        log_info('  decoded:  %s' % s_decoding)
+                        log_info(splitter)
+                else:
+                    log_info('%s result - loss: %.2f' % (label, total_loss))
+                return total_loss
+
+            if FLAGS.train and target_epoch > start_epoch:
+                log_info('STARTING Optimization')
+                for epoch in range(start_epoch, target_epoch):
+                    log_info('=' * 100)
+                    # training
+                    log_info('Training epoch %d...' % epoch)
+                    should_report = FLAGS.display_step > 0 and (epoch % FLAGS.display_step) == 0
+                    apply_set(0, True, should_report, 'Training', offset=n_samples_already_trained)
+                    n_samples_already_trained = 0
+                    # validation
+                    if FLAGS.validation_step > 0 and epoch % FLAGS.validation_step == 0:
+                        log_info('Validating epoch %d...' % epoch)
+                        apply_set(1, False, should_report, 'Validation')
+                    log_info('Finished epoch %d.' % epoch)
+                log_info('=' * 100)
+                log_info('FINISHED Optimization')
+
+            if FLAGS.test:
+                # test
+                log_info('Testing epoch %d...' % target_epoch)
+                apply_set(2, False, True, 'Test')
+                log_info('Finished testing epoch %d.' % target_epoch)
+
+            log_debug('Quitting cluster...')
+            cluster.quit()
         else:
-            # Create and start a server for the local task.
-            server = tf.train.Server(cluster, job_name=FLAGS.job_name, task_index=FLAGS.task_index)
-            if FLAGS.job_name == 'ps':
-                # We are a parameter server and therefore we just wait for all workers to finish
-                # by waiting for their stop tokens.
-                with tf.Session(server.target) as session:
-                    for worker in FLAGS.worker_hosts:
-                        log_debug('Waiting for stop token...')
-                        token = session.run(done_dequeues[FLAGS.task_index])
-                        if token < 0:
-                            log_debug('Got a kill switch token from worker %i.' % abs(token + 1))
-                            break
-                        log_debug('Got a stop token from worker %i.' % token)
-                log_debug('Session closed.')
-            elif FLAGS.job_name == 'worker':
-                # We are a worker and therefore we have to do some work.
-                # Assigns ops to the local worker by default.
-                with tf.device(tf.train.replica_device_setter(
-                               worker_device=worker_device,
-                               cluster=cluster)):
+            cluster.wait()
 
-                    # Do the training
-                    train(server)
+        log_debug('Request threads to stop...')
+        coord.request_stop()
+        log_debug('Closing feeder queues...')
+        model_feeder.close_queues(session)
+        log_debug('Closing cluster end point queues...')
+        cluster.close_queues(session)
+        log_debug('Waiting for coordinated threads to stop...')
+        coord.join()
+    log_debug('Session closed.')
 
-            log_debug('Server stopped.')
-
-    # Are we the main process?
     if is_chief:
-        # Doing solo/post-processing work just on the main process...
-        # Exporting the model
+        # exporting the model
         if FLAGS.export_dir:
             export()
-
-    # Stopping the coordinator
-    COORD.stop()
 
 if __name__ == '__main__' :
     tf.app.run()
