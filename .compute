@@ -45,7 +45,7 @@ worker_hosts=${worker_hosts:1}
 
 # shared cluster configuration
 # assert: for this job it should be exactly the same on all allocated nodes
-cluster="--coord_host $first --worker_hosts=$worker_hosts"
+cluster="--coord_host $first --nodes=$worker_hosts"
 
 # helpful for debugging potential networking issues
 echo "Starting allocated node no. $COMPUTE_NODE_INDEX on $hostname of cluster (workers: $worker_hosts) ..."

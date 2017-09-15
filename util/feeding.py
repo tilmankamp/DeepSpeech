@@ -37,18 +37,20 @@ class ModelFeeder(object):
     Creates, owns and delegates to num_tower_feeders internal tower feeder objects.
     '''
     def __init__(self,
+                 gpus_per_worker,
+                 worker_index,
                  num_cep,
                  num_context,
-                 num_tower_feeders,
                  num_sample_loaders_per_set,
                  num_samples_loader_buffer,
                  min_tower_memory,
                  queue_capacity,
                  allocate_indices=lambda n: 0):
 
+        self.gpus_per_worker = gpus_per_worker
+        self.worker_index = worker_index
         self.num_cep = num_cep
         self.num_context = num_context
-        self.num_tower_feeders = num_tower_feeders
         self.num_sample_loaders_per_set = num_sample_loaders_per_set
         self.num_samples_loader_buffer = num_samples_loader_buffer
         self.min_tower_memory = min_tower_memory
@@ -61,6 +63,9 @@ class ModelFeeder(object):
         self.ph_y = tf.placeholder(tf.int32, [None,])
         self.ph_y_length = tf.placeholder(tf.int32, [])
 
+        self.width = num_cep + (2 * num_cep * num_context)
+        self.dummy_sample = self._create_sample([self.width * [0]], 1, [0], 1)
+
         # protects the feeder state
         self._lock = Lock()
 
@@ -69,7 +74,7 @@ class ModelFeeder(object):
 
         # queue of batches that are ready to be enqueued on towers
         # a batch is a tuple of the batch size and a list of sample tuples
-        self.queue = Queue.Queue(maxsize=2 * self.num_tower_feeders)
+        self.queue = Queue.Queue(maxsize=2 * len(self.gpus_per_worker[self.worker_index]))
 
         # take care data set member exists
         self._data_set = None
@@ -112,8 +117,29 @@ class ModelFeeder(object):
         #     and decrease t1 and t2 if there are still OOMs
         # 9 - If everything works, don't forget to comment the prints again
 
+        self.tower_queues_per_worker = []
+        self.tower_queues = []
+        for w in range(len(gpus_per_worker)):
+            tower_queues = []
+            for g in range(len(gpus_per_worker[w])):
+                queue = self._create_queue(w, g)
+                self.tower_queues.append((w, g, queue))
+                tower_queues.append(queue)
+            self.tower_queues_per_worker.append(tower_queues)
+
         # tower feeders - each one typically feeds into a GPU
-        self._tower_feeders = [_TowerFeeder(self, i) for i in range(self.num_tower_feeders)]
+        self._tower_feeders = [_TowerFeeder(self, i, queue) for i, queue in \
+                               enumerate(self.tower_queues_per_worker[self.worker_index])]
+
+    def next_batch(self, worker_index, tower_index):
+        queue = self.tower_queues_per_worker[worker_index][tower_index][0]
+        _, batch_size, _, _ = queue.dequeue(name='Batch_Size_Dequeue')
+        #batch_size = tf.Print(batch_size, [batch_size], 'Dequeueing batch size (tower %d): ' % self.tower_index)
+        # to dequeue the dummy sample, dequeue_size has to be 1 in case of batch_size=0
+        dequeue_size = tf.maximum(batch_size, 1)
+        source, source_lengths, target, target_lengths = queue.dequeue_many(dequeue_size, name='Samples_Dequeue')
+        sparse_labels = ctc_label_dense_to_sparse(target, target_lengths, batch_size)
+        return batch_size, source, source_lengths, sparse_labels
 
     def start_queue_threads(self, session, coord):
         '''
@@ -169,18 +195,29 @@ class ModelFeeder(object):
             # first index of last retrieved index allocation (<0: wait, >=file_count: enqueue dummy batches)
             self._index = -1
 
-    def next_batch(self, tower_feeder_index):
-        '''
-        Draw the next batch from one of the tower feeders.
-        '''
-        return self._tower_feeders[tower_feeder_index].next_batch()
+    def _create_sample(self, x, x_len, y, y_len):
+        return { self.ph_x: x, self.ph_x_length: x_len, self.ph_y: y, self.ph_y_length: y_len }
+
+    def _create_queue(self, worker_index, tower_index):
+        name = 'PFQ-%d-%s' % (worker_index, tower_index)
+        queue = tf.PaddingFIFOQueue(shapes=[[None, self.width], [], [None,], []],
+                                    dtypes=[tf.float32, tf.int32, tf.int32, tf.int32],
+                                    capacity=self.queue_capacity,
+                                    name=name,
+                                    shared_name=name)
+        enqueue = queue.enqueue([self.ph_x, self.ph_x_length, self.ph_y, self.ph_y_length])
+        close = queue.close(cancel_pending_enqueues=True)
+        return (queue, enqueue, close)
 
     def _main_loop(self, coord):
         # if we are the dummy queue, we'll just enqueue dummy batches
         while not coord.should_stop():
             if not self._data_set:
                 if self._index != -2:
-                    self.queue.put(self._dummy)
+                    try:
+                        self.queue.put(self._dummy, True, 1)
+                    except Queue.Full:
+                        pass
                 continue
             file_count = len(self._data_set.files)
             # sample batch that will be queued
@@ -236,12 +273,20 @@ class ModelFeeder(object):
                         self._loaded = []
             if batch:
                 # enqueuing the batch
+                while not coord.should_stop():
+                    try:
+                        self.queue.put((len(batch), batch), True, 1)
+                        break
+                    except Queue.Full:
+                        pass
                 self._enqueued += len(batch)
-                self.queue.put((len(batch), batch))
             else:
                 if self._index >= file_count:
                     # sending trailing dummy batches to prevent remaining empty towers from blocking current job
-                    self.queue.put(self._dummy)
+                    try:
+                        self.queue.put(self._dummy, True, 1)
+                    except Queue.Full:
+                        pass
                 else:
                     # the epoch hasn't started yet (index < 0) or
                     # not enough samples got loaded yet (but len(self._to_load) + len(self._loading) > 0)
@@ -275,9 +320,9 @@ class ModelFeeder(object):
             with self._lock:
                 # handing loaded sample over to the main thread,
                 # if there was no reset in the meantime
-                #if index in self._loading:
-                self._loading.remove(index)
-                self._loaded.append((source, source_len, target, target_len))
+                if index in self._loading:
+                    self._loading.remove(index)
+                    self._loaded.append((source, source_len, target, target_len))
 
 class _TowerFeeder(object):
     '''
@@ -287,19 +332,10 @@ class _TowerFeeder(object):
     Keeps a DataSet reference to access its samples.
     If no data_set is provided (None), the loader will just enqueue dummy samples.
     '''
-    def __init__(self, model_feeder, tower_index):
+    def __init__(self, model_feeder, tower_index, queue):
         self.model_feeder = model_feeder
         self.tower_index = tower_index
-
-        self._width = model_feeder.num_cep + (2 * model_feeder.num_cep * model_feeder.num_context)
-        self._dummy_sample = self._create_sample([self._width * [0]], 1, [0], 1)
-
-        self._sample_queue = tf.PaddingFIFOQueue(shapes=[[None, self._width], [], [None,], []],
-                                                 dtypes=[tf.float32, tf.int32, tf.int32, tf.int32],
-                                                 capacity=model_feeder.queue_capacity)
-        self._sample_queue_size = self._sample_queue.size()
-        self._sample_enqueue_op = self._sample_queue.enqueue([model_feeder.ph_x, model_feeder.ph_x_length, model_feeder.ph_y, model_feeder.ph_y_length])
-        self._sample_close_op = self._sample_queue.close(cancel_pending_enqueues=True)
+        _, self._enqueue, self._close = queue
 
     def start_queue_thread(self, session, coord):
         '''
@@ -316,46 +352,29 @@ class _TowerFeeder(object):
         '''
         Closes the data set loader queues.
         '''
-        session.run(self._sample_close_op)
-
-    def next_batch(self):
-        '''
-        Draw the next batch from the combined switchable queue.
-        '''
-        _, batch_size, _, _ = self._sample_queue.dequeue(name='Batch_Size_Dequeue')
-        #batch_size = tf.Print(batch_size, [batch_size], 'Dequeueing batch size (tower %d): ' % self.tower_index)
-        # to dequeue the dummy sample, dequeue_size has to be 1 in case of batch_size=0
-        dequeue_size = tf.maximum(batch_size, 1)
-
-        source, source_lengths, target, target_lengths = self._sample_queue.dequeue_many(dequeue_size, name='Samples_Dequeue')
-        sparse_labels = ctc_label_dense_to_sparse(target, target_lengths, batch_size)
-        return batch_size, source, source_lengths, sparse_labels
-
-    def _create_sample(self, x, x_len, y, y_len):
-        return { self.model_feeder.ph_x: x,
-                 self.model_feeder.ph_x_length: x_len,
-                 self.model_feeder.ph_y: y,
-                 self.model_feeder.ph_y_length: y_len }
+        session.run(self._close)
 
     def _populate_sample_queue(self, session, coord):
         '''
         Queue thread routine.
         '''
         while not coord.should_stop():
-            batch_size, samples = self.model_feeder.queue.get()
-            #if batch_size == 0 and session.run(self._sample_queue_size) > 0:
-            #    continue
+            while not coord.should_stop():
+                try:
+                    batch_size, samples = self.model_feeder.queue.get(True, 1)
+                    break
+                except Queue.Empty:
+                    pass
             try:
                 if not coord.should_stop():
-                    feed_dict = self._create_sample([self._width * [0]], batch_size, [0], 0)
-                    session.run(self._sample_enqueue_op, feed_dict=feed_dict)
+                    feed_dict = self.model_feeder._create_sample([self.model_feeder.width * [0]], batch_size, [0], 0)
+                    session.run(self._enqueue, feed_dict=feed_dict)
                 for sample in samples:
                     if not coord.should_stop():
-                        feed_dict = self._create_sample(*sample) if batch_size > 0 else self._dummy_sample
-                        session.run(self._sample_enqueue_op, feed_dict=feed_dict)
+                        feed_dict = self.model_feeder._create_sample(*sample) if batch_size > 0 else \
+                                    self.model_feeder.dummy_sample
+                        session.run(self._enqueue, feed_dict=feed_dict)
                 if batch_size == 0:
                     time.sleep(1)
-            except Exception as ex:
-                print(ex)
-                print('CANCELLED!!!!!!!!!!')
+            except (tf.errors.CancelledError, tf.errors.OutOfRangeError):
                 return
