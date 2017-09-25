@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 from __future__ import absolute_import, division, print_function
-
+import __builtin__
 import os
 import sys
 from util.gpu import get_available_gpus
@@ -19,6 +19,7 @@ import pickle
 import shutil
 import subprocess
 import tensorflow as tf
+import numpy as np
 import time
 import traceback
 import inspect
@@ -28,15 +29,15 @@ from six.moves import zip, range, filter, urllib, BaseHTTPServer
 from tensorflow.contrib.session_bundle import exporter
 from tensorflow.python.tools import freeze_graph
 from threading import Thread, Lock, Event
+from urlparse import parse_qs
+from xdg import BaseDirectory as xdg
 from util.feeding import DataSet, ModelFeeder
+from util.persistence import CheckpointManager
 from util.shared_lib import check_cupti
 from util.spell import correction
 from util.text import sparse_tensor_value_to_texts, wer, Alphabet
 from util.message_bus import MessageBusClient
-from urlparse import parse_qs
-from xdg import BaseDirectory as xdg
-import numpy as np
-
+from util.log import Logger
 
 # Importer
 # ========
@@ -104,8 +105,10 @@ tf.app.flags.DEFINE_integer ('validation_step',  0,           'number of epochs 
 # Checkpointing
 
 tf.app.flags.DEFINE_string  ('checkpoint_dir',   '',          'directory in which checkpoints are stored - defaults to directory "deepspeech/checkpoints" within user\'s data home specified by the XDG Base Directory Specification')
-tf.app.flags.DEFINE_integer ('checkpoint_secs',  600,         'checkpoint saving interval in seconds')
-tf.app.flags.DEFINE_integer ('max_to_keep',      5,           'number of checkpoint files to keep - default value is 5')
+tf.app.flags.DEFINE_string  ('load',             'recent',    'either "recent" to load most recent checkpoint from checkpoint_dir, "best-dev" to load lowest loss epoch checkpoint, "last-epoch" to load the last epoch checkpoint or a checkpoint filename to load - defaults to "recent"')
+tf.app.flags.DEFINE_integer ('inter_secs',       600,         'time interval for saving intermediate checkpoints in seconds (0 for turning off intermediate checkpoints) - defaults to 600')
+tf.app.flags.DEFINE_integer ('keep_n_epochs',    5,           'number of epoch checkpoint files to keep - default value is 5')
+tf.app.flags.DEFINE_integer ('keep_n_inters',    3,           'number of intermediate checkpoint files to keep - default value is 3')
 
 # Exporting
 
@@ -141,7 +144,7 @@ tf.app.flags.DEFINE_boolean ('early_stop',       True,        'enable early stop
 
 # This parameter is irrespective of the time taken by single epoch to complete and checkpoint saving intervals.
 # It is possible that early stopping is triggered far after the best checkpoint is already replaced by checkpoint saving interval mechanism.
-# One has to align the parameters (earlystop_nsteps, checkpoint_secs) accordingly as per the time taken by an epoch on different datasets.
+# One has to align the parameters (earlystop_nsteps, inter_secs) accordingly as per the time taken by an epoch on different datasets.
 
 tf.app.flags.DEFINE_integer ('es_steps',         4,           'number of steps to consider for early stopping. Loss is not stored in the checkpoint so when checkpoint is revived it starts the loss calculation from start at that point')
 tf.app.flags.DEFINE_float   ('es_mean_th',       0.5,         'mean threshold for loss to determine the condition if early stopping is required')
@@ -161,10 +164,10 @@ tf.app.flags.DEFINE_float   ('valid_word_count_weight', 1.10,        'Valid word
 for var in ['b1', 'h1', 'b2', 'h2', 'b3', 'h3', 'b5', 'h5', 'b6', 'h6']:
     tf.app.flags.DEFINE_float('%s_stddev' % var, None, 'standard deviation to use when initialising %s' % var)
 
-FLAGS = tf.app.flags.FLAGS
+__builtin__.FLAGS = tf.app.flags.FLAGS
+log = Logger()
 
 def initialize_globals():
-
     # ps and worker hosts required for p2p cluster setup
     FLAGS.nodes = list(filter(len, FLAGS.nodes.split(',')))
     if len(FLAGS.nodes) == 0:
@@ -187,12 +190,12 @@ def initialize_globals():
     cpu_count = multiprocessing.cpu_count()
     if FLAGS.threads_per_set <= 0:
         FLAGS.threads_per_set = max(2, cpu_count)
-    log_debug('Number of loader threads per data set (%d CPUs): %d' % (cpu_count, FLAGS.threads_per_set))
+    log.debug('Number of loader threads per data set (%d CPUs): %d' % (cpu_count, FLAGS.threads_per_set))
 
     # By default the loader buffer is the 10 million-th part of the biggest GPU's memory in bytes
     if FLAGS.loader_buffer <= 0:
         FLAGS.loader_buffer = max(100, max(memory_limits) // 10000000) if len(memory_limits) > 0 else 100
-    log_debug('Number of samples in loader buffer (%d bytes GPU memory): %d' % (max(memory_limits), FLAGS.loader_buffer))
+    log.debug('Number of samples in loader buffer (%d bytes GPU memory): %d' % (max(memory_limits), FLAGS.loader_buffer))
 
     # Set default dropout rates
     if FLAGS.dropout_rate2 < 0:
@@ -280,33 +283,6 @@ def initialize_globals():
         if val is None:
             setattr(FLAGS, '%s_stddev' % var, FLAGS.default_stddev)
 
-
-# Logging functions
-# =================
-
-def prefix_print(prefix, message):
-    print(prefix + ('\n' + prefix).join(message.split('\n')))
-
-def log_debug(message):
-    if FLAGS.log_level == 0:
-        prefix_print('D ', message)
-
-def log_traffic(message):
-    if FLAGS.log_traffic:
-        log_debug(message)
-
-def log_info(message):
-    if FLAGS.log_level <= 1:
-        prefix_print('I ', message)
-
-def log_warn(message):
-    if FLAGS.log_level <= 2:
-        prefix_print('W ', message)
-
-def log_error(message):
-    if FLAGS.log_level <= 3:
-        prefix_print('E ', message)
-
 # Graph Creation
 # ==============
 
@@ -317,7 +293,7 @@ def model_variable(name, shape, initializer, trainable=True):
     with tf.device('/job:worker/task:0/cpu'):
         return tf.get_variable(name=name, shape=shape, initializer=initializer, trainable=trainable)
 
-def BiRNN(batch_x, seq_length):
+def BiRNN(batch_x, seq_length, dropout):
     r'''
     That done, we will define the learned variables, the weights and biases,
     within the method ``BiRNN()`` which also constructs the neural network.
@@ -350,19 +326,19 @@ def BiRNN(batch_x, seq_length):
     b1 = model_variable('b1', [n_hidden_1], tf.random_normal_initializer(stddev=FLAGS.b1_stddev))
     h1 = model_variable('h1', [n_input + 2*n_input*n_context, n_hidden_1], tf.contrib.layers.xavier_initializer(uniform=False))
     layer_1 = tf.minimum(tf.nn.relu(tf.add(tf.matmul(batch_x, h1), b1)), FLAGS.relu_clip)
-    layer_1 = tf.nn.dropout(layer_1, (1.0 - dropout_rates[0]))
+    layer_1 = tf.nn.dropout(layer_1, (1.0 - dropout[0]))
 
     # 2nd layer
     b2 = model_variable('b2', [n_hidden_2], tf.random_normal_initializer(stddev=FLAGS.b2_stddev))
     h2 = model_variable('h2', [n_hidden_1, n_hidden_2], tf.random_normal_initializer(stddev=FLAGS.h2_stddev))
     layer_2 = tf.minimum(tf.nn.relu(tf.add(tf.matmul(layer_1, h2), b2)), FLAGS.relu_clip)
-    layer_2 = tf.nn.dropout(layer_2, (1.0 - dropout_rates[1]))
+    layer_2 = tf.nn.dropout(layer_2, (1.0 - dropout[1]))
 
     # 3rd layer
     b3 = model_variable('b3', [n_hidden_3], tf.random_normal_initializer(stddev=FLAGS.b3_stddev))
     h3 = model_variable('h3', [n_hidden_2, n_hidden_3], tf.random_normal_initializer(stddev=FLAGS.h3_stddev))
     layer_3 = tf.minimum(tf.nn.relu(tf.add(tf.matmul(layer_2, h3), b3)), FLAGS.relu_clip)
-    layer_3 = tf.nn.dropout(layer_3, (1.0 - dropout_rates[2]))
+    layer_3 = tf.nn.dropout(layer_3, (1.0 - dropout[2]))
 
     # Now we create the forward and backward LSTM units.
     # Both of which have inputs of length `n_cell_dim` and bias `1.0` for the forget gate of the LSTM.
@@ -372,16 +348,16 @@ def BiRNN(batch_x, seq_length):
                    if 'reuse' not in inspect.getargspec(tf.contrib.rnn.BasicLSTMCell.__init__).args else \
                    tf.contrib.rnn.BasicLSTMCell(n_cell_dim, forget_bias=1.0, state_is_tuple=True, reuse=tf.get_variable_scope().reuse)
     lstm_fw_cell = tf.contrib.rnn.DropoutWrapper(lstm_fw_cell,
-                                                input_keep_prob=1.0 - dropout_rates[3],
-                                                output_keep_prob=1.0 - dropout_rates[3],
+                                                input_keep_prob=1.0 - dropout[3],
+                                                output_keep_prob=1.0 - dropout[3],
                                                 seed=FLAGS.random_seed)
     # Backward direction cell: (if else required for TF 1.0 and 1.1 compat)
     lstm_bw_cell = tf.contrib.rnn.BasicLSTMCell(n_cell_dim, forget_bias=1.0, state_is_tuple=True) \
                    if 'reuse' not in inspect.getargspec(tf.contrib.rnn.BasicLSTMCell.__init__).args else \
                    tf.contrib.rnn.BasicLSTMCell(n_cell_dim, forget_bias=1.0, state_is_tuple=True, reuse=tf.get_variable_scope().reuse)
     lstm_bw_cell = tf.contrib.rnn.DropoutWrapper(lstm_bw_cell,
-                                                input_keep_prob=1.0 - dropout_rates[4],
-                                                output_keep_prob=1.0 - dropout_rates[4],
+                                                input_keep_prob=1.0 - dropout[4],
+                                                output_keep_prob=1.0 - dropout[4],
                                                 seed=FLAGS.random_seed)
 
     # `layer_3` is now reshaped into `[n_steps, batch_size, 2*n_cell_dim]`,
@@ -405,7 +381,7 @@ def BiRNN(batch_x, seq_length):
     b5 = model_variable('b5', [n_hidden_5], tf.random_normal_initializer(stddev=FLAGS.b5_stddev))
     h5 = model_variable('h5', [(2 * n_cell_dim), n_hidden_5], tf.random_normal_initializer(stddev=FLAGS.h5_stddev))
     layer_5 = tf.minimum(tf.nn.relu(tf.add(tf.matmul(outputs, h5), b5)), FLAGS.relu_clip)
-    layer_5 = tf.nn.dropout(layer_5, (1.0 - dropout_rates[5]))
+    layer_5 = tf.nn.dropout(layer_5, (1.0 - dropout[5]))
 
     # Now we apply the weight matrix `h6` and bias `b6` to the output of `layer_5`
     # creating `n_classes` dimensional vectors, the logits.
@@ -464,7 +440,7 @@ def calculate_mean_edit_distance_and_loss(model_feeder, worker_index, tower_inde
     batch_size, batch_x, batch_seq_len, batch_y = model_feeder.next_batch(worker_index, tower_index)
 
     # Calculate the logits of the batch using BiRNN
-    logits = BiRNN(batch_x, tf.to_int64(batch_seq_len))
+    logits = BiRNN(batch_x, tf.to_int64(batch_seq_len), dropout_rates)
     # Compute the CTC loss using either TensorFlow's `ctc_loss` or Baidu's `warp_ctc_loss`.
     if FLAGS.use_warpctc:
         total_loss = tf.contrib.warpctc.warp_ctc_loss(labels=batch_y, inputs=logits, sequence_length=batch_seq_len)
@@ -610,8 +586,8 @@ def get_tower_results(model_feeder):
                decoded, \
                labels
 
+    # compute gradients - also get weighted loss and weighted edit-distance
     results = for_each_tower(model_feeder, weight_and_compute_gradients, results)
-    # compute gradients and weight loss and edit-distance
     _, _, _, _, total_losses, avg_losses, distances, mean_edit_distances, decodings, labels = zip(*results)
 
     worker_averages = []
@@ -665,7 +641,7 @@ def export():
     r'''
     Restores the trained variables into a simpler graph that will be exported for serving.
     '''
-    log_info('Exporting the model...')
+    log.info('Exporting the model...')
     with tf.device('/cpu:0'):
 
         tf.reset_default_graph()
@@ -698,7 +674,7 @@ def export():
         checkpoint = tf.train.get_checkpoint_state(FLAGS.checkpoint_dir)
         checkpoint_path = checkpoint.model_checkpoint_path
         saver.restore(session, checkpoint_path)
-        log_info('Restored checkpoint at training epoch %d' % (int(checkpoint_path.split('-')[-1]) + 1))
+        log.info('Restored checkpoint at training epoch %d' % (int(checkpoint_path.split('-')[-1]) + 1))
 
         # Initialise the model exporter and export the model
         model_exporter.init(session.graph.as_graph_def(),
@@ -711,7 +687,7 @@ def export():
         if FLAGS.remove_export:
             actual_export_dir = os.path.join(FLAGS.export_dir, '%08d' % FLAGS.export_version)
             if os.path.isdir(actual_export_dir):
-                log_info('Removing old export')
+                log.info('Removing old export')
                 shutil.rmtree(actual_FLAGS.export_dir)
         try:
             # Export serving model
@@ -735,13 +711,14 @@ def export():
                                       restore_op_name, filename_tensor_name,
                                       output_graph_path, clear_devices, '')
 
-            log_info('Models exported at %s' % (FLAGS.export_dir))
+            log.info('Models exported at %s' % (FLAGS.export_dir))
         except RuntimeError:
-            log_error(sys.exc_info()[1])
+            log.error(sys.exc_info()[1])
 
 class ClusterEndPoint(MessageBusClient):
     def __init__(self, cluster_spec, task):
         MessageBusClient.__init__(self, cluster_spec, 'worker', task)
+        self._index_lock = Lock()
         self._get_gpus_per_worker_lock = Lock()
         self._index = 0
         self._event = Event()
@@ -758,10 +735,9 @@ class ClusterEndPoint(MessageBusClient):
             self.call('worker', i, '_start_data_set', data_set_index)
 
     def _allocate_indices(self, number):
-        with self._lock:
+        with self._index_lock:
             value = self._index
             self._index = self._index + number
-            #print ('Allocated %d indices.' % number)
             return value
 
     def allocate_indices(self, number):
@@ -781,20 +757,17 @@ class ClusterEndPoint(MessageBusClient):
         return self.call('worker', 0, '_get_gpus_per_worker')
 
     def _quit(self):
-        log_debug('Quitting...')
         self._event.set()
 
     def quit(self):
         for i in self.cluster_spec.task_indices('worker'):
-            log_debug('Calling worker %d to quit...' % i)
             self.call_async('worker', i, '_quit', None)
 
     def wait(self):
         self._event.wait()
 
-def main(_) :
-    initialize_globals()
-    is_chief = FLAGS.task_index == 0
+def train() :
+    # creating local server
     server = tf.train.Server(cluster_spec, job_name='worker', task_index=FLAGS.task_index)
     # preparing local instances of all required data sets
     train_set = DataSet(FLAGS.train_files.split(','),
@@ -833,7 +806,6 @@ def main(_) :
         # react on data set (re-)starting (cluster wide event)
         cluster.on_start_data_set = \
             lambda data_set_index: model_feeder.start_data_set(data_sets[data_set_index])
-
         # get all training relevant graph end-points
         optimizer, results_tuple, gradients, sample_number, mean_edit_distance, loss = \
             get_tower_results(model_feeder)
@@ -846,17 +818,24 @@ def main(_) :
         # increment global sample counter
         sample_counter = model_variable('sample_counter', None, 0, trainable=False)
         sample_inc_op = tf.assign_add(sample_counter, sample_number)
-        # op to initialize variables
-        init_op = tf.global_variables_initializer()
 
-        # starting feeding
+        # checkpoint manager to deal with all saving, restoring and result logging
+        checkpoint_manager = CheckpointManager(FLAGS.checkpoint_dir,
+                                               load=FLAGS.load,
+                                               inter_secs=FLAGS.inter_secs,
+                                               keep_n_inters=FLAGS.keep_n_inters,
+                                               keep_n_epochs=FLAGS.keep_n_epochs)
+
+        # start feeding - feeding runs on every node
+        # Note: happens to result in very strange errors, if done earlier
+        # (supposedly during graph construction)
         model_feeder.start_queue_threads(session, coord)
 
         # in-graph replication approach
         # all graph evaluation initiated by chief worker only
         if is_chief:
-            # Initialize all variables
-            session.run(init_op)
+            # let the checkpoint manager either load a model or initialize all variables
+            checkpoint_manager.start(session)
             # retrieving number of applied samples from (potentially restored) model
             n_samples_trained_on_model = session.run(sample_counter)
             # number of samples per epoch - to be at least 1
@@ -867,12 +846,12 @@ def main(_) :
             # number of samples trained already 'on top of' our start epoch
             n_samples_already_trained = (n_samples_trained_on_model % n_samples_per_epoch)
             # a negative epoch means to add its absolute number to the epochs already computed
-            target_epoch = (start_epoch + abs(FLAGS.epoch)) if FLAGS.epoch < 0 else FLAGS.epoch
+            target_epoch = (start_epoch - 1 + abs(FLAGS.epoch)) if FLAGS.epoch < 0 else FLAGS.epoch
             # important debug info
-            log_debug('start epoch: %d' % start_epoch)
-            log_debug('target epoch: %d' % target_epoch)
-            log_debug('number of samples per epoch: %d' % n_samples_per_epoch)
-            log_debug('number of samples already trained in start epoch: %d' % n_samples_already_trained)
+            log.debug('start epoch: %d' % start_epoch)
+            log.debug('target epoch: %d' % target_epoch)
+            log.debug('number of samples per epoch: %d' % n_samples_per_epoch)
+            log.debug('number of samples already trained in start epoch: %d' % n_samples_already_trained)
 
             def apply_set(data_set_index, should_train, should_report, label, offset=0):
                 # start feeding requested data set on every worker
@@ -897,15 +876,12 @@ def main(_) :
                 n_samples_to_apply = len(data_sets[data_set_index].files)
                 # looping over batches till every sample got applied
                 while n_samples_applied < n_samples_to_apply:
-                    log_debug('Total sample number: %d, Target sample number: %d' % \
-                        (n_samples_applied, n_samples_to_apply))
-                    log_debug(model_feeder.get_state_report())
                     # run one step
                     _, n_samples_in_step, current_loss, current_report = \
                         session.run([train_ops, sample_number, loss, report_params])
-                    log_debug('Finished step with %d samples.' % n_samples_in_step)
                     # collect results
                     n_samples_applied += n_samples_in_step
+                    log.debug('Applied %d samples (%d of %d).' % (n_samples_in_step, n_samples_applied, n_samples_to_apply))
                     # aggregate loss (weighted by number of samples)
                     total_loss += current_loss * n_samples_in_step
                     if should_report:
@@ -922,19 +898,16 @@ def main(_) :
                             report_results[3].extend(samples[3][i])
                         # aggregate mean edit distance (weighted by number of samples)
                         total_mean_edit_distance += current_mean_edit_distance * n_samples_in_step
-
                 # gathering results (dividing weighted aggregates by total number of samples)
                 total_loss = total_loss / n_samples_applied
                 if should_report:
                     total_mean_edit_distance = total_mean_edit_distance / n_samples_applied
                     samples = []
                     mean_wer = 0.0
-                    report_results = list(zip(*report_results))
+                    # re-arrange list and exclude dummy samples
+                    report_results = [r for r in list(zip(*report_results)) if r[0] != ' ']
+                    # do spell-checking and compute WER - only keep samples with WER > 0
                     for s_label, s_decoding, s_distance, s_loss in report_results:
-                        if len(s_label) == 1 and s_label[0] == ' ':
-                            # skip dummy sample
-                            continue
-                        print('%s ----> %s' % (s_label, s_decoding))
                         s_decoding = correction(s_decoding)
                         s_wer = wer(s_label, s_decoding)
                         mean_wer += s_wer
@@ -942,68 +915,76 @@ def main(_) :
                             samples.append((s_label, s_decoding, s_loss, s_distance, s_wer))
                     # get the mean WER from the accumulated one
                     mean_wer = mean_wer / len(report_results)
-                    # order the remaining items by their loss (lowest loss on top)
+                    # order the remaining samples by their loss (lowest loss on top)
                     samples.sort(key=lambda s: s[2])
-                    # take only the first report_count items
+                    # take only the first report_count samples
                     samples = samples[:FLAGS.report_count]
-                    # order this top FLAGS.report_count items by their WER (lowest WER on top)
+                    # order the remaining samples by their WER (lowest WER on top)
                     samples.sort(key=lambda s: s[4])
-                    # printing
+                    # print the report
                     splitter = '  ' + '-' * 20
-                    log_info('%s result - average WER: %.2f, average loss: %.2f, average edit distance: %.2f' % \
+                    log.info('%s result - average WER: %.2f, average loss: %.2f, average edit distance: %.2f' % \
                              (label, mean_wer, total_loss, s_distance))
-                    log_info(splitter)
+                    log.info(splitter)
                     for s_label, s_decoding, s_loss, s_distance, s_wer in samples:
-                        log_info('- WER: %.2f, loss: %.2f, edit distance: %.2f' % (s_wer, s_loss, s_distance))
-                        log_info('  expected: %s' % s_label)
-                        log_info('  decoded:  %s' % s_decoding)
-                        log_info(splitter)
+                        log.info('- WER: %.2f, loss: %.2f, edit distance: %.2f' % (s_wer, s_loss, s_distance))
+                        log.info('  expected: %s' % s_label)
+                        log.info('  decoded:  %s' % s_decoding)
+                        log.info(splitter)
                 else:
-                    log_info('%s result - loss: %.2f' % (label, total_loss))
+                    log.info('%s result - loss: %.2f' % (label, total_loss))
+                # give checkpoint manager the opportunity to persist an intermediate checkpoint
+                checkpoint_manager.step(session)
                 return total_loss
 
-            if FLAGS.train and target_epoch > start_epoch:
-                log_info('STARTING Optimization')
-                for epoch in range(start_epoch, target_epoch):
-                    log_info('=' * 100)
+            if FLAGS.train and target_epoch >= start_epoch:
+                log.info('STARTING Optimization')
+                for epoch in range(start_epoch, target_epoch + 1):
+                    log.info('=' * 100)
                     # training
-                    log_info('Training epoch %d...' % epoch)
+                    log.info('Training epoch %d...' % epoch)
                     should_report = FLAGS.display_step > 0 and (epoch % FLAGS.display_step) == 0
-                    apply_set(0, True, should_report, 'Training', offset=n_samples_already_trained)
+                    train_loss = apply_set(0, True, should_report, 'Training', offset=n_samples_already_trained)
                     n_samples_already_trained = 0
                     # validation
+                    dev_loss = None
                     if FLAGS.validation_step > 0 and epoch % FLAGS.validation_step == 0:
-                        log_info('Validating epoch %d...' % epoch)
-                        apply_set(1, False, should_report, 'Validation')
-                    log_info('Finished epoch %d.' % epoch)
-                log_info('=' * 100)
-                log_info('FINISHED Optimization')
+                        log.info('Validating epoch %d...' % epoch)
+                        dev_loss = apply_set(1, False, should_report, 'Validation')
+                    # let the checkpoint manager log results and checkpoint the current model
+                    checkpoint_manager.epoch(session, epoch, train_loss, dev_loss=dev_loss)
+                    log.info('Finished epoch %d.' % epoch)
+                log.info('=' * 100)
+                log.info('FINISHED Optimization')
 
             if FLAGS.test:
                 # test
-                log_info('Testing epoch %d...' % target_epoch)
+                log.info('Testing epoch %d...' % target_epoch)
                 apply_set(2, False, True, 'Test')
-                log_info('Finished testing epoch %d.' % target_epoch)
+                log.info('Finished testing epoch %d.' % target_epoch)
 
-            log_debug('Quitting cluster...')
+            log.debug('Quitting cluster...')
             cluster.quit()
         else:
             cluster.wait()
-
-        log_debug('Request threads to stop...')
+        log.debug('Shutting down training session...')
+        # requesting threads to stop
         coord.request_stop()
-        log_debug('Closing feeder queues...')
+        # closing feeder queues
         model_feeder.close_queues(session)
-        log_debug('Closing cluster end point queues...')
+        # closing cluster end point queues
         cluster.close_queues(session)
-        log_debug('Waiting for coordinated threads to stop...')
+        # waiting for coordinated threads to stop
         coord.join()
-    log_debug('Session closed.')
+    log.debug('Training session closed.')
 
-    if is_chief:
-        # exporting the model
-        if FLAGS.export_dir:
-            export()
+def main(_) :
+    # initializing all global variables (mostly from FLAGS values)
+    initialize_globals()
+    if FLAGS.train:
+        train()
+    if FLAGS.export_dir and is_chief:
+        export()
 
 if __name__ == '__main__' :
     tf.app.run()

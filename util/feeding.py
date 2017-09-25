@@ -8,6 +8,9 @@ from math import ceil
 from six.moves import range
 from util.audio import audiofile_to_input_vector
 from util.text import ctc_label_dense_to_sparse, text_to_char_array
+from util.log import Logger
+
+log = Logger('Feeding')
 
 class DataSet(object):
     '''
@@ -149,6 +152,7 @@ class ModelFeeder(object):
             thread.start()
         for tower_feeder in self._tower_feeders:
             threads.append(tower_feeder.start_queue_thread(session, coord))
+        log.debug('Started queue threads')
         return threads
 
     def get_state_report(self):
@@ -161,6 +165,7 @@ class ModelFeeder(object):
         '''
         for tower_feeder in self._tower_feeders:
             tower_feeder.close_queues(session)
+        log.debug('Closed queues')
 
     def get_data_set(self):
         '''
@@ -189,6 +194,7 @@ class ModelFeeder(object):
                 self.queue.get_nowait()
             # first index of last retrieved index allocation (<0: wait, >=file_count: enqueue dummy batches)
             self._index = -1
+        log.debug('(Re-)Started data set')
 
     def _create_sample(self, x, x_len, y, y_len):
         return { self.ph_x: x, self.ph_x_length: x_len, self.ph_y: y, self.ph_y_length: y_len }
@@ -208,12 +214,16 @@ class ModelFeeder(object):
         # if we are the dummy queue, we'll just enqueue dummy batches
         while not coord.should_stop():
             if not self._data_set:
+                # only enqueue, if we're not in a draining process
                 if self._index != -2:
                     try:
+                        # trying for one second to enqueue the dummy
                         self.queue.put(self._dummy, True, 1)
                     except Queue.Full:
+                        # just ignore the timeout and loop on
                         pass
                 continue
+            # the overall number of samples to enqueue
             file_count = len(self._data_set.files)
             # sample batch that will be queued
             batch = None
@@ -267,25 +277,30 @@ class ModelFeeder(object):
                         batch = self._loaded
                         self._loaded = []
             if batch:
-                # enqueuing the batch
+                # enqueuing the batch in a non-blocking way to allow coordinator induced exiting
                 while not coord.should_stop():
                     try:
+                        # trying for one second to enqueue the batch
                         self.queue.put((len(batch), batch), True, 1)
+                        log.traffic('Enqueued batch with %d samples' % len(batch))
                         break
                     except Queue.Full:
+                        # we ran into timeout - repeat...
                         pass
+                # keeping track of enqueued samples
                 self._enqueued += len(batch)
             else:
                 if self._index >= file_count:
                     # sending trailing dummy batches to prevent remaining empty towers from blocking current job
                     try:
+                        # trying for one second to enqueue the batch
                         self.queue.put(self._dummy, True, 1)
                     except Queue.Full:
+                        # we ran into timeout - restart at the very top (forgetting this dummy sample)...
                         pass
                 else:
                     # the epoch hasn't started yet (index < 0) or
-                    # not enough samples got loaded yet (but len(self._to_load) + len(self._loading) > 0)
-                    # -> wait a sec and repeat
+                    # not enough samples got loaded yet -> wait a sec and repeat
                     time.sleep(1)
 
     def _load_sample(self, coord):
@@ -330,7 +345,8 @@ class _TowerFeeder(object):
     def __init__(self, model_feeder, tower_index, queue):
         self.model_feeder = model_feeder
         self.tower_index = tower_index
-        _, self._enqueue, self._close = queue
+        self._queue, self._enqueue, self._close = queue
+        self._size = self._queue.size()
 
     def start_queue_thread(self, session, coord):
         '''
@@ -353,23 +369,40 @@ class _TowerFeeder(object):
         '''
         Queue thread routine.
         '''
+        log.debug('Tower %d enqueueing started' % self.tower_index)
+        # all the following dequeue/enqueue operations are non-blocking
+        # to ensure graceful ending of the thread (querying coord.should_stop)
         while not coord.should_stop():
+            # polling loop - dequeueing/waiting for the next batch
             while not coord.should_stop():
                 try:
+                    # getting/waiting for the next batch
                     batch_size, samples = self.model_feeder.queue.get(True, 1)
+                    # we got a batch - exit polling loop
                     break
                 except Queue.Empty:
+                    # we ran into timeout getting the next batch - poll on
                     pass
             try:
-                if not coord.should_stop():
-                    feed_dict = self.model_feeder._create_sample([self.model_feeder.width * [0]], batch_size, [0], 0)
-                    session.run(self._enqueue, feed_dict=feed_dict)
-                for sample in samples:
-                    if not coord.should_stop():
-                        feed_dict = self.model_feeder._create_sample(*sample) if batch_size > 0 else \
-                                    self.model_feeder.dummy_sample
-                        session.run(self._enqueue, feed_dict=feed_dict)
-                if batch_size == 0:
+                # to prevent flooding, dummy samples are only enqueued onto an empty queue
+                while not coord.should_stop() and batch_size == 0 and session.run(self._size) > 0:
                     time.sleep(1)
+                # create header sample
+                feed_dict = self.model_feeder._create_sample([self.model_feeder.width * [0]], batch_size, [0], 0)
+                if not coord.should_stop():
+                    # enqueue it
+                    session.run(self._enqueue, feed_dict=feed_dict)
+                # enqueue all regular samples of the batch
+                for sample in samples:
+                    # prepare sample feed_dict
+                    feed_dict = self.model_feeder._create_sample(*sample) if batch_size > 0 else \
+                                self.model_feeder.dummy_sample
+                    if not coord.should_stop():
+                        # enqueue it
+                        session.run(self._enqueue, feed_dict=feed_dict)
             except (tf.errors.CancelledError, tf.errors.OutOfRangeError):
+                # this is expected under certain circumstances - just exiting
+                log.debug('Tower %d enqueueing ended by closed queue' % self.tower_index)
                 return
+        # regular end
+        log.debug('Tower %d enqueueing ended by coordinator' % self.tower_index)
