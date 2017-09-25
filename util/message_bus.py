@@ -2,6 +2,9 @@ import tensorflow as tf
 import pickle
 from threading import Thread, Lock, Event
 import Queue
+from util.log import Logger
+
+log = Logger('Message Bus')
 
 class MessageBusClient(object):
     def __init__(self, cluster_spec, job, task):
@@ -28,13 +31,14 @@ class MessageBusClient(object):
 
         self._waiting_for_response = {}
         self._response_id_counter = 0
-        self._lock = Lock()
+        self._response_id_lock = Lock()
         self._to_send = Queue.Queue()
 
     def _call(self, function, args):
         try:
             fun = getattr(self, function, *args)
         except AttributeError:
+            log.warn('Function not found: %s, arguments: %r' % (function, args))
             return
         return fun(*args)
 
@@ -48,7 +52,7 @@ class MessageBusClient(object):
 
     def _receive(self, session, caller, is_response, response_id, function, items):
         if is_response:
-            print('[%s] Response From: %s, Function: %s, Items: %r' % (self.id, caller, function, items))
+            log.traffic('Response from: %s, function: %s, return values: %r' % (caller, function, items))
             callback = self._waiting_for_response[response_id]
             if callable(callback):
                 callback(items)
@@ -57,6 +61,7 @@ class MessageBusClient(object):
                 self._waiting_for_response[response_id] = items
                 callback.set()
         else:
+            log.traffic('Call from: %s, function: %s, arguments: %r' % (caller, function, items))
             results = self._call(function, items)
             if response_id > 0:
                 content = pickle.dumps((self.id, True, response_id, function, results))
@@ -79,31 +84,37 @@ class MessageBusClient(object):
             thread.daemon = True
             thread.start()
             threads.append(thread)
+        log.debug('Started queue threads')
         return threads
 
     def close_queues(self, session):
         session.run(self._inbound_close)
         for close in self._outbound_closes:
             session.run(close)
+        log.debug('Closed queue threads')
 
     def call_async(self, job, task, function, callback, *args):
-        if job == self.job and task == self.task:
+        id = 'MBQ-%s-%d' % (job, task)
+        if self.id == id:
+            log.traffic('Local call of function: %s, arguments: %r' % (function, args))
             results = self._call(function, args)
             if callback:
                 callback(results)
             return -1
+        log.traffic('Calling worker: %s, function: %s, arguments: %r' % (id, function, args))
         response_id = 0
         if callback:
-            with self._lock:
+            with self._response_id_lock:
                 response_id = self._response_id_counter = self._response_id_counter + 1
                 self._waiting_for_response[response_id] = callback
         content = pickle.dumps((self.id, False, response_id, function, args))
-        enqueue = self._outbound_enqueues['MBQ-%s-%d' % (job, task)]
+        enqueue = self._outbound_enqueues[id]
         self._to_send.put((enqueue, { self._ph_content: content }))
         return response_id
 
     def call(self, job, task, function, *args):
         if job == self.job and task == self.task:
+            log.traffic('Local call of function: %s, arguments: %r' % (function, args))
             return self._call(function, args)
         event = Event()
         response_id = self.call_async(job, task, function, event, *args)
