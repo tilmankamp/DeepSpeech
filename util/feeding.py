@@ -375,7 +375,7 @@ class _TowerFeeder(object):
         Queue thread routine.
         '''
         log.debug('Tower %d enqueueing started' % self.tower_index)
-        # all the following dequeue/enqueue operations are non-blocking
+        # all of the following dequeue/enqueue operations are non-blocking
         # to ensure graceful ending of the thread (querying coord.should_stop)
         while not coord.should_stop():
             # polling loop - dequeueing/waiting for the next batch
