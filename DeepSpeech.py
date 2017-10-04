@@ -820,7 +820,7 @@ def train() :
         sample_inc_op = tf.assign_add(sample_counter, sample_number)
 
         # checkpoint manager to deal with all saving, restoring and result logging
-        checkpoint_manager = CheckpointManager(FLAGS.checkpoint_dir,
+        checkpoint_manager = CheckpointManager(checkpoint_dir=FLAGS.checkpoint_dir,
                                                load=FLAGS.load,
                                                inter_secs=FLAGS.inter_secs,
                                                keep_n_inters=FLAGS.keep_n_inters,
@@ -856,8 +856,10 @@ def train() :
             def apply_set(data_set_index, should_train, should_report, label, offset=0):
                 # start feeding requested data set on every worker
                 cluster.start_data_set(data_set_index, offset)
-                # adding training operation in case of training requested
-                train_ops = [apply_gradient_op, sample_inc_op] if should_train else []
+                # training operation in case of training requested
+                train_op = [apply_gradient_op] if should_train else []
+                # global sample counter incrementation and/or retrieval
+                overall_samples_op = sample_inc_op if should_train else sample_counter
                 # requirements for computing a WER report
                 if should_report:
                     # initialize mean edit distance aggregator
@@ -875,13 +877,14 @@ def train() :
                 # total number of samples to apply for current data set
                 n_samples_to_apply = len(data_sets[data_set_index].files)
                 # looping over batches till every sample got applied
-                while n_samples_applied < n_samples_to_apply:
+                while offset + n_samples_applied < n_samples_to_apply:
                     # run one step
-                    _, n_samples_in_step, current_loss, current_report = \
-                        session.run([train_ops, sample_number, loss, report_params])
+                    _, n_samples_trained_on_model, n_samples_in_step, current_loss, current_report = \
+                        session.run([train_op, overall_samples_op, sample_number, loss, report_params])
                     # collect results
                     n_samples_applied += n_samples_in_step
-                    log.debug('Applied %d samples (%d of %d).' % (n_samples_in_step, n_samples_applied, n_samples_to_apply))
+                    log.debug('Applied %d samples (%d of %d).' % \
+                        (n_samples_in_step, offset + n_samples_applied, n_samples_to_apply))
                     # aggregate loss (weighted by number of samples)
                     total_loss += current_loss * n_samples_in_step
                     if should_report:
@@ -898,6 +901,9 @@ def train() :
                             report_results[3].extend(samples[3][i])
                         # aggregate mean edit distance (weighted by number of samples)
                         total_mean_edit_distance += current_mean_edit_distance * n_samples_in_step
+                    if should_train:
+                        # give checkpoint manager a chance to write an intermediate checkpoint
+                        checkpoint_manager.step(session, n_samples_trained_on_model)
                 # gathering results (dividing weighted aggregates by total number of samples)
                 total_loss = total_loss / n_samples_applied
                 if should_report:
@@ -933,9 +939,7 @@ def train() :
                         log.info(splitter)
                 else:
                     log.info('%s result - loss: %.2f' % (label, total_loss))
-                # give checkpoint manager the opportunity to persist an intermediate checkpoint
-                checkpoint_manager.step(session)
-                return total_loss
+                return total_loss, n_samples_trained_on_model
 
             if FLAGS.train and target_epoch >= start_epoch:
                 log.info('STARTING Optimization')
@@ -944,15 +948,15 @@ def train() :
                     # training
                     log.info('Training epoch %d...' % epoch)
                     should_report = FLAGS.display_step > 0 and (epoch % FLAGS.display_step) == 0
-                    train_loss = apply_set(0, True, should_report, 'Training', offset=n_samples_already_trained)
+                    train_loss, n_samples_trained_on_model = apply_set(0, True, should_report, 'Training', offset=n_samples_already_trained)
                     n_samples_already_trained = 0
                     # validation
                     dev_loss = None
                     if FLAGS.validation_step > 0 and epoch % FLAGS.validation_step == 0:
                         log.info('Validating epoch %d...' % epoch)
-                        dev_loss = apply_set(1, False, should_report, 'Validation')
-                    # let the checkpoint manager log results and checkpoint the current model
-                    checkpoint_manager.epoch(session, epoch, train_loss, dev_loss=dev_loss)
+                        dev_loss, _ = apply_set(1, False, should_report, 'Validation')
+                    # let the checkpoint manager log results and do an epoch checkpoint of the current model
+                    checkpoint_manager.epoch(session, epoch, n_samples_trained_on_model, train_loss, dev_loss=dev_loss)
                     log.info('Finished epoch %d.' % epoch)
                 log.info('=' * 100)
                 log.info('FINISHED Optimization')

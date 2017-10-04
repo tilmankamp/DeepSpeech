@@ -1,7 +1,6 @@
 import os
 import re
 import glob
-import pandas
 import tensorflow as tf
 import time
 from six.moves import range
@@ -10,7 +9,27 @@ from util.log import Logger
 log = Logger('Persistence')
 
 class CheckpointManager(object):
-    def __init__(self, checkpoint_dir, load='recent', inter_secs=0, keep_n_inters=3, keep_n_epochs=5, init_op=None, saver=None):
+    '''
+    A class to manage checkpointing, restoring and initialization of a model.
+    It also manages filenames of two checkpoint series/families (epoch ones and intermediate ones)
+    within a checkpoint directory.
+    '''
+    def __init__(self, checkpoint_dir=None, load='recent', inter_secs=0, keep_n_inters=3, keep_n_epochs=5, init_op=None, saver=None):
+        '''
+        Initializes a new checkpoint manager.
+        'checkpoint_dir' - path of the checkpoint directory - if omitted, checkpointing will be deactivated.
+        'load' - one of
+         - 'recent' (default) to load the most recent checkpoint,
+         - 'best-dev' for loading the existing validated epoch with the lowest validation loss
+         - 'last-epoch' for loading the epoch checkpoint with the highest number
+         - <filename> for directly loading a checkpoint from the given filename
+         - 'init' (also fallback if no checkpoints were found) for initializing a new model
+        'inter_secs' - time interval in seconds for saving intermediate checkpoints - 0 deactivates intermediate checkpointing
+        'keep_n_inters' - how many intermediate checkpoints to keep - 0 deactivates intermediate checkpointing
+        'keep_n_epochs' - how many epoch checkpointsd to keep - 0 deactivates epoch checkpointing
+        'init_op' - optional initialization operation for the model (if omitted, it will use standard global initialization)
+        'saver' - optional saver for the model (if omitted, it will use an internal one)
+        '''
         self.checkpoint_dir = checkpoint_dir
         self.load = load
         self.inter_secs = inter_secs
@@ -18,110 +37,195 @@ class CheckpointManager(object):
         self.keep_n_epochs = keep_n_epochs
         self.init_op = init_op if init_op else tf.global_variables_initializer()
         self.saver = saver if saver else tf.train.Saver()
-        self._str_inter = 'intermediate'
-        self._str_epoch = 'epoch'
         self._t0 = None
         if checkpoint_dir:
             self._csv = os.path.join(checkpoint_dir, 'results.csv')
             if os.path.isfile(self._csv):
-                self._results = pandas.read_csv(self._csv)
+                # read all lines and columns from results.csv
+                self._results = [l.split(',') for l in open(self._csv, 'r').readlines()[1:]]
+                # post-process lines to required data types of columns epoch, loss, dev-loss
+                self._results = [(int(r[0]), float(r[1]), None if r[2] is None else float(r[2])) for r in self._results]
             else:
-                self._results = pandas.DataFrame(columns=['loss', 'dev-loss'])
-                self._results.index.rename('epoch', inplace=True)
+                self._results = []
 
-    def _get_numbered_files(self, kind):
-        entries = []
-        entries_lookup = {}
+    def _get_checkpoints(self):
+        '''
+        Scans checkpoint dir and returns a list of checkpoint tuples
+        ordered by their global index.
+        Each checkpoint tuple consists of the
+         - epoch index (1-based, 0 for intermediate checkpoints),
+         - global index and a
+         - set of filenames.
+        '''
+        # list and hash for collecting checkpoint tuples
+        checkpoints = []
+        checkpoints_lookup = {}
+        # scanning checkpoint dir for checkpoints...
         for filename in glob.glob(self.checkpoint_dir + '/*'):
-            number = re.search('%s_([0-9]+)\\.ckpt.*' % kind, filename, re.IGNORECASE)
-            if number:
-                number = int(number.group(1))
-                if number in entries_lookup:
-                    _, files = entries_lookup[number]
+            # only process filenames of the following form
+            found = re.search('(inter|epoch-[0-9]+)_([0-9]+)\\.ckpt.*', filename, re.IGNORECASE)
+            if found:
+                # extract the epoch index - 0 for intermediate checkpoints
+                epoch_index = found.group(1)
+                epoch_index = int(epoch_index[6:]) if epoch_index.startswith('epoch-') else 0
+                # extract the global index (underscore part)
+                global_index = int(found.group(2))
+                # for looking up checkpoint tuples within this loop
+                key = '%d-%d' % (epoch_index, global_index)
+                if key in checkpoints_lookup:
+                    # we already processed some file(s) for this checkpoint...
+                    _, _, filenames = checkpoints_lookup[key]
                 else:
-                    files = []
-                    entry = (number, files)
-                    entries_lookup[number] = entry
-                    entries.append(entry)
-                files.append(filename)
-        return sorted(entries, key=lambda e: e[0])
+                    # creating a new checkpoint tuple
+                    filenames = []
+                    checkpoint = (epoch_index, global_index, filenames)
+                    checkpoints_lookup[key] = checkpoint
+                    checkpoints.append(checkpoint)
+                # add current filename to checkpoint's file-set
+                filenames.append(filename)
+        # return list of checkpoint tuples - ordered by their global index
+        return sorted(checkpoints, key=lambda cp: cp[1])
 
-    def _prune_and_save(self, session, kind, keep, new_index=-1):
-        _files = self._get_numbered_files(kind)
-        if new_index < 0:
-            # compute the next index
-            new_index = _files[-1][0] + 1 if len(_files) > 0 else 1
-        _filtered_files = []
-        for number, filenames in _files:
-            if new_index <= number:
-                log.debug('Removing %s checkpoint files "%s.*", as its number is greater than %d...' % (kind, filename, new_index))
+    def _get_filename(self, filenames):
+        '''
+        Strips the filename-suffix from first file of the passed checkpoint file-set
+        to get a common prefix that can be used to restore the checkpoint.
+        '''
+        return '.'.join(filenames[0].split('.')[:-1])
+
+    def _prune_and_save(self, session, epoch_index, global_index):
+        '''
+        Removes outdated checkpoint files and stores a new checkpoint.
+        '''
+        keep = self.keep_n_inters if epoch_index == 0 else self.keep_n_epochs
+        assert keep > 0
+        checkpoints = []
+        for checkpoint in self._get_checkpoints():
+            # if checkpoint's global index is greater than this one,
+            if checkpoint[1] > global_index:
+                # it is on an outdated branch of training history and will be deleted
+                log.debug('Removing files of checkpoint "%s", as the global index %d is greater than the new one (%d)...' % \
+                    (self._get_filename(filenames), checkpoint[1], global_index))
                 for filename in filenames:
                     os.remove(filename)
             else:
-                _filtered_files.append((number, filenames))
-        for number, filenames in _filtered_files[:len(_filtered_files) - keep]:
-            log.debug('Removing files of %s checkpoint %d, as only %d %s checkpoints are kept...' % (kind, number, keep, kind))
+                # for the next steps we only keep checkpoints of the current
+                # checkpoint family (either epoch ones or intermediate ones)
+                if (epoch_index == 0 and checkpoint[0] == 0) or (epoch_index > 0 and checkpoint[0] > 0):
+                    checkpoints.append(checkpoint)
+        # removing checkpoint files within current checkpoint family that fall off the keep range
+        for _, _, filenames in checkpoints[:-(keep - 1)]:
+            log.debug('Removing files of "%s", as only %d checkpoints should be kept...' % \
+                (self._get_filename(filenames), keep))
             for filename in filenames:
                 os.remove(filename)
-        filename = os.path.join(self.checkpoint_dir, '%s_%d.ckpt' % (kind, new_index))
-        log.info('Checkpointing %s %d as "%s"...' % (kind, new_index, filename))
+        # generating checkpoint filename
+        filename = '%s_%d.ckpt' % (('epoch-%d' % epoch_index) if epoch_index > 0 else 'inter', global_index)
+        filename = os.path.join(self.checkpoint_dir, filename)
+        log.info('Writing checkpoint "%s"...' % filename)
+        # finally: saving the new checkpoint
         self.saver.save(session, filename, write_state=False)
 
     def _init(self, session):
-        log.info('Initializing graph')
+        '''
+        Initializes the session.
+        '''
+        log.info('No checkpoint to load - initializing new model...')
         session.run(self.init_op)
 
+    def _restore(self, session, filename):
+        '''
+        Restores a checkpoint file-set.
+        '''
+        log.info('Restoring checkpoint "%s"...' % filename)
+        self.saver.restore(session, filename)
+
     def start(self, session):
+        '''
+        Starts a training session by either restoring the right checkpoint
+        or by initializing the model.
+        Should be called at the beginning of a training session.
+        '''
         if not self.checkpoint_dir:
             self._init(session)
             return
-        file = None
-        epoch_files = self._get_numbered_files(self._str_epoch)
-        last_epoch = epoch_files[-1] if len(epoch_files) > 0 else None
+        checkpoint = None
+        # collect available checkpoints
+        checkpoints = self._get_checkpoints()
         if self.load == 'recent':
-            kind = self._str_inter
-            files = self._get_numbered_files(self._str_inter)
-            file = files[-1] if len(files) > 0 else last_epoch
+            if len(checkpoints) > 0:
+                # pick the most recent checkpoint (by means of global-index),
+                # no matter if this is an epoch or intermediate one
+                checkpoint = checkpoints[-1]
         else:
-            kind = self._str_epoch
-            if self.load == 'best-dev':
-                number = self._results.ix[self._results['dev-loss'].idxmin()]['epoch']
-                if number:
-                    file = (number, os.path.join(checkpoint_dir, '%s_%d.ckpt' % (kind, number)))
-            elif self.load == 'last-epoch':
-                file = last_epoch
-        if file:
-            number, filenames = file
-            filename = '.'.join(filenames[0].split('.')[:-1])
-            log.info('Restoring %s %d from checkpoint file "%s"...' % (kind, number, filename))
-            self.saver.restore(session, filename)
-        elif os.path.isfile(self.load):
-            log.info('Restoring checkpoint file "%s"...' % self.load)
-            self.saver.restore(session, self.load)
+            # reduce to epoch checkpoints only, order by epoch number
+            checkpoints = sorted([cp for cp in checkpoints if cp[0] > 0], key=lambda cp: cp[0])
+            if len(checkpoints) > 0:
+                if self.load == 'best-dev':
+                    # get epoch numbers of existing checkpoints
+                    available = [cp[0] for cp in checkpoints]
+                    # and intersect them with result-file-listed epochs featuring a dev-loss
+                    available = [r for r in self._results if r[0] in available and not r[2] is None]
+                    # if there are any,
+                    if len(available) > 0:
+                        # pick the one with dev-loss minimum
+                        epoch = min(available, key=lambda r: r[2])[0]
+                        checkpoint = next(cp for cp in checkpoints if cp[0] == epoch)
+                elif self.load == 'last-epoch':
+                    # pick the one with the highest epoch number
+                    checkpoint = checkpoints[-1]
+        if checkpoint:
+            # so we got a checkpoint file-set - restoring it...
+            self._restore(session, self._get_filename(checkpoint[2]))
+        elif self.load != 'init' and len(glob.glob(self.load + '*')) > 0:
+            # if self.load is not a keyword, but a path-prefix to existing files, we restore it...
+            self._restore(session, self.load)
         else:
+            # final fallback -> fresh start (also self.load == 'init')
             self._init(session)
+        # setting t0 for intermediate checkpointing
         self._t0 = time.time()
 
-    def _step(self, session):
-        self._prune_and_save(session, self._str_inter, self.keep_n_inters)
-
-    def step(self, session):
-        if not self.checkpoint_dir:
+    def step(self, session, global_index):
+        '''
+        Allows checkpoint manager to save an intermediate checkpoint,
+        if the internal timer elapsed.
+        Should be called after each trained batch within a training loop.
+        'global_index' should represent the overall training progress
+        (one could use TF's global_step or the total number of applied samples).
+        '''
+        # no intermediate checkpointing, if no dir or nothing to keep
+        if not self.checkpoint_dir or self.keep_n_inters <= 0:
             return
         current_time = time.time()
         if self.inter_secs > 0 and current_time - self._t0 > self.inter_secs:
+            # our timer elapsed -> restart timer and write an intermediate checkpoint
             self._t0 = current_time
-            self._step(session)
+            self._prune_and_save(session, 0, global_index)
 
-    def epoch(self, session, epoch_number, loss, dev_loss=None):
-        if not self.checkpoint_dir:
+    def epoch(self, session, epoch_number, global_index, loss, dev_loss=None):
+        '''
+        Allows checkpoint manager to save an epoch checkpoint.
+        Should be called after each (trained and validated) epoch.
+        'epoch_number' is the 1-based epoch index.
+        'global_index' should represent the overall training progress
+        (one could use TF's global_step or the total number of applied samples).
+        'loss' should be the epoch's mean training loss.
+        'dev_loss' (optional) should be the epoch's mean validation loss.
+        '''
+        # no epoch checkpointing, if no dir or nothing to keep
+        if not self.checkpoint_dir or self.keep_n_epochs <= 0:
             return
-        if self.inter_secs > 0:
-            self._step(session)
-        self._prune_and_save(session, self._str_epoch, self.keep_n_epochs, new_index=epoch_number)
+        # removing outdated checkpoint files and saving the epoch checkpoint...
+        self._prune_and_save(session, epoch_number, global_index)
         log.debug('Updating "%s"...' % self._csv)
-        # removing higher epoch numbers from log, as they got pruned/overwritten
-        self._results = self._results.drop(self._results[self._results.index > epoch_number].index)
-        self._results.loc[epoch_number] = [loss, dev_loss]
-        self._results.to_csv(self._csv)
+        # removing higher epoch numbers from results log, as they got pruned and
+        # are on an outdated branch of training history
+        self._results = [r for r in self._results if r[0] < epoch_number]
+        # append our new epoch
+        self._results.append((epoch_number, loss, dev_loss))
+        # write out results.csv
+        with open(self._csv, 'w') as csv:
+            csv.write('epoch,loss,dev-loss\n')
+            csv.write('\n'.join([','.join(('' if v is None else str(v)) for v in r) for r in self._results]))
 
