@@ -140,14 +140,9 @@ tf.app.flags.DEFINE_float   ('default_stddev',   0.046875,    'default standard 
 # Early Stopping
 
 tf.app.flags.DEFINE_boolean ('early_stop',       True,        'enable early stopping mechanism over validation dataset. Make sure that dev FLAG is enabled for this to work')
-
-# This parameter is irrespective of the time taken by single epoch to complete and checkpoint saving intervals.
-# It is possible that early stopping is triggered far after the best checkpoint is already replaced by checkpoint saving interval mechanism.
-# One has to align the parameters (earlystop_nsteps, inter_secs) accordingly as per the time taken by an epoch on different datasets.
-
-tf.app.flags.DEFINE_integer ('es_steps',         4,           'number of steps to consider for early stopping. Loss is not stored in the checkpoint so when checkpoint is revived it starts the loss calculation from start at that point')
-tf.app.flags.DEFINE_float   ('es_mean_th',       0.5,         'mean threshold for loss to determine the condition if early stopping is required')
-tf.app.flags.DEFINE_float   ('es_std_th',        0.5,         'standard deviation threshold for loss to determine the condition if early stopping is required')
+tf.app.flags.DEFINE_integer ('es_nsteps',        4,           'number of steps to consider for early stopping. Loss is not stored in the checkpoint so when checkpoint is revived it starts the loss calculation from start at that point')
+tf.app.flags.DEFINE_float   ('es_mean_thresh',   0.5,         'mean threshold for loss to determine the condition if early stopping is required')
+tf.app.flags.DEFINE_float   ('es_std_thresh',    0.5,         'standard deviation threshold for loss to determine the condition if early stopping is required')
 
 for var in ['b1', 'h1', 'b2', 'h2', 'b3', 'h3', 'b5', 'h5', 'b6', 'h6']:
     tf.app.flags.DEFINE_float('%s_stddev' % var, None, 'standard deviation to use when initialising %s' % var)
@@ -796,7 +791,9 @@ def train() :
         # all graph evaluation initiated by chief worker only
         if is_chief:
             # let the checkpoint manager either load a model or initialize all variables
-            checkpoint_manager.start(session)
+            epoch_history = checkpoint_manager.start(session)
+            # getting historic validation loss log for early stopping
+            dev_losses = [e[2] for e in epoch_history if not e[2] is None]
             # retrieving number of applied samples from (potentially restored) model
             n_samples_trained_on_model = session.run(sample_counter)
             # number of samples per epoch - to be at least 1
@@ -905,6 +902,25 @@ def train() :
             if FLAGS.train and target_epoch >= start_epoch:
                 log.info('STARTING Optimization')
                 for epoch in range(start_epoch, target_epoch + 1):
+                    # if early stopping is enabled and possible...
+                    if FLAGS.early_stop and FLAGS.validation_step > 0 and len(dev_losses) >= FLAGS.es_nsteps:
+                        # calculate the mean of losses for past epochs
+                        print(dev_losses[-FLAGS.es_nsteps:-1])
+                        mean_loss = np.mean(dev_losses[-FLAGS.es_nsteps:-1])
+                        # calculate the standard deviation for losses from validation part in the past epochs
+                        std_loss = np.std(dev_losses[-FLAGS.es_nsteps:-1])
+                        # update the list of losses incurred
+                        dev_losses = dev_losses[-FLAGS.es_nsteps:]
+                        es_info = 'steps: %d, validation loss: %f, standard deviation: %f, mean: %f' % \
+                                  (FLAGS.es_nsteps, dev_losses[-1], std_loss, mean_loss)
+                        log.debug('Checking for early stopping - %s' % es_info)
+                        # check if validation loss has started increasing or is not decreasing substantially,
+                        # making sure slight fluctuations don't bother the early stopping from working
+                        if (dev_losses[-1] > np.max(dev_losses[:-1])) or \
+                           (abs(dev_losses[-1] - mean_loss) < FLAGS.es_mean_thresh and std_loss < FLAGS.es_std_thresh):
+                            log.info('Early stop triggered - %s' % es_info)
+                            # early stopping -> just exit loop
+                            break
                     log.info('=' * 100)
                     # training
                     log.info('Training epoch %d...' % epoch)
@@ -916,6 +932,7 @@ def train() :
                     if FLAGS.validation_step > 0 and epoch % FLAGS.validation_step == 0:
                         log.info('Validating epoch %d...' % epoch)
                         dev_loss, _ = apply_set(1, False, should_report, 'Validation')
+                        dev_losses.append(dev_loss)
                     # let the checkpoint manager log results and do an epoch checkpoint of the current model
                     checkpoint_manager.epoch(session, epoch, n_samples_trained_on_model, train_loss, dev_loss=dev_loss)
                     log.info('Finished epoch %d.' % epoch)
