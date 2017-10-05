@@ -45,6 +45,8 @@ class CheckpointManager(object):
                 self._results = [l.split(',') for l in open(self._csv, 'r').readlines()[1:]]
                 # post-process lines to required data types of columns epoch, loss, dev-loss
                 self._results = [(int(r[0]), float(r[1]), None if r[2] is None else float(r[2])) for r in self._results]
+                # ordered by epoch
+                self._results = sorted(self._results, key=lambda r: r[0])
             else:
                 self._results = []
 
@@ -158,7 +160,7 @@ class CheckpointManager(object):
                 # no matter if this is an epoch or intermediate one
                 checkpoint = checkpoints[-1]
         else:
-            # reduce to epoch checkpoints only, order by epoch number
+            # epoch checkpoints only, ordered by epoch number
             checkpoints = sorted([cp for cp in checkpoints if cp[0] > 0], key=lambda cp: cp[0])
             if len(checkpoints) > 0:
                 if self.load == 'best-dev':
@@ -185,6 +187,8 @@ class CheckpointManager(object):
             self._init(session)
         # setting t0 for intermediate checkpointing
         self._t0 = time.time()
+        # return epoch history
+        return self._results
 
     def step(self, session, global_index):
         '''
@@ -199,8 +203,9 @@ class CheckpointManager(object):
             return
         current_time = time.time()
         if self.inter_secs > 0 and current_time - self._t0 > self.inter_secs:
-            # our timer elapsed -> restart timer and write an intermediate checkpoint
+            # our timer elapsed -> restart timer
             self._t0 = current_time
+            # removing outdated intermediate checkpoint files and saving the intermediate checkpoint...
             self._prune_and_save(session, 0, global_index)
 
     def epoch(self, session, epoch_number, global_index, loss, dev_loss=None):
@@ -216,7 +221,7 @@ class CheckpointManager(object):
         # no epoch checkpointing, if no dir or nothing to keep
         if not self.checkpoint_dir or self.keep_n_epochs <= 0:
             return
-        # removing outdated checkpoint files and saving the epoch checkpoint...
+        # removing outdated epoch checkpoint files and saving the epoch checkpoint...
         self._prune_and_save(session, epoch_number, global_index)
         log.debug('Updating "%s"...' % self._csv)
         # removing higher epoch numbers from results log, as they got pruned and
