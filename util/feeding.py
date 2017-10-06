@@ -60,7 +60,6 @@ class ModelFeeder(object):
         self.queue_capacity = queue_capacity
         self.allocate_indices = allocate_indices
 
-        self.ph_header = tf.placeholder(tf.int32, [])
         self.ph_x = tf.placeholder(tf.float32, [None, num_cep + (2 * num_cep * num_context)])
         self.ph_x_length = tf.placeholder(tf.int32, [])
         self.ph_y = tf.placeholder(tf.int32, [None,])
@@ -71,28 +70,21 @@ class ModelFeeder(object):
 
         # protects the feeder state
         self._lock = Lock()
-
         # special dummy batch
         self._dummy = (0, [None])
-
         # queue of batches that are ready to be enqueued on towers
         # a batch is a tuple of the batch size and a list of sample tuples
-        self.queue = Queue.Queue(maxsize=2 * len(self.gpus_per_worker[self.worker_index]))
-
+        self.queue = Queue.Queue(maxsize=len(self.gpus_per_worker[self.worker_index]))
         # take care data set member exists
         self._data_set = None
-
         # set it again to initialize all structures for feeding
         self.start_data_set(None)
-
         # Bisected threshold t1 at memory m1
         m1 = 3816882176
         t1 = 2000
-
         # Bisected threshold t2 at memory m2
         m2 = 7994143540
         t2 = 11000
-
         # threshold by a linear function derived from the two "measurements"
         self.len_threshold = (min_tower_memory * (t2-t1) + m2*t1 - m1*t2) // (m2-m1)
 
