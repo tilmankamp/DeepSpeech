@@ -45,7 +45,6 @@ class ModelFeeder(object):
                  num_cep,
                  num_context,
                  alphabet,
-                 num_tower_feeders,
                  num_sample_loaders_per_set,
                  num_samples_loader_buffer,
                  min_tower_memory,
@@ -56,6 +55,7 @@ class ModelFeeder(object):
         self.worker_index = worker_index
         self.num_cep = num_cep
         self.num_context = num_context
+        self.alphabet = alphabet
         self.num_sample_loaders_per_set = num_sample_loaders_per_set
         self.num_samples_loader_buffer = num_samples_loader_buffer
         self.min_tower_memory = min_tower_memory
@@ -325,7 +325,7 @@ class ModelFeeder(object):
             # let's fail, if the sample alone already exceeds the batch lenght threshold
             assert source_len <= self.len_threshold
             # preparing the text
-            target = text_to_char_array(transcript)
+            target = text_to_char_array(transcript, self.alphabet)
             target_len = len(target)
             with self._lock:
                 # handing loaded sample over to the main thread,

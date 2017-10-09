@@ -44,7 +44,7 @@ class CheckpointManager(object):
                 # read all lines and columns from results.csv
                 self._results = [l.split(',') for l in open(self._csv, 'r').readlines()[1:]]
                 # post-process lines to required data types of columns epoch, loss, dev-loss
-                self._results = [(int(r[0]), float(r[1]), None if r[2] is None else float(r[2])) for r in self._results]
+                self._results = [(int(r[0]), float(r[1]), None if len(r[2].strip()) == 0 else float(r[2])) for r in self._results]
                 # ordered by epoch
                 self._results = sorted(self._results, key=lambda r: r[0])
             else:

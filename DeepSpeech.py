@@ -34,7 +34,6 @@ from xdg import BaseDirectory as xdg
 from util.feeding import DataSet, ModelFeeder
 from util.persistence import CheckpointManager
 from util.shared_lib import check_cupti
-from util.spell import correction
 from util.text import sparse_tensor_value_to_texts, wer, Alphabet
 from util.message_bus import MessageBusClient
 from util.log import Logger
@@ -393,7 +392,7 @@ def BiRNN(batch_x, seq_length, dropout):
     return layer_6
 
 if not os.path.exists(os.path.abspath(FLAGS.decoder_library_path)):
-    log_error('ERROR: The decoder library file does not exist. Make sure you have ' \
+    log.error('ERROR: The decoder library file does not exist. Make sure you have ' \
           'downloaded or built the native client binaries and pass the ' \
           'appropriate path to the binaries in the --decoder_library_path parameter.')
 
@@ -793,6 +792,7 @@ def train() :
                                    FLAGS.task_index,
                                    n_input,
                                    n_context,
+                                   alphabet,
                                    FLAGS.threads_per_set,
                                    FLAGS.loader_buffer,
                                    min(memory_limits),
@@ -911,7 +911,6 @@ def train() :
                     report_results = [r for r in list(zip(*report_results)) if r[0] != ' ']
                     # do spell-checking and compute WER - only keep samples with WER > 0
                     for s_label, s_decoding, s_distance, s_loss in report_results:
-                        s_decoding = correction(s_decoding)
                         s_wer = wer(s_label, s_decoding)
                         mean_wer += s_wer
                         if s_wer > 0:
