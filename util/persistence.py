@@ -211,7 +211,7 @@ class CheckpointManager(object):
     def epoch(self, session, epoch_number, global_index, loss, dev_loss=None):
         '''
         Allows checkpoint manager to save an epoch checkpoint.
-        Should be called after each (trained and validated) epoch.
+        Should be called after each trained epoch (with dev-loss if validated).
         'epoch_number' is the 1-based epoch index.
         'global_index' should represent the overall training progress
         (one could use TF's global_step or the total number of applied samples).

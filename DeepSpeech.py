@@ -35,7 +35,7 @@ from util.feeding import DataSet, ModelFeeder
 from util.persistence import CheckpointManager
 from util.shared_lib import check_cupti
 from util.text import sparse_tensor_value_to_texts, wer, Alphabet
-from util.message_bus import MessageBusClient
+from util.messaging import ClusterMessagingClient
 from util.log import Logger
 
 # Importer
@@ -709,13 +709,20 @@ def export():
         except RuntimeError:
             log.error(sys.exc_info()[1])
 
-class ClusterEndPoint(MessageBusClient):
+class ClusterEndPoint(ClusterMessagingClient):
+    '''
+    Local cluster messaging end point.
+    '''
     def __init__(self, cluster_spec, task):
-        MessageBusClient.__init__(self, cluster_spec, 'worker', task)
+        ClusterMessagingClient.__init__(self, cluster_spec, 'worker', task)
         self._index_lock = Lock()
         self._get_gpus_per_worker_lock = Lock()
         self._index = 0
         self._event = Event()
+        # Public member to set an event callback after the model feeder got created.
+        # Reason for not being a ctor parameter: Creating the model feeder requires
+        # the cluster GPU configuration that in turn already requires messaging to
+        # query the GPU configuration of each worker.
         self.on_start_data_set = None
         self.gpus_per_worker = []
 
@@ -724,6 +731,12 @@ class ClusterEndPoint(MessageBusClient):
             self.on_start_data_set(data_set_index)
 
     def start_data_set(self, data_set_index, index_offset=0):
+        '''
+        Starts a data_set on every node of the cluster.
+        Should only be called by chief worker.
+        'data_set_index' - 0 for the training set, 1 for the validation set and 2 for the test set
+        'index_offset' - sample offset of the first sample within the data set to enqueue
+        '''
         self._index = index_offset
         for i in self.cluster_spec.task_indices('worker'):
             self.call('worker', i, '_start_data_set', data_set_index)
@@ -735,29 +748,48 @@ class ClusterEndPoint(MessageBusClient):
             return value
 
     def allocate_indices(self, number):
+        '''
+        Gets an index allocation from chief worker.
+        'number' - Number of indices to allocate.
+        Returns new base index of allocation.
+        '''
         return self.call('worker', 0, '_allocate_indices', number)
 
     def _get_gpus(self):
         return memory_limits
 
     def _get_gpus_per_worker(self):
+        # lock is required to prevent competing calls to interfer with each other
         with self._get_gpus_per_worker_lock:
+            # lazy evaluation
             if len(self.gpus_per_worker) == 0:
+                # query each worker for his GPUs
                 for i in self.cluster_spec.task_indices('worker'):
                     self.gpus_per_worker.append(self.call('worker', i, '_get_gpus'))
         return self.gpus_per_worker
 
     def get_gpus_per_worker(self):
+        '''
+        Retrieves GPU configuration for every worker.
+        Returns a list (of workers) of a list of GPUs (of one worker).
+        '''
         return self.call('worker', 0, '_get_gpus_per_worker')
 
     def _quit(self):
         self._event.set()
 
     def quit(self):
+        '''
+        Quitting the cluster/training by unblocking every node's wait call.
+        Should only be called by chief worker.
+        '''
         for i in self.cluster_spec.task_indices('worker'):
             self.call_async('worker', i, '_quit', None)
 
     def wait(self):
+        '''
+        Blocking call that waits for the cluster/training to conclude.
+        '''
         self._event.wait()
 
 def train() :
@@ -779,11 +811,11 @@ def train() :
     data_sets = [train_set, dev_set, test_set]
 
     with tf.Session(server.target, config=session_config) as session:
-        # starting the cluster end point / connecting to message bus
+        # creating the cluster messaging end point
         cluster = ClusterEndPoint(cluster_spec, FLAGS.task_index)
         # central thread coordinator
         coord = tf.train.Coordinator()
-        # starting worker services's queue thrads
+        # starting cluster messaging thrads
         cluster.start_queue_threads(session, coord)
         # query all GPU configurations across the cluster
         gpus_per_worker = cluster.get_gpus_per_worker()
@@ -801,7 +833,7 @@ def train() :
         # react on data set (re-)starting (cluster wide event)
         cluster.on_start_data_set = \
             lambda data_set_index: model_feeder.start_data_set(data_sets[data_set_index])
-        # get all training relevant graph end-points
+        # get all relevant graph end-points
         optimizer, results_tuple, gradients, sample_number, mean_edit_distance, loss = \
             get_tower_results(model_feeder)
         # add summaries of all variables and gradients to log
@@ -943,7 +975,6 @@ def train() :
                     # if early stopping is enabled and possible...
                     if FLAGS.early_stop and FLAGS.validation_step > 0 and len(dev_losses) >= FLAGS.es_nsteps:
                         # calculate the mean of losses for past epochs
-                        print(dev_losses[-FLAGS.es_nsteps:-1])
                         mean_loss = np.mean(dev_losses[-FLAGS.es_nsteps:-1])
                         # calculate the standard deviation for losses from validation part in the past epochs
                         std_loss = np.std(dev_losses[-FLAGS.es_nsteps:-1])
