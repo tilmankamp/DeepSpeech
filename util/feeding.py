@@ -10,7 +10,7 @@ from util.audio import audiofile_to_input_vector
 from util.text import ctc_label_dense_to_sparse, text_to_char_array
 from util.log import Logger
 
-log = Logger('Feeding')
+log = Logger('feeding', 'Feeding')
 
 class DataSet(object):
     '''
@@ -194,7 +194,7 @@ class ModelFeeder(object):
                 self.queue.get_nowait()
             # first index of last retrieved index allocation (<0: wait, >=file_count: enqueue dummy batches)
             self._index = -1
-        log.debug('(Re-)Started data set')
+        log.debug('Started data set')
 
     def _create_sample(self, x, x_len, y, y_len):
         return { self.ph_x: x, self.ph_x_length: x_len, self.ph_y: y, self.ph_y_length: y_len }
@@ -219,6 +219,7 @@ class ModelFeeder(object):
                     try:
                         # trying for one second to enqueue the dummy
                         self.queue.put(self._dummy, True, 1)
+                        log.step('Enqueued dummy sample')
                     except Queue.Full:
                         # just ignore the timeout and loop on
                         pass
@@ -282,7 +283,7 @@ class ModelFeeder(object):
                     try:
                         # trying for one second to enqueue the batch
                         self.queue.put((len(batch), batch), True, 1)
-                        log.traffic('Enqueued batch with %d samples' % len(batch))
+                        log.step('Enqueued batch with %d samples' % len(batch))
                         break
                     except Queue.Full:
                         # we ran into timeout - repeat...
@@ -295,6 +296,7 @@ class ModelFeeder(object):
                     try:
                         # trying for one second to enqueue the batch
                         self.queue.put(self._dummy, True, 1)
+                        log.step('Enqueued trailing dummy sample')
                     except Queue.Full:
                         # we ran into timeout - restart at the very top (forgetting this dummy sample)...
                         pass

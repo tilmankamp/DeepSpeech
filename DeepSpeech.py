@@ -1,7 +1,6 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 from __future__ import absolute_import, division, print_function
-import __builtin__
 import os
 import sys
 from util.gpu import get_available_gpus
@@ -36,7 +35,7 @@ from util.persistence import CheckpointManager
 from util.shared_lib import check_cupti
 from util.text import sparse_tensor_value_to_texts, wer, Alphabet
 from util.messaging import ClusterMessagingClient
-from util.log import Logger
+from util.log import set_log_levels, Logger
 
 # Importer
 # ========
@@ -117,10 +116,7 @@ tf.app.flags.DEFINE_boolean ('remove_export',    False,       'wether to remove 
 
 # Reporting
 
-tf.app.flags.DEFINE_integer ('log_level',        1,           'log level for console logs - 0: INFO, 1: WARN, 2: ERROR, 3: FATAL')
-tf.app.flags.DEFINE_boolean ('log_traffic',      False,       'log cluster transaction and traffic information during debug logging')
-
-tf.app.flags.DEFINE_string  ('wer_log_pattern',  '',          'pattern for machine readable global logging of WER progress; has to contain %%s, %%s and %%f for the set name, the date and the float respectively; example: "GLOBAL LOG: logwer(\'12ade231\', %%s, %%s, %%f)" would result in some entry like "GLOBAL LOG: logwer(\'12ade231\', \'train\', \'2017-05-18T03:09:48-0700\', 0.05)"; if omitted (default), there will be no logging')
+tf.app.flags.DEFINE_string  ('log_level',        'info',      'comma separated assignments of log levels to modules (e.g. "main=debug,persistence=step") - Modules can be "main", "persistence", "messaging", "feeding". Levels can be "step", "debug", "info", "warn", "error". If only a level is specified, it will will be used as default value.')
 
 tf.app.flags.DEFINE_boolean ('log_placement',    False,       'wether to log device placement of the operators to the console')
 tf.app.flags.DEFINE_integer ('report_count',     10,          'number of phrases with lowest WER (best matching) to print out during a WER report')
@@ -158,8 +154,14 @@ tf.app.flags.DEFINE_float   ('valid_word_count_weight', 1.10,        'Valid word
 for var in ['b1', 'h1', 'b2', 'h2', 'b3', 'h3', 'b5', 'h5', 'b6', 'h6']:
     tf.app.flags.DEFINE_float('%s_stddev' % var, None, 'standard deviation to use when initialising %s' % var)
 
-__builtin__.FLAGS = tf.app.flags.FLAGS
-log = Logger()
+# parse command line parameters
+FLAGS = tf.app.flags.FLAGS
+
+# set global cross module log level
+set_log_levels(FLAGS.log_level)
+
+# create local logger w/o module name
+log = Logger('main', None)
 
 def initialize_globals():
     # ps and worker hosts required for p2p cluster setup
@@ -912,7 +914,7 @@ def train() :
                         session.run([train_op, overall_samples_op, sample_number, loss, report_params])
                     # collect results
                     n_samples_applied += n_samples_in_step
-                    log.debug('Applied %d samples (%d of %d).' % \
+                    log.step('Applied %d samples (%d of %d).' % \
                         (n_samples_in_step, offset + n_samples_applied, n_samples_to_apply))
                     # aggregate loss (weighted by number of samples)
                     total_loss += current_loss * n_samples_in_step

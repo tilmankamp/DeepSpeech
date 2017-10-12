@@ -4,7 +4,7 @@ from threading import Thread, Lock, Event
 import Queue
 from util.log import Logger
 
-log = Logger('Messaging')
+log = Logger('messaging', 'Messaging')
 
 class ClusterMessagingClient(object):
     '''
@@ -93,7 +93,7 @@ class ClusterMessagingClient(object):
         '''
         if is_response:
             # we got the response for an outbound RPC call.
-            log.traffic('Response from: %s, function: %s, return values: %r' % (caller, function, items))
+            log.step('Response from: %s, function: %s, return values: %r' % (caller, function, items))
             callback = self._waiting_for_response[response_id]
             if callable(callback):
                 # Local response is a callable - so we call it.
@@ -111,7 +111,7 @@ class ClusterMessagingClient(object):
                 callback.set()
         else:
             # We got an inbound RPC call.
-            log.traffic('Call from: %s, function: %s, arguments: %r' % (caller, function, items))
+            log.step('Call from: %s, function: %s, arguments: %r' % (caller, function, items))
             # Calling the local RPC function/class member (if available).
             results = self._call(function, items)
             if response_id > 0:
@@ -183,12 +183,12 @@ class ClusterMessagingClient(object):
         id = self._id_pattern % (job, task)
         if self.id == id:
             # local call - no queueing needed
-            log.traffic('Local call of function: %s, arguments: %r' % (function, args))
+            log.step('Local call of function: %s, arguments: %r' % (function, args))
             results = self._call(function, args)
             if callback:
                 callback(results)
             return -1
-        log.traffic('Calling worker: %s, function: %s, arguments: %r' % (id, function, args))
+        log.step('Calling worker: %s, function: %s, arguments: %r' % (id, function, args))
         # default value in case of no callback, if not waiting for responseno
         # and no response should be produced on the receiving end.
         response_id = 0
@@ -218,7 +218,7 @@ class ClusterMessagingClient(object):
         '''
         if job == self.job and task == self.task:
             # local call - no queueing needed
-            log.traffic('Local call of function: %s, arguments: %r' % (function, args))
+            log.step('Local call of function: %s, arguments: %r' % (function, args))
             return self._call(function, args)
         # Create an Event object to wait/block until response arrives.
         event = Event()

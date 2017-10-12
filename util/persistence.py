@@ -6,7 +6,7 @@ import time
 from six.moves import range
 from util.log import Logger
 
-log = Logger('Persistence')
+log = Logger('persistence', 'Persistence')
 
 class CheckpointManager(object):
     '''
@@ -95,6 +95,14 @@ class CheckpointManager(object):
         '''
         return '.'.join(filenames[0].split('.')[:-1])
 
+    def _delete_files(self, filenames):
+        '''
+        Deletes files of a file-set.
+        '''
+        for filename in filenames:
+            log.step('Removing file "%s"...' % filename)
+            os.remove(filename)
+
     def _prune_and_save(self, session, epoch_index, global_index):
         '''
         Removes outdated checkpoint files and stores a new checkpoint.
@@ -108,8 +116,7 @@ class CheckpointManager(object):
                 # it is on an outdated branch of training history and will be deleted
                 log.debug('Removing files of checkpoint "%s", as the global index %d is greater than the new one (%d)...' % \
                     (self._get_filename(filenames), checkpoint[1], global_index))
-                for filename in filenames:
-                    os.remove(filename)
+                self._delete_files(filenames)
             else:
                 # for the next steps we only keep checkpoints of the current
                 # checkpoint family (either epoch ones or intermediate ones)
@@ -119,8 +126,7 @@ class CheckpointManager(object):
         for _, _, filenames in checkpoints[:-(keep - 1)]:
             log.debug('Removing files of "%s", as only %d checkpoints should be kept...' % \
                 (self._get_filename(filenames), keep))
-            for filename in filenames:
-                os.remove(filename)
+            self._delete_files(filenames)
         # generating checkpoint filename
         filename = '%s_%d.ckpt' % (('epoch-%d' % epoch_index) if epoch_index > 0 else 'inter', global_index)
         filename = os.path.join(self.checkpoint_dir, filename)
