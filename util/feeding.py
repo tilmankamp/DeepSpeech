@@ -17,7 +17,20 @@ class DataSet(object):
     Represents a collection of audio samples and their respective transcriptions.
     Takes a set of CSV files produced by importers in /bin.
     '''
-    def __init__(self, csvs, skip=0, limit=0, ascending=True):
+    def __init__(self, csvs, batch_size=0, skip=0, limit=0, ascending=True):
+        '''
+        Constructs a DataSet object from a list of provided csv files.
+        'csvs' - List of filenames of comma separated value files that have the columns
+            - wav_filename - Filename of the voice audio file
+            - wav_filesize - The file size of the voice audio file
+            - transcript - The transription of the voice sample
+        'batch_size' - The batch size for this data set - if 0 (default),
+            it will be computed dynamically for each applied batch
+        'skip' - how many samples to skip from the beginning of the DataSet's sample sequence
+        'limit' - limits the the number of samples to load from the DataSet
+        'ascending' - if the samples of the data set should be ordered ascending (True)
+            of descending (False) by their file sizes
+        '''
         self.files = None
         for csv in csvs:
             file = pandas.read_csv(csv)
@@ -30,6 +43,7 @@ class DataSet(object):
                          .values[skip:]
         if limit > 0:
             self.files = self.files[:limit]
+        self.batch_size = batch_size
 
 class ModelFeeder(object):
     '''
@@ -248,29 +262,39 @@ class ModelFeeder(object):
                     # Note: the case index=-1 should've survived unpacking
                 # if we got samples loaded by sample loaders, we could construct a batch...
                 if len(self._loaded) > 0:
-                    # ordering samples by audio length (source_len) to achieve good packing of the
-                    # batch to maximize memory utilization of PaddingFIFOQueue
-                    # Note: Our thresholding is based and calibrated on audio data size, as this
-                    # is supposedly by far the most memory critical factor.
-                    self._loaded = sorted(self._loaded, key=lambda sample: sample[1])
-                    # find the biggest batch from all loaded samples...
-                    for i in range(len(self._loaded)):
-                        # test, if current hypothetical batch already exceeds the length threshold...
-                        # Note: PaddingFIFOQueue is padding all samples to the size of the biggest
-                        # one (the current i-th) and requires (i + 1) slots.
-                        # Note: The for-loop will only produce a batch, if a sample results in a batch
-                        # that would exceed the threshold. This ensures that we are not enqueuing small
-                        # batches just because there are not enough samples loaded yet. The code directly
-                        # following the loop will care about the other/remainder case.
-                        if (i + 1) * self._loaded[i][1] > self.len_threshold:
-                            # if so, we build a batch with all samples till the (i-1)-th one
-                            # (as this already passed our test during last iteration)...
-                            assert i > 0 # fail, if first sample alone (i = 0) is already too big
-                            # cut the batch (samples 0 to i-1) from loaded samples
-                            batch = self._loaded[:i]
-                            # and keep the rest
-                            self._loaded = self._loaded[i:]
-                            break
+                    if self._data_set.batch_size > 0 and self._data_set.batch_size <= len(self._loaded):
+                        # Static Batch Size
+                        # -----------------
+                        # cut the batch from loaded samples
+                        batch = self._loaded[:self._data_set.batch_size]
+                        # and keep the rest
+                        self._loaded = self._loaded[self._data_set.batch_size:]
+                    else:
+                        # Dynamic Batch Size
+                        # ------------------
+                        # ordering samples by audio length (source_len) to achieve good packing of the
+                        # batch to maximize memory utilization of PaddingFIFOQueue
+                        # Not*e: Our thresholding is based and calibrated on audio data size, as this
+                        # is supposedly by far the most memory critical factor.
+                        self._loaded = sorted(self._loaded, key=lambda sample: sample[1])
+                        # find the biggest batch from all loaded samples...
+                        for i in range(len(self._loaded)):
+                            # test, if current hypothetical batch already exceeds the length threshold...
+                            # Note: PaddingFIFOQueue is padding all samples to the size of the biggest
+                            # one (the current i-th) and requires (i + 1) slots.
+                            # Note: The for-loop will only produce a batch, if a sample results in a batch
+                            # that would exceed the threshold. This ensures that we are not enqueuing small
+                            # batches just because there are not enough samples loaded yet. The code directly
+                            # following the loop will care about the other/remainder case.
+                            if (i + 1) * self._loaded[i][1] > self.len_threshold:
+                                # if so, we build a batch with all samples till the (i-1)-th one
+                                # (as this already passed our test during last iteration)...
+                                assert i > 0 # fail, if first sample alone (i = 0) is already too big
+                                # cut the batch (samples 0 to i-1) from loaded samples
+                                batch = self._loaded[:i]
+                                # and keep the rest
+                                self._loaded = self._loaded[i:]
+                                break
                     # if there is no batch yet and there are no samples under way,
                     if not batch and len(self._to_load) + len(self._loading) == 0:
                         # we build a (smaller) remainder batch from all loaded samples

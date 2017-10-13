@@ -50,6 +50,12 @@ tf.app.flags.DEFINE_string  ('train_files',      '',          'comma separated l
 tf.app.flags.DEFINE_string  ('dev_files',        '',          'comma separated list of files specifying the dataset used for validation. multiple files will get merged')
 tf.app.flags.DEFINE_string  ('test_files',       '',          'comma separated list of files specifying the dataset used for testing. multiple files will get merged')
 
+# Batch sizes
+
+tf.app.flags.DEFINE_integer ('train_batch_size', 0,           'number of elements in a training batch - 0 (default) for dynamic batch size')
+tf.app.flags.DEFINE_integer ('dev_batch_size',   0,           'number of elements in a validation batch - 0 (default) for dynamic batch size')
+tf.app.flags.DEFINE_integer ('test_batch_size',  0,           'number of elements in a test batch - 0 (default) for dynamic batch size')
+
 # Sample window
 
 tf.app.flags.DEFINE_integer ('limit_train',      0,           'maximum number of elements to use from train set - 0 means no limit')
@@ -799,14 +805,17 @@ def train() :
     server = tf.train.Server(cluster_spec, job_name='worker', task_index=FLAGS.task_index)
     # preparing local instances of all required data sets
     train_set = DataSet(FLAGS.train_files.split(','),
+                        batch_size=FLAGS.train_batch_size,
                         limit=FLAGS.limit_train,
                         skip=FLAGS.skip_train,
                         ascending=FLAGS.train_ascending)
     dev_set =   DataSet(FLAGS.dev_files.split(','),
+                        batch_size=FLAGS.dev_batch_size,
                         limit=FLAGS.limit_dev,
                         skip=FLAGS.skip_dev,
                         ascending=FLAGS.dev_ascending)
     test_set =  DataSet(FLAGS.test_files.split(','),
+                        batch_size=FLAGS.test_batch_size,
                         limit=FLAGS.limit_test,
                         skip=FLAGS.skip_test,
                         ascending=FLAGS.test_ascending)
