@@ -13,26 +13,19 @@ memory_limits = [gpu.memory_limit for gpu in get_available_gpus()]
 if len(memory_limits) == 0:
     memory_limits = [1000000000]
 
-import datetime
-import pickle
 import shutil
-import subprocess
 import tensorflow as tf
 import numpy as np
-import time
-import traceback
 import inspect
 import multiprocessing
 
-from six.moves import zip, range, filter, urllib, BaseHTTPServer
+from six.moves import zip, range, filter
 from tensorflow.contrib.session_bundle import exporter
 from tensorflow.python.tools import freeze_graph
 from threading import Thread, Lock, Event
-from urlparse import parse_qs
 from xdg import BaseDirectory as xdg
 from util.feeding import DataSet, ModelFeeder
 from util.persistence import CheckpointManager
-from util.shared_lib import check_cupti
 from util.text import sparse_tensor_value_to_texts, wer, Alphabet
 from util.messaging import ClusterMessagingClient
 from util.log import set_log_levels, Logger
@@ -544,7 +537,7 @@ def average_gradients(device, gradients, batch_sizes):
                 grads.append(expanded_g)
             # Average over the 'tower' dimension
             grad = tf.concat(grads, 0)
-            grad = tf.reduce_mean(grad, 0)
+            grad = tf.reduce_sum(grad, 0)
             grad = grad / tf.to_float(sample_number)
             # Create a gradient/variable tuple for the current variable with its average gradient
             grad_and_var = (grad, grad_and_vars[0][1])
@@ -568,7 +561,7 @@ def get_tower_results(model_feeder):
     # building the graph
     results = for_each_tower(model_feeder, calculate_mean_edit_distance_and_loss)
     # constructing sum of all tower batch sizes
-    batch_sizes = [result[0] for result in results]
+    batch_sizes = [result[2] for result in results]
     batch_size_sum = tf.to_float(tf.maximum(1, tf.reduce_sum(batch_sizes)))
     # creating the optimizer by passing it the sum of all batch sizes for weighting
     optimizer = create_optimizer(batch_size_sum)
@@ -608,8 +601,8 @@ def get_tower_results(model_feeder):
            (labels, decodings, distances, total_losses), \
            gradients, \
            batch_size, \
-           tf.reduce_mean(mean_edit_distances, 0) / batch_size_sum, \
-           tf.reduce_mean(avg_losses, 0) / batch_size_sum
+           tf.reduce_sum(mean_edit_distances, 0) / batch_size_sum, \
+           tf.reduce_sum(avg_losses, 0) / batch_size_sum
 
 def log_variable(variable, gradient=None):
     r'''
