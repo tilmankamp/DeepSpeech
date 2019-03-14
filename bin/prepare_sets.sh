@@ -4,6 +4,7 @@ data="${SHARED_DIR}/data"
 fis="${data}/LDC/fisher"
 swb="${data}/LDC/LDC97S62/swb"
 lbs="${data}/OpenSLR/LibriSpeech/librivox"
+cov="${data}/mozilla/CommonVoice/v2.0/en/clips"
 alphabet="${SRC_DIR}/data/alphabet.txt"
 noise_set="${data}/UPF/freesound-cc0/ds.csv"
 target_dir="${ML_GROUP_DIR}/ds/training/augmented"
@@ -104,12 +105,15 @@ process_set train \
     add "${swb}-train.csv" \
     add "${lbs}-train-clean-100.csv" \
     add "${lbs}-train-clean-360.csv" \
-    add "${lbs}-train-other-500.csv"
+    add "${lbs}-train-other-500.csv" \
+    add "${cov}/train.csv"
 
 process_set dev \
     add "${lbs}-dev-clean.csv" \
-    add "${lbs}-dev-other.csv"
+    add "${lbs}-dev-other.csv" \
+    add "${cov}/dev.csv"
 
 process_set test \
     add "${lbs}-test-clean.csv" \
-    add "${lbs}-test-other.csv"
+    add "${lbs}-test-other.csv" \
+    add "${cov}/test.csv"
