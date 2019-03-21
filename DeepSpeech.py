@@ -20,12 +20,10 @@ from six.moves import zip, range
 from tensorflow.python.tools import freeze_graph
 from util.audio import audiofile_to_input_vector
 from util.config import Config, initialize_globals
-from util.coordinator import TrainingCoordinator
 from util.feeding import DataSet, ModelFeeder
 from util.flags import create_flags, FLAGS
 from util.logging import log_info, log_error, log_debug, log_warn
 from util.preprocess import preprocess
-from util.text import Alphabet
 
 
 # Graph Creation
@@ -361,21 +359,12 @@ def send_token_to_ps(session, kill=False):
         log_debug('Sent %s token to ps %d.' % (kind, index))
 
 
-def train(server=None):
+def train():
     r'''
     Trains the network on a given server of a cluster.
     If no server provided, it performs single process training.
     '''
-
-    # Initializing and starting the training coordinator
-    coord = TrainingCoordinator(Config.is_chief)
-    coord.start()
-
-    # Create a variable to hold the global_step.
-    # It will automagically get incremented by the optimizer.
-    global_step = tf.Variable(0, trainable=False, name='global_step')
-
-    dropout_rates = [tf.placeholder(tf.float32, name='dropout_{}'.format(i)) for i in range(6)]
+    start_batch = 0
 
     # Reading training set
     train_data = preprocess(FLAGS.train_files.split(','),
@@ -388,7 +377,7 @@ def train(server=None):
     train_set = DataSet(train_data,
                         FLAGS.train_batch_size,
                         limit=FLAGS.limit_train,
-                        next_index=lambda i: coord.get_next_index('train'))
+                        next_index=lambda i: start_batch if i < 0 else i + 1)
 
     # Reading validation set
     dev_data = preprocess(FLAGS.dev_files.split(','),
@@ -400,8 +389,7 @@ def train(server=None):
 
     dev_set = DataSet(dev_data,
                       FLAGS.dev_batch_size,
-                      limit=FLAGS.limit_dev,
-                      next_index=lambda i: coord.get_next_index('dev'))
+                      limit=FLAGS.limit_dev)
 
     # Combining all sets to a multi set model feeder
     model_feeder = ModelFeeder(train_set,
@@ -411,77 +399,16 @@ def train(server=None):
                                Config.alphabet,
                                tower_feeder_count=len(Config.available_devices))
 
-    # Create the optimizer
-    optimizer = create_optimizer()
-
-    # Synchronous distributed training is facilitated by a special proxy-optimizer
-    if not server is None:
-        optimizer = tf.train.SyncReplicasOptimizer(optimizer,
-                                                   replicas_to_aggregate=FLAGS.replicas_to_agg,
-                                                   total_num_replicas=FLAGS.replicas)
-
-    # Get the data_set specific graph end-points
-    gradients, loss = get_tower_results(model_feeder, optimizer, dropout_rates)
-
-    # Average tower gradients across GPUs
-    avg_tower_gradients = average_gradients(gradients)
-
-    # Add summaries of all variables and gradients to log
-    log_grads_and_vars(avg_tower_gradients)
-
-    # Op to merge all summaries for the summary hook
-    merge_all_summaries_op = tf.summary.merge_all()
-
-    # These are saved on every step
-    step_summaries_op = tf.summary.merge_all('step_summaries')
-
-    step_summary_writers = {
-        'train': tf.summary.FileWriter(os.path.join(FLAGS.summary_dir, 'train'), max_queue=120),
-        'dev': tf.summary.FileWriter(os.path.join(FLAGS.summary_dir, 'dev'), max_queue=120)
+    # Dropout
+    dropout_rates = [tf.placeholder(tf.float32, name='dropout_{}'.format(i)) for i in range(6)]
+    dropout_feed_dict = {
+        dropout_rates[0]: FLAGS.dropout_rate,
+        dropout_rates[1]: FLAGS.dropout_rate2,
+        dropout_rates[2]: FLAGS.dropout_rate3,
+        dropout_rates[3]: FLAGS.dropout_rate4,
+        dropout_rates[4]: FLAGS.dropout_rate5,
+        dropout_rates[5]: FLAGS.dropout_rate6,
     }
-
-    # Apply gradients to modify the model
-    apply_gradient_op = optimizer.apply_gradients(avg_tower_gradients, global_step=global_step)
-
-
-    if FLAGS.early_stop is True and not FLAGS.validation_step > 0:
-        log_warn('Parameter --validation_step needs to be >0 for early stopping to work')
-
-    class CoordHook(tf.train.SessionRunHook):
-        r'''
-        Embedded coordination hook-class that will use variables of the
-        surrounding Python context.
-        '''
-        def after_create_session(self, session, coord):
-            log_debug('Starting queue runners...')
-            model_feeder.start_queue_threads(session, coord)
-            log_debug('Queue runners started.')
-
-        def end(self, session):
-            # Closing the data_set queues
-            log_debug('Closing queues...')
-            model_feeder.close_queues(session)
-            log_debug('Queues closed.')
-
-            # Telling the ps that we are done
-            send_token_to_ps(session)
-
-    # Collecting the hooks
-    hooks = [CoordHook()]
-
-    # Hook to handle initialization and queues for sync replicas.
-    if not server is None:
-        hooks.append(optimizer.make_session_run_hook(Config.is_chief))
-
-    # Hook to save TensorBoard summaries
-    if FLAGS.summary_secs > 0:
-        hooks.append(tf.train.SummarySaverHook(save_secs=FLAGS.summary_secs, output_dir=FLAGS.summary_dir, summary_op=merge_all_summaries_op))
-
-    # Hook wih number of checkpoint files to save in checkpoint_dir
-    if FLAGS.train and FLAGS.max_to_keep > 0:
-        saver = tf.train.Saver(max_to_keep=FLAGS.max_to_keep)
-        hooks.append(tf.train.CheckpointSaverHook(checkpoint_dir=FLAGS.checkpoint_dir, save_secs=FLAGS.checkpoint_secs, saver=saver))
-
     no_dropout_feed_dict = {
         dropout_rates[0]: 0.,
         dropout_rates[1]: 0.,
@@ -491,156 +418,116 @@ def train(server=None):
         dropout_rates[5]: 0.,
     }
 
-    # Progress Bar
-    def update_progressbar(set_name):
-        if not hasattr(update_progressbar, 'current_set_name'):
-            update_progressbar.current_set_name = None
+    # Building the graph
+    optimizer = create_optimizer()
+    gradients, loss = get_tower_results(model_feeder, optimizer, dropout_rates)
+    # Average tower gradients across GPUs
+    avg_tower_gradients = average_gradients(gradients)
+    log_grads_and_vars(avg_tower_gradients)
+    # global_step is automagically incremented by the optimizer
+    global_step = tf.Variable(0, trainable=False, name='global_step')
+    apply_gradient_op = optimizer.apply_gradients(avg_tower_gradients, global_step=global_step)
 
-        if (update_progressbar.current_set_name != set_name or
-            update_progressbar.current_job_index == update_progressbar.total_jobs):
+    # Summaries
+    step_summaries_op = tf.summary.merge_all('step_summaries')
+    step_summary_writers = {
+        'train': tf.summary.FileWriter(os.path.join(FLAGS.summary_dir, 'train'), max_queue=120),
+        'dev': tf.summary.FileWriter(os.path.join(FLAGS.summary_dir, 'dev'), max_queue=120)
+    }
 
-            # finish prev pbar if it exists
-            if hasattr(update_progressbar, 'pbar') and update_progressbar.pbar:
-                update_progressbar.pbar.finish()
+    # Checkpointing
+    epoch_saver = tf.train.Saver(max_to_keep=FLAGS.max_to_keep)
+    epoch_path = os.path.join(FLAGS.checkpoint_dir, 'epoch.ckpt')
+    best_dev_saver = tf.train.Saver(max_to_keep=1)
+    best_dev_path = os.path.join(FLAGS.checkpoint_dir, 'best_dev.ckpt')
+    initializer = tf.global_variables_initializer()
 
-            update_progressbar.total_jobs = None
-            update_progressbar.current_job_index = 0
-
-            current_epoch = coord._epoch-1
-
-            if set_name == "train":
-                log_info('Training epoch %i...' % current_epoch)
-                update_progressbar.total_jobs = coord._num_jobs_train
-            else:
-                log_info('Validating epoch %i...' % current_epoch)
-                update_progressbar.total_jobs = coord._num_jobs_dev
-
-            # recreate pbar
-            update_progressbar.pbar = progressbar.ProgressBar(max_value=update_progressbar.total_jobs,
-                                                              redirect_stdout=True).start()
-
-            update_progressbar.current_set_name = set_name
-
-        if update_progressbar.pbar:
-            update_progressbar.pbar.update(update_progressbar.current_job_index+1, force=True)
-
-        update_progressbar.current_job_index += 1
-
-    # Initialize update_progressbar()'s child fields to safe values
-    update_progressbar.pbar = None
-
-    # The MonitoredTrainingSession takes care of session initialization,
-    # restoring from a checkpoint, saving to a checkpoint, and closing when done
-    # or an error occurs.
-    try:
-        with tf.train.MonitoredTrainingSession(master='' if server is None else server.target,
-                                               is_chief=Config.is_chief,
-                                               hooks=hooks,
-                                               checkpoint_dir=FLAGS.checkpoint_dir,
-                                               save_checkpoint_secs=None, # already taken care of by a hook
-                                               log_step_count_steps=0, # disable logging of steps/s to avoid TF warning in validation sets
-                                               config=Config.session_config) as session:
-            tf.get_default_graph().finalize()
-
+    with tf.Session(config=Config.session_config) as session:
+        log_debug('Session opened.')
+        tf.get_default_graph().finalize()
+        try:
+            epoch_saver.restore(session, epoch_path)
+            log_info('Restored model from most recent checkpoint at %s' % epoch_path)
+        except:
             try:
-                if Config.is_chief:
-                    # Retrieving global_step from the (potentially restored) model
-                    model_feeder.set_data_set(no_dropout_feed_dict, model_feeder.train)
-                    step = session.run(global_step, feed_dict=no_dropout_feed_dict)
-                    coord.start_coordination(model_feeder, step)
+                best_dev_saver.restore(session, best_dev_path)
+                log_info('Restored model from best validation checkpoint at %s' % best_dev_path)
+            except:
+                log_info('Found no model to restore - initializing...')
+                session.run(initializer)
 
-                # Get the first job
-                job = coord.get_job()
+        # Retrieving global_step from restored model and setting training parameters accordingly
+        model_feeder.set_data_set(no_dropout_feed_dict, model_feeder.train)
+        step = session.run(global_step, feed_dict=no_dropout_feed_dict)
+        num_gpus = len(Config.available_devices)
+        steps_per_epoch = max(1, model_feeder.train.total_batches // num_gpus)
+        current_epoch = step // steps_per_epoch
+        start_batch = (step % steps_per_epoch) * num_gpus
+        target_epoch = current_epoch + abs(FLAGS.epoch) if FLAGS.epoch < 0 else FLAGS.epoch
 
-                while job and not session.should_stop():
-                    log_debug('Computing %s...' % job)
+        log_debug('step: %d' % step)
+        log_debug('epoch: %d' % current_epoch)
+        log_debug('target epoch: %d' % target_epoch)
+        log_debug('steps per epoch: %d' % steps_per_epoch)
+        log_debug('batches per step (GPUs): %d' % num_gpus)
+        log_debug('number of batches in train set: %d' % model_feeder.train.total_batches)
+        log_debug('number of batches already trained in first epoch: %d' % start_batch)
 
-                    is_train = job.set_name == 'train'
+        def run_set(set_name):
+            data_set = getattr(model_feeder, set_name)
+            is_train = set_name == 'train'
+            feed_dict = dropout_feed_dict if is_train else no_dropout_feed_dict
+            train_op = apply_gradient_op if is_train else []
+            model_feeder.set_data_set(feed_dict, data_set)
+            total_loss = 0.0
+            step_summary_writer = step_summary_writers.get(set_name)
+            num_steps = max(1, data_set.total_batches // num_gpus)
+            if FLAGS.show_progressbar:
+                pbar = progressbar.ProgressBar(max_value=num_steps,
+                                               redirect_stdout=True).start()
+            # Batch loop
+            for step_index in range(start_batch, num_steps):
+                _, current_step, batch_loss, step_summary = \
+                    session.run([train_op, global_step, loss, step_summaries_op],
+                                feed_dict=feed_dict)
+                total_loss += batch_loss
+                step_summary_writer.add_summary(step_summary, current_step)
+                if FLAGS.show_progressbar:
+                    pbar.update(step_index + 1, force=True)
+            if FLAGS.show_progressbar:
+                pbar.finish()
+            return total_loss / num_steps
 
-                    # The feed_dict (mainly for switching between queues)
-                    if is_train:
-                        feed_dict = {
-                            dropout_rates[0]: FLAGS.dropout_rate,
-                            dropout_rates[1]: FLAGS.dropout_rate2,
-                            dropout_rates[2]: FLAGS.dropout_rate3,
-                            dropout_rates[3]: FLAGS.dropout_rate4,
-                            dropout_rates[4]: FLAGS.dropout_rate5,
-                            dropout_rates[5]: FLAGS.dropout_rate6,
-                        }
-                    else:
-                        feed_dict = no_dropout_feed_dict
-
-                    # Sets the current data_set for the respective placeholder in feed_dict
-                    model_feeder.set_data_set(feed_dict, getattr(model_feeder, job.set_name))
-
-                    # Initialize loss aggregator
-                    total_loss = 0.0
-
-                    # Setting the training operation in case of training requested
-                    train_op = apply_gradient_op if is_train else []
-
-                    # So far the only extra parameter is the feed_dict
-                    extra_params = { 'feed_dict': feed_dict }
-
-                    step_summary_writer = step_summary_writers.get(job.set_name)
-
-                    # Loop over the batches
-                    for job_step in range(job.steps):
-                        if session.should_stop():
-                            break
-
-                        log_debug('Starting batch...')
-                        # Compute the batch
-                        _, current_step, batch_loss, step_summary = session.run([train_op, global_step, loss, step_summaries_op], **extra_params)
-
-                        # Log step summaries
-                        step_summary_writer.add_summary(step_summary, current_step)
-
-                        # Uncomment the next line for debugging race conditions / distributed TF
-                        log_debug('Finished batch step %d.' % current_step)
-
-                        # Add batch to loss
-                        total_loss += batch_loss
-
-                    # Gathering job results
-                    job.loss = total_loss / job.steps
-
-                    # Display progressbar
-                    if FLAGS.show_progressbar:
-                        update_progressbar(job.set_name)
-
-                    # Send the current job to coordinator and receive the next one
-                    log_debug('Sending %s...' % job)
-                    job = coord.next_job(job)
-
-                if update_progressbar.pbar:
-                    update_progressbar.pbar.finish()
-
-            except Exception as e:
-                log_error(str(e))
-                traceback.print_exc()
-                # Calling all hook's end() methods to end blocking calls
-                for hook in hooks:
-                    hook.end(session)
-                # Only chief has a SyncReplicasOptimizer queue runner that needs to be stopped for unblocking process exit.
-                # A rather graceful way to do this is by stopping the ps.
-                # Only one party can send it w/o failing.
-                if Config.is_chief:
-                    send_token_to_ps(session, kill=True)
-                sys.exit(1)
-
-        log_debug('Session closed.')
-
-    except tf.errors.InvalidArgumentError as e:
-        log_error(str(e))
-        log_error('The checkpoint in {0} does not match the shapes of the model.'
-                  ' Did you change alphabet.txt or the --n_hidden parameter'
-                  ' between train runs using the same checkpoint dir? Try moving'
-                  ' or removing the contents of {0}.'.format(FLAGS.checkpoint_dir))
-        sys.exit(1)
-
-    # Stopping the coordinator
-    coord.stop()
+        if target_epoch > current_epoch:
+            best_loss_dev = float('inf')
+            log_info('STARTING Optimization')
+            log_debug('Starting queue runners...')
+            coord = tf.train.Coordinator()
+            model_feeder.start_queue_threads(session, coord=coord)
+            log_debug('Queue runners started.')
+            # Epoch loop
+            for current_epoch in range(current_epoch, target_epoch):
+                # Training
+                log_info('Training epoch %d ...' % current_epoch)
+                loss_train = run_set('train')
+                log_info('Finished training epoch %d - loss: %f' % (current_epoch, loss_train))
+                start_batch = 0
+                save_path = epoch_saver.save(session, epoch_path)
+                log_info("Saved model to: %s" % save_path)
+                # Validation
+                log_info('Validating epoch %d ...' % current_epoch)
+                loss_dev = run_set('dev')
+                log_info('Finished validating epoch %d - loss: %f' % (current_epoch, loss_dev))
+                if loss_dev < best_loss_dev:
+                    best_loss_dev = loss_dev
+                    save_path = best_dev_saver.save(session, best_dev_path)
+                    log_info("Saved new best validating model to: %s" % save_path)
+            log_debug('Closing queues...')
+            model_feeder.close_queues(session)
+            log_debug('Queues closed.')
+        else:
+            log_info('Target epoch already reached - skipped training.')
+    log_debug('Session closed.')
 
 
 def test():
@@ -878,53 +765,17 @@ def do_single_file_inference(input_file_path):
 def main(_):
     initialize_globals()
 
-    if FLAGS.train or FLAGS.test:
-        if len(FLAGS.worker_hosts) == 0:
-            # Only one local task: this process (default case - no cluster)
-            with tf.Graph().as_default():
-                tf.set_random_seed(FLAGS.random_seed)
-                train()
-            # Now do a final test epoch
-            if FLAGS.test:
-                with tf.Graph().as_default():
-                    test()
-            log_debug('Done.')
-        else:
-            # Create and start a server for the local task.
-            server = tf.train.Server(Config.cluster, job_name=FLAGS.job_name, task_index=FLAGS.task_index)
-            if FLAGS.job_name == 'ps':
-                # We are a parameter server and therefore we just wait for all workers to finish
-                # by waiting for their stop tokens.
-                with tf.Session(server.target) as session:
-                    for worker in FLAGS.worker_hosts:
-                        log_debug('Waiting for stop token...')
-                        token = session.run(Config.done_dequeues[FLAGS.task_index])
-                        if token < 0:
-                            log_debug('Got a kill switch token from worker %i.' % abs(token + 1))
-                            break
-                        log_debug('Got a stop token from worker %i.' % token)
-                log_debug('Session closed.')
+    if FLAGS.train:
+        with tf.Graph().as_default():
+            tf.set_random_seed(FLAGS.random_seed)
+            train()
 
-                if FLAGS.test:
-                    test()
-            elif FLAGS.job_name == 'worker':
-                # We are a worker and therefore we have to do some work.
-                # Assigns ops to the local worker by default.
-                with tf.device(tf.train.replica_device_setter(
-                               worker_device=Config.worker_device,
-                               cluster=Config.cluster)):
+    if FLAGS.test:
+        with tf.Graph().as_default():
+            test()
 
-                    # Do the training
-                    train(server)
-
-            log_debug('Server stopped.')
-
-    # Are we the main process?
-    if Config.is_chief:
-        # Doing solo/post-processing work just on the main process...
-        # Exporting the model
-        if FLAGS.export_dir:
-            export()
+    if FLAGS.export_dir:
+        export()
 
     if len(FLAGS.one_shot_infer):
         do_single_file_inference(FLAGS.one_shot_infer)
