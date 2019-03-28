@@ -13,7 +13,6 @@ import numpy as np
 import progressbar
 import shutil
 import tensorflow as tf
-import traceback
 
 from ds_ctcdecoder import ctc_beam_search_decoder, Scorer
 from six.moves import zip, range
@@ -29,19 +28,14 @@ from util.preprocess import preprocess
 # Graph Creation
 # ==============
 
-def variable_on_worker_level(name, shape, initializer):
-    r'''
+def variable_on_cpu(name, shape, initializer):
+    r"""
     Next we concern ourselves with graph creation.
-    However, before we do so we must introduce a utility function ``variable_on_worker_level()``
+    However, before we do so we must introduce a utility function ``variable_on_cpu()``
     used to create a variable in CPU memory.
-    '''
-    # Use the /cpu:0 device on worker_device for scoped operations
-    if len(FLAGS.ps_hosts) == 0:
-        device = Config.worker_device
-    else:
-        device = tf.train.replica_device_setter(worker_device=Config.worker_device, cluster=Config.cluster)
-
-    with tf.device(device):
+    """
+    # Use the /cpu:0 device for scoped operations
+    with tf.device(Config.cpu_device):
         # Create or get apropos variable
         var = tf.get_variable(name=name, shape=shape, initializer=initializer)
     return var
@@ -80,22 +74,22 @@ def BiRNN(batch_x, seq_length, dropout, reuse=False, batch_size=None, n_steps=-1
     # clipped RELU activation and dropout.
 
     # 1st layer
-    b1 = variable_on_worker_level('b1', [Config.n_hidden_1], tf.zeros_initializer())
-    h1 = variable_on_worker_level('h1', [Config.n_input + 2*Config.n_input*Config.n_context, Config.n_hidden_1], tf.contrib.layers.xavier_initializer())
+    b1 = variable_on_cpu('b1', [Config.n_hidden_1], tf.zeros_initializer())
+    h1 = variable_on_cpu('h1', [Config.n_input + 2*Config.n_input*Config.n_context, Config.n_hidden_1], tf.contrib.layers.xavier_initializer())
     layer_1 = tf.minimum(tf.nn.relu(tf.add(tf.matmul(batch_x, h1), b1)), FLAGS.relu_clip)
     layer_1 = tf.nn.dropout(layer_1, rate=dropout[0])
     layers['layer_1'] = layer_1
 
     # 2nd layer
-    b2 = variable_on_worker_level('b2', [Config.n_hidden_2], tf.zeros_initializer())
-    h2 = variable_on_worker_level('h2', [Config.n_hidden_1, Config.n_hidden_2], tf.contrib.layers.xavier_initializer())
+    b2 = variable_on_cpu('b2', [Config.n_hidden_2], tf.zeros_initializer())
+    h2 = variable_on_cpu('h2', [Config.n_hidden_1, Config.n_hidden_2], tf.contrib.layers.xavier_initializer())
     layer_2 = tf.minimum(tf.nn.relu(tf.add(tf.matmul(layer_1, h2), b2)), FLAGS.relu_clip)
     layer_2 = tf.nn.dropout(layer_2, rate=dropout[1])
     layers['layer_2'] = layer_2
 
     # 3rd layer
-    b3 = variable_on_worker_level('b3', [Config.n_hidden_3], tf.zeros_initializer())
-    h3 = variable_on_worker_level('h3', [Config.n_hidden_2, Config.n_hidden_3], tf.contrib.layers.xavier_initializer())
+    b3 = variable_on_cpu('b3', [Config.n_hidden_3], tf.zeros_initializer())
+    h3 = variable_on_cpu('h3', [Config.n_hidden_2, Config.n_hidden_3], tf.contrib.layers.xavier_initializer())
     layer_3 = tf.minimum(tf.nn.relu(tf.add(tf.matmul(layer_2, h3), b3)), FLAGS.relu_clip)
     layer_3 = tf.nn.dropout(layer_3, rate=dropout[2])
     layers['layer_3'] = layer_3
@@ -138,16 +132,16 @@ def BiRNN(batch_x, seq_length, dropout, reuse=False, batch_size=None, n_steps=-1
     layers['rnn_output_state'] = output_state
 
     # Now we feed `output` to the fifth hidden layer with clipped RELU activation and dropout
-    b5 = variable_on_worker_level('b5', [Config.n_hidden_5], tf.zeros_initializer())
-    h5 = variable_on_worker_level('h5', [Config.n_cell_dim, Config.n_hidden_5], tf.contrib.layers.xavier_initializer())
+    b5 = variable_on_cpu('b5', [Config.n_hidden_5], tf.zeros_initializer())
+    h5 = variable_on_cpu('h5', [Config.n_cell_dim, Config.n_hidden_5], tf.contrib.layers.xavier_initializer())
     layer_5 = tf.minimum(tf.nn.relu(tf.add(tf.matmul(output, h5), b5)), FLAGS.relu_clip)
     layer_5 = tf.nn.dropout(layer_5, rate=dropout[5])
     layers['layer_5'] = layer_5
 
     # Now we apply the weight matrix `h6` and bias `b6` to the output of `layer_5`
     # creating `n_classes` dimensional vectors, the logits.
-    b6 = variable_on_worker_level('b6', [Config.n_hidden_6], tf.zeros_initializer())
-    h6 = variable_on_worker_level('h6', [Config.n_hidden_5, Config.n_hidden_6], tf.contrib.layers.xavier_initializer())
+    b6 = variable_on_cpu('b6', [Config.n_hidden_6], tf.zeros_initializer())
+    h6 = variable_on_cpu('h6', [Config.n_hidden_5, Config.n_hidden_6], tf.contrib.layers.xavier_initializer())
     layer_6 = tf.add(tf.matmul(layer_5, h6), b6)
     layers['layer_6'] = layer_6
 
@@ -242,10 +236,7 @@ def get_tower_results(model_feeder, optimizer, dropout_rates):
         # Loop over available_devices
         for i in range(len(Config.available_devices)):
             # Execute operations of tower i on device i
-            if len(FLAGS.ps_hosts) == 0:
-                device = Config.available_devices[i]
-            else:
-                device = tf.train.replica_device_setter(worker_device=Config.available_devices[i], cluster=Config.cluster)
+            device = Config.available_devices[i]
             with tf.device(device):
                 # Create a scope for all operations of tower i
                 with tf.name_scope('tower_%d' % i) as scope:
@@ -348,15 +339,30 @@ def log_grads_and_vars(grads_and_vars):
 # Helpers
 # =======
 
-def send_token_to_ps(session, kill=False):
-    # Sending our token (the task_index as a debug opportunity) to each parameter server.
-    # kill switch tokens are negative and decremented by 1 to deal with task_index 0
-    token = -FLAGS.task_index-1 if kill else FLAGS.task_index
-    kind = 'kill switch' if kill else 'stop'
-    for index, enqueue in enumerate(Config.done_enqueues):
-        log_debug('Sending %s token to ps %d...' % (kind, index))
-        session.run(enqueue, feed_dict={ Config.token_placeholder: token })
-        log_debug('Sent %s token to ps %d.' % (kind, index))
+
+class SampleIndex:
+    def __init__(self, index=0):
+        self.index = index
+
+    def inc(self, old_index):
+        self.index += 1
+        return self.index
+
+
+def try_loading(session, saver, checkpoint_path, caption):
+    try:
+        saver.restore(session, checkpoint_path)
+        log_info('Restored model from %s checkpoint at %s' % (caption, checkpoint_path))
+        return True
+    except tf.errors.InvalidArgumentError as e:
+        log_error(str(e))
+        log_error('The checkpoint in {0} does not match the shapes of the model.'
+                  ' Did you change alphabet.txt or the --n_hidden parameter'
+                  ' between train runs using the same checkpoint dir? Try moving'
+                  ' or removing the contents of {0}.'.format(checkpoint_path))
+        sys.exit(1)
+    except:
+        return False
 
 
 def train():
@@ -364,9 +370,10 @@ def train():
     Trains the network on a given server of a cluster.
     If no server provided, it performs single process training.
     '''
-    start_batch = 0
 
     # Reading training set
+    train_index = SampleIndex()
+
     train_data = preprocess(FLAGS.train_files.split(','),
                             FLAGS.train_batch_size,
                             Config.n_input,
@@ -377,9 +384,11 @@ def train():
     train_set = DataSet(train_data,
                         FLAGS.train_batch_size,
                         limit=FLAGS.limit_train,
-                        next_index=lambda i: start_batch if i < 0 else i + 1)
+                        next_index=train_index.inc)
 
     # Reading validation set
+    dev_index = SampleIndex()
+
     dev_data = preprocess(FLAGS.dev_files.split(','),
                           FLAGS.dev_batch_size,
                           Config.n_input,
@@ -389,7 +398,8 @@ def train():
 
     dev_set = DataSet(dev_data,
                       FLAGS.dev_batch_size,
-                      limit=FLAGS.limit_dev)
+                      limit=FLAGS.limit_dev,
+                      next_index=dev_index.inc)
 
     # Combining all sets to a multi set model feeder
     model_feeder = ModelFeeder(train_set,
@@ -445,16 +455,21 @@ def train():
     with tf.Session(config=Config.session_config) as session:
         log_debug('Session opened.')
         tf.get_default_graph().finalize()
-        try:
-            epoch_saver.restore(session, epoch_path)
-            log_info('Restored model from most recent checkpoint at %s' % epoch_path)
-        except:
-            try:
-                best_dev_saver.restore(session, best_dev_path)
-                log_info('Restored model from best validation checkpoint at %s' % best_dev_path)
-            except:
-                log_info('Found no model to restore - initializing...')
+
+        # Loading or initializing
+        loaded = False
+        if FLAGS.load in ['auto', 'last']:
+            loaded = try_loading(session, epoch_saver, epoch_path, 'most recent epoch')
+        if not loaded and FLAGS.load in ['auto', 'best']:
+            loaded = try_loading(session, best_dev_saver, best_dev_path, 'best validation')
+        if not loaded:
+            if FLAGS.load in ['auto', 'init']:
+                log_info('Initializing...')
                 session.run(initializer)
+            else:
+                log_error('Unable to load %s model from specified checkpoint dir'
+                          ' - consider using load option "auto" or "init".' % FLAGS.load)
+                sys.exit(1)
 
         # Retrieving global_step from restored model and setting training parameters accordingly
         model_feeder.set_data_set(no_dropout_feed_dict, model_feeder.train)
@@ -462,7 +477,6 @@ def train():
         num_gpus = len(Config.available_devices)
         steps_per_epoch = max(1, model_feeder.train.total_batches // num_gpus)
         current_epoch = step // steps_per_epoch
-        start_batch = (step % steps_per_epoch) * num_gpus
         target_epoch = current_epoch + abs(FLAGS.epoch) if FLAGS.epoch < 0 else FLAGS.epoch
 
         log_debug('step: %d' % step)
@@ -471,13 +485,12 @@ def train():
         log_debug('steps per epoch: %d' % steps_per_epoch)
         log_debug('batches per step (GPUs): %d' % num_gpus)
         log_debug('number of batches in train set: %d' % model_feeder.train.total_batches)
-        log_debug('number of batches already trained in first epoch: %d' % start_batch)
 
         def run_set(set_name):
             data_set = getattr(model_feeder, set_name)
             is_train = set_name == 'train'
-            feed_dict = dropout_feed_dict if is_train else no_dropout_feed_dict
             train_op = apply_gradient_op if is_train else []
+            feed_dict = dropout_feed_dict if is_train else no_dropout_feed_dict
             model_feeder.set_data_set(feed_dict, data_set)
             total_loss = 0.0
             step_summary_writer = step_summary_writers.get(set_name)
@@ -486,7 +499,9 @@ def train():
                 pbar = progressbar.ProgressBar(max_value=num_steps,
                                                redirect_stdout=True).start()
             # Batch loop
-            for step_index in range(start_batch, num_steps):
+            for step_index in range(num_steps):
+                if coord.should_stop():
+                    break
                 _, current_step, batch_loss, step_summary = \
                     session.run([train_op, global_step, loss, step_summaries_op],
                                 feed_dict=feed_dict)
@@ -499,32 +514,51 @@ def train():
             return total_loss / num_steps
 
         if target_epoch > current_epoch:
-            best_loss_dev = float('inf')
             log_info('STARTING Optimization')
-            log_debug('Starting queue runners...')
+            best_dev_loss = float('inf')
+            dev_losses = []
             coord = tf.train.Coordinator()
-            model_feeder.start_queue_threads(session, coord=coord)
-            log_debug('Queue runners started.')
-            # Epoch loop
-            for current_epoch in range(current_epoch, target_epoch):
-                # Training
-                log_info('Training epoch %d ...' % current_epoch)
-                loss_train = run_set('train')
-                log_info('Finished training epoch %d - loss: %f' % (current_epoch, loss_train))
-                start_batch = 0
-                save_path = epoch_saver.save(session, epoch_path)
-                log_info("Saved model to: %s" % save_path)
-                # Validation
-                log_info('Validating epoch %d ...' % current_epoch)
-                loss_dev = run_set('dev')
-                log_info('Finished validating epoch %d - loss: %f' % (current_epoch, loss_dev))
-                if loss_dev < best_loss_dev:
-                    best_loss_dev = loss_dev
-                    save_path = best_dev_saver.save(session, best_dev_path)
-                    log_info("Saved new best validating model to: %s" % save_path)
-            log_debug('Closing queues...')
-            model_feeder.close_queues(session)
-            log_debug('Queues closed.')
+            with coord.stop_on_exception():
+                log_debug('Starting queue runners...')
+                model_feeder.start_queue_threads(session, coord=coord)
+                log_debug('Queue runners started.')
+                # Epoch loop
+                for current_epoch in range(current_epoch, target_epoch):
+                    # Training
+                    if coord.should_stop():
+                        break
+                    log_info('Training epoch %d ...' % current_epoch)
+                    train_loss = run_set('train')
+                    log_info('Finished training epoch %d - loss: %f' % (current_epoch, train_loss))
+                    save_path = epoch_saver.save(session, epoch_path)
+                    log_info("Saved model to: %s" % save_path)
+                    # Validation
+                    log_info('Validating epoch %d ...' % current_epoch)
+                    dev_loss = run_set('dev')
+                    dev_losses.append(dev_loss)
+                    log_info('Finished validating epoch %d - loss: %f' % (current_epoch, dev_loss))
+                    if dev_loss < best_dev_loss:
+                        best_dev_loss = dev_loss
+                        save_path = best_dev_saver.save(session, best_dev_path)
+                        log_info("Saved new best validating model to: %s" % save_path)
+                    # Early stopping
+                    if FLAGS.early_stop and len(dev_losses) >= FLAGS.es_steps:
+                        mean_loss = np.mean(dev_losses[-FLAGS.es_steps:-1])
+                        std_loss = np.std(dev_losses[-FLAGS.es_steps:-1])
+                        dev_losses = dev_losses[-FLAGS.es_steps:]
+                        log_debug('Checking for early stopping (last %d steps) validation loss: '
+                                  '%f, with standard deviation: %f and mean: %f' %
+                                  (FLAGS.es_steps, dev_losses[-1], std_loss, mean_loss))
+                        if dev_losses[-1] > np.max(dev_losses[:-1]) or \
+                           (abs(dev_losses[-1] - mean_loss) < FLAGS.es_mean_th and std_loss < FLAGS.es_std_th):
+                            log_info('Early stop triggered as (for last %d steps) validation loss:'
+                                     ' %f with standard deviation: %f and mean: %f' %
+                                     (FLAGS.es_steps, dev_losses[-1], std_loss, mean_loss))
+                            break
+                log_debug('Closing queues...')
+                coord.request_stop()
+                model_feeder.close_queues(session)
+                log_debug('Queues closed.')
         else:
             log_info('Target epoch already reached - skipped training.')
     log_debug('Session closed.')
@@ -554,8 +588,8 @@ def create_inference_graph(batch_size=1, n_steps=16, tflite=False):
         previous_state = previous_state_c = previous_state_h = None
     else:
         if not tflite:
-            previous_state_c = variable_on_worker_level('previous_state_c', [batch_size, Config.n_cell_dim], initializer=None)
-            previous_state_h = variable_on_worker_level('previous_state_h', [batch_size, Config.n_cell_dim], initializer=None)
+            previous_state_c = variable_on_cpu('previous_state_c', [batch_size, Config.n_cell_dim], initializer=None)
+            previous_state_h = variable_on_cpu('previous_state_h', [batch_size, Config.n_cell_dim], initializer=None)
         else:
             previous_state_c = tf.placeholder(tf.float32, [batch_size, Config.n_cell_dim], name='previous_state_c')
             previous_state_h = tf.placeholder(tf.float32, [batch_size, Config.n_cell_dim], name='previous_state_h')
