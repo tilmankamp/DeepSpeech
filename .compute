@@ -14,15 +14,12 @@ pip install $(python3 util/taskcluster.py --decoder)
 
 mkdir -p ../keep/summaries
 
-data="${SHARED_DIR}/data"
-fis="${data}/LDC/fisher"
-swb="${data}/LDC/LDC97S62/swb"
-lbs="${data}/OpenSLR/LibriSpeech/librivox"
+data="${ML_GROUP_DIR}/ds/training/augmented"
 
 python -u DeepSpeech.py \
-  --train_files "${fis}-train.csv","${swb}-train.csv","${lbs}-train-clean-100.csv","${lbs}-train-clean-360.csv","${lbs}-train-other-500.csv" \
-  --dev_files "${lbs}-dev-clean.csv"\
-  --test_files "${lbs}-test-clean.csv" \
+  --train_cached_features_path "${data}/ds_train_clean.hdf5" \
+  --dev_cached_features_path "${data}/ds_dev_clean.hdf5" \
+  --test_cached_features_path "${data}/ds_test_clean.hdf5" \
   --train_batch_size 24 \
   --dev_batch_size 48 \
   --test_batch_size 48 \
