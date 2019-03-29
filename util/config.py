@@ -30,7 +30,7 @@ def initialize_globals():
     c.cpu_device = '/cpu:0'
 
     # Available GPU devices
-    c.available_devices = [gpu for gpu in get_available_gpus()]
+    c.available_devices = get_available_gpus()
 
     # If there is no GPU available, we fall back to CPU based operation
     if 0 == len(c.available_devices):
