@@ -22,7 +22,7 @@ python -u DeepSpeech.py --noshow_progressbar \
   --lm_binary_path 'data/smoke_test/vocab.pruned.lm' \
   --lm_trie_path 'data/smoke_test/vocab.trie' | tee /tmp/resume.log
 
-if ! grep "Training of Epoch $epoch_count" /tmp/resume.log; then
+if ! grep "Training epoch $epoch_count" /tmp/resume.log; then
   echo "Did not resume training from checkpoint"
   exit 1
 else
