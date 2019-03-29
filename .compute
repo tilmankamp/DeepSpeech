@@ -26,6 +26,6 @@ python -u DeepSpeech.py \
   --n_hidden 2048 \
   --learning_rate 0.0001 \
   --dropout_rate 0.2 \
-  --epoch 13 \
+  --epoch 20 \
   --checkpoint_dir "../keep" \
   --summary_dir "../keep/summaries"
