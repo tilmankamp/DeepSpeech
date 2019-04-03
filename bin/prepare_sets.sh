@@ -6,7 +6,7 @@ swb="${data}/LDC/LDC97S62/swb"
 lbs="${data}/OpenSLR/LibriSpeech/librivox"
 cov="${data}/mozilla/CommonVoice/v2.0/en/clips"
 alphabet="${SRC_DIR}/data/alphabet.txt"
-noise_set="${data}/UPF/freesound-cc0/ds.csv"
+noise="${data}/UPF/freesound-cc0/"
 target_dir="${ML_GROUP_DIR}/ds/training/augmented"
 
 mkdir -p "${target_dir}"
@@ -27,13 +27,6 @@ process_lot() {
     else
         print_head "Generating ${target_lot} version of ${target_set} set..."
         vocoto "$@" write "${target_prefix}"
-        rm -f "${target_prefix}.hdf5"
-    fi
-    if [ -f "${target_prefix}.hdf5" ]; then
-        print_head "Skipping MFCC DB generation for ${target_lot} version of ${target_set} set (${target_prefix}.hdf5 already exists)."
-    else
-        print_head "Generating MFCC DB for ${target_lot} version of ${target_set} set..."
-        vocoto add "${target_prefix}.csv" hdf5 "${alphabet}" "${target_prefix}.hdf5"
     fi
 }
 
@@ -47,7 +40,7 @@ process_set() {
     shift
     process_lot noise1 \
         "${target_set}" \
-        add "${noise_set}" $LIMIT stash noise \
+        add "${noise}${target_set}.csv" $LIMIT stash noise \
         add "${clean_set}" shuffle $LIMIT stash crosstalk \
         "$@" $LIMIT \
         shuffle \
@@ -74,7 +67,7 @@ process_set() {
 
     process_lot noise2 \
         "${target_set}" \
-        add "${noise_set}" $LIMIT stash noise \
+        add "${noise}${target_set}.csv" $LIMIT stash noise \
         add "${clean_set}" shuffle $LIMIT stash crosstalk \
         "$@" $LIMIT \
         shuffle \
