@@ -14,21 +14,33 @@ pip install $(python3 util/taskcluster.py --decoder)
 
 mkdir -p ../keep/summaries
 
-data="${SHARED_DIR}/data"
-fis="${data}/LDC/fisher"
-swb="${data}/LDC/LDC97S62/swb"
-lbs="${data}/OpenSLR/LibriSpeech/librivox"
+data="${ML_GROUP_DIR}/ds/training/augmented"
 
-python -u DeepSpeech.py \
-  --train_files "${fis}-train.csv","${swb}-train.csv","${lbs}-train-clean-100.csv","${lbs}-train-clean-360.csv","${lbs}-train-other-500.csv" \
-  --dev_files "${lbs}-dev-clean.csv"\
-  --test_files "${lbs}-test-clean.csv" \
-  --train_batch_size 24 \
-  --dev_batch_size 48 \
-  --test_batch_size 48 \
-  --n_hidden 2048 \
-  --learning_rate 0.0001 \
-  --dropout_rate 0.2 \
-  --epoch 13 \
-  --checkpoint_dir "../keep" \
-  --summary_dir "../keep/summaries"
+training_phase() {
+    augmentation="$1"; shift
+    python -u DeepSpeech.py \
+        --load auto \
+        --train_files "${data}/ds_train_${augmentation}.csv" \
+        --train_cached_features_path "${data}/ds_train_${augmentation}.hdf5" \
+        --train_batch_size 24 \
+        --dev_files "${data}/ds_dev_${augmentation}.csv" \
+        --dev_cached_features_path "${data}/ds_dev_${augmentation}.hdf5" \
+        --dev_batch_size 48 \
+        --test_files "${data}/ds_test_${augmentation}.csv" \
+        --test_cached_features_path "${data}/ds_test_${augmentation}.hdf5" \
+        --test_batch_size 48 \
+        --learning_rate 0.0001 \
+        --dropout_rate 0.15 \
+        --epochs 50 \
+        --max_to_keep 1 \
+        --checkpoint_dir "../keep" \
+        --summary_dir "../keep/summaries" \
+        "$@"
+    phase_dir="../keep/best_${augmentation}"
+    mkdir -p "${phase_dir}"
+    cp ../keep/best_dev* "${phase_dir}"
+}
+
+training_phase clean
+training_phase noise1 --load best
+training_phase noise2 --load best
