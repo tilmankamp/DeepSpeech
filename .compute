@@ -17,17 +17,17 @@ mkdir -p ../keep/summaries
 data="${ML_GROUP_DIR}/ds/training/augmented"
 
 training_phase() {
-    augmentation="$1"; shift
+    aug="$1"; shift
     python -u DeepSpeech.py \
         --load auto \
-        --train_files "${data}/ds_train_${augmentation}.csv" \
-        --train_cached_features_path "${data}/ds_train_${augmentation}.hdf5" \
+        --train_files "${data}/ds_train_${aug}.csv" \
+        --train_cached_features_path "${data}/ds_train_${aug}.bundle" \
         --train_batch_size 24 \
-        --dev_files "${data}/ds_dev_${augmentation}.csv" \
-        --dev_cached_features_path "${data}/ds_dev_${augmentation}.hdf5" \
+        --dev_files "${data}/ds_dev_${aug}.csv" \
+        --dev_cached_features_path "${data}/ds_dev_${aug}.bundle" \
         --dev_batch_size 48 \
-        --test_files "${data}/ds_test_${augmentation}.csv" \
-        --test_cached_features_path "${data}/ds_test_${augmentation}.hdf5" \
+        --test_files "${data}/ds_test_${aug}.csv" \
+        --test_cached_features_path "${data}/ds_test_${aug}.bundle" \
         --test_batch_size 48 \
         --learning_rate 0.0001 \
         --dropout_rate 0.15 \
@@ -36,7 +36,7 @@ training_phase() {
         --checkpoint_dir "../keep" \
         --summary_dir "../keep/summaries" \
         "$@"
-    phase_dir="../keep/best_${augmentation}"
+    phase_dir="../keep/best_${aug}"
     mkdir -p "${phase_dir}"
     cp ../keep/best_dev* "${phase_dir}"
 }
