@@ -19,6 +19,7 @@ data="${ML_GROUP_DIR}/ds/training/augmented"
 training_phase() {
     aug="$1"; shift
     python -u DeepSpeech.py \
+        --noshow_progressbar \
         --load auto \
         --train_files "${data}/ds_train_${aug}.csv" \
         --train_cached_features_path "${data}/ds_train_${aug}.bundle" \
