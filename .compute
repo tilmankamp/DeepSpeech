@@ -22,14 +22,10 @@ training_phase() {
         --noshow_progressbar \
         --load auto \
         --train_files "${data}/ds_train_${aug}.csv" \
-        --train_cached_features_path "${data}/ds_train_${aug}.bundle" \
         --train_batch_size 24 \
+        --features_cache "${data}/ds_train_${aug}.bundle" \
         --dev_files "${data}/ds_dev_${aug}.csv" \
-        --dev_cached_features_path "${data}/ds_dev_${aug}.bundle" \
         --dev_batch_size 48 \
-        --test_files "${data}/ds_test_${aug}.csv" \
-        --test_cached_features_path "${data}/ds_test_${aug}.bundle" \
-        --test_batch_size 48 \
         --learning_rate 0.0001 \
         --dropout_rate 0.15 \
         --epochs 50 \
@@ -42,6 +38,32 @@ training_phase() {
     cp ../keep/best_dev* "${phase_dir}"
 }
 
+test_phase() {
+    phase="$1"; shift
+    set_name="$1"; shift
+    set_path="$1"; shift
+    echo ""
+    echo "================ Testing ${set_name} set on ${phase} model ================"
+    echo ""
+    python -u evaluate.py \
+        --checkpoint_dir "../keep/best_${phase}" \
+        --load best \
+        --test_files "${set_path}" \
+        --test_batch_size 48 \
+        --test_output_file "../keep/results_${set_name}_set_on_${phase}_model.json"
+}
+
+test_set() {
+    test_phase clean  "$@"
+    test_phase noise1 "$@"
+    test_phase noise2 "$@"
+}
+
 training_phase clean
 training_phase noise1 --load best
 training_phase noise2 --load best
+
+test_set clean  "${data}/ds_test_clean.csv"
+test_set noise1 "${data}/ds_test_noise1.csv"
+test_set noise2 "${data}/ds_test_noise2.csv"
+test_set lbvcln "${SHARED_DIR}/data/OpenSLR/LibriSpeech/librivox-test-clean.csv"
