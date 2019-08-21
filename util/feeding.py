@@ -14,6 +14,7 @@ from tensorflow.contrib.framework.python.ops import audio_ops as contrib_audio
 
 from util.config import Config
 from util.text import text_to_char_array
+from util.vad_split import vad_segment_generator
 
 
 def read_csvs(csv_files):
@@ -99,6 +100,41 @@ def create_dataset(csvs, batch_size, cache_path=''):
                               .prefetch(num_gpus))
 
     return dataset
+
+
+def split_to_dataset(wav_file, batch_size=1, aggressiveness=3, cache_path=''):
+
+    def generate_values():
+        segments, sample_rate, audio_length = vad_segment_generator(wav_file, aggressiveness)
+        for segment in segments:
+            segment_buffer, time_start, time_end = segment
+            samples = np.frombuffer(segment_buffer, dtype=np.int16)
+            multiplier = 1.0 / (1 << 15)
+            samples = samples * multiplier
+            samples = np.expand_dims(samples, axis=1)
+            yield time_start, time_end, samples, sample_rate
+
+    def to_mfccs(time_start, time_end, samples, sample_rate):
+        features, features_len = samples_to_mfccs(samples, sample_rate)
+        return time_start, time_end, features, features_len
+
+    def batch_fn(time_start, time_end, features, features_len):
+        features = tf.data.Dataset.zip((features, features_len))
+        features = features.padded_batch(batch_size, padded_shapes=([None, Config.n_input], []))
+        return tf.data.Dataset.zip((time_start, time_end, features))
+
+    num_gpus = len(Config.available_devices)
+
+    dataset = (tf.data.Dataset.from_generator(generate_values,
+                                              output_types=(tf.int32, tf.int32, tf.float32, tf.int32))
+                              .map(to_mfccs, num_parallel_calls=tf.data.experimental.AUTOTUNE)
+                              .cache(cache_path)
+                              .window(batch_size, drop_remainder=True)
+                              .flat_map(batch_fn)
+                              .prefetch(num_gpus))
+
+    return dataset
+
 
 def secs_to_hours(secs):
     hours, remainder = divmod(secs, 3600)
