@@ -157,4 +157,4 @@ def vad_segment_generator(wav_file, aggressiveness):
     frames = list(frames)
     segments = vad_collector(sample_rate, 30, 300, 0.5, vad, frames)
 
-    return segments, sample_rate, audio_length
+    return segments, sample_rate, audio_length * 1000

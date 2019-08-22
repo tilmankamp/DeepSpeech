@@ -103,13 +103,13 @@ def create_dataset(csvs, batch_size, cache_path=''):
 
 
 def split_to_dataset(wav_file, batch_size=1, aggressiveness=3, cache_path=''):
+    multiplier = 1.0 / (1 << 15)
+    segments, sample_rate, audio_length = vad_segment_generator(wav_file, aggressiveness)
 
     def generate_values():
-        segments, sample_rate, audio_length = vad_segment_generator(wav_file, aggressiveness)
         for segment in segments:
             segment_buffer, time_start, time_end = segment
             samples = np.frombuffer(segment_buffer, dtype=np.int16)
-            multiplier = 1.0 / (1 << 15)
             samples = samples * multiplier
             samples = np.expand_dims(samples, axis=1)
             yield time_start, time_end, samples, sample_rate
@@ -119,9 +119,9 @@ def split_to_dataset(wav_file, batch_size=1, aggressiveness=3, cache_path=''):
         return time_start, time_end, features, features_len
 
     def batch_fn(time_start, time_end, features, features_len):
-        features = tf.data.Dataset.zip((features, features_len))
-        features = features.padded_batch(batch_size, padded_shapes=([None, Config.n_input], []))
-        return tf.data.Dataset.zip((time_start, time_end, features))
+        features = tf.data.Dataset.zip((time_start, time_end, features, features_len))
+        features = features.padded_batch(batch_size, padded_shapes=([], [], [None, Config.n_input], []))
+        return features
 
     num_gpus = len(Config.available_devices)
 
@@ -133,7 +133,7 @@ def split_to_dataset(wav_file, batch_size=1, aggressiveness=3, cache_path=''):
                               .flat_map(batch_fn)
                               .prefetch(num_gpus))
 
-    return dataset
+    return dataset, audio_length
 
 
 def secs_to_hours(secs):
