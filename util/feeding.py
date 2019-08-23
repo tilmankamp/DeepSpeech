@@ -119,9 +119,8 @@ def split_to_dataset(wav_file, batch_size=1, aggressiveness=3, cache_path=''):
         return time_start, time_end, features, features_len
 
     def batch_fn(time_start, time_end, features, features_len):
-        features = tf.data.Dataset.zip((time_start, time_end, features, features_len))
-        features = features.padded_batch(batch_size, padded_shapes=([], [], [None, Config.n_input], []))
-        return features
+        samples = tf.data.Dataset.zip((time_start, time_end, features, features_len))
+        return samples.padded_batch(batch_size, padded_shapes=([], [], [None, Config.n_input], []))
 
     num_gpus = len(Config.available_devices)
 

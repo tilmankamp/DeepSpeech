@@ -2,11 +2,12 @@
 # -*- coding: utf-8 -*-
 from __future__ import absolute_import, division, print_function
 
+import os
 import json
+import errno
 import progressbar
 import tensorflow as tf
 
-from threading import Thread
 from multiprocessing import cpu_count
 from ds_ctcdecoder import ctc_beam_search_decoder_batch, Scorer
 from util.config import Config, initialize_globals
@@ -15,14 +16,14 @@ from util.flags import create_flags, FLAGS
 from util.logging import log_error, log_progress, create_progressbar
 
 
-def transcribe(wav_files, create_model, try_loading):
+def transcribe(path_pairs, create_model, try_loading):
     scorer = Scorer(FLAGS.lm_alpha, FLAGS.lm_beta, FLAGS.lm_binary_path, FLAGS.lm_trie_path, Config.alphabet)
 
-    current_file = wav_files[0]
-    current_set, current_audio_length = split_to_dataset(current_file, batch_size=FLAGS.test_batch_size)
-    iterator = tf.data.Iterator.from_structure(current_set.output_types,
-                                               current_set.output_shapes,
-                                               output_classes=current_set.output_classes)
+    wav_path, log_path = next(path_pairs)
+    wav_set, audio_length = split_to_dataset(wav_path, batch_size=FLAGS.test_batch_size)
+    iterator = tf.data.Iterator.from_structure(wav_set.output_types,
+                                               wav_set.output_shapes,
+                                               output_classes=wav_set.output_classes)
 
     batch_time_start, batch_time_end, batch_x, batch_x_len = iterator.get_next()
 
@@ -53,11 +54,9 @@ def transcribe(wav_files, create_model, try_loading):
             log_error('Checkpoint directory ({}) does not contain a valid checkpoint state.'.format(FLAGS.checkpoint_dir))
             exit(1)
 
-        file_results = []
-
-        def run_transcription(data_set, wav_file, audio_length):
+        def run_transcription(data_set, wav_path, log_path, audio_length):
             transcriptions = []
-            bar = create_progressbar(prefix='Transcribing file "{}" | '.format(wav_file),
+            bar = create_progressbar(prefix='Transcribing file "{}" | '.format(wav_path),
                                      max_value=audio_length,
                                      widgets=[progressbar.ETA()]).start()
             log_progress('Transcribing...')
@@ -83,35 +82,84 @@ def transcribe(wav_files, create_model, try_loading):
                 bar.update(audio_offset)
 
             bar.finish()
-            transcriptions.sort(key=lambda t: t[1])
-            return transcriptions
+            transcriptions.sort(key=lambda t: t[0])
+            json.dump(transcriptions, open(log_path, 'w'), default=float)
 
-        run_transcription(current_set, current_file, current_audio_length)
-        for current_file in wav_files[1:]:
-            current_set, current_audio_length = split_to_dataset(current_file, batch_size=FLAGS.test_batch_size)
-            file_transcriptions = run_transcription(current_set, current_file, current_audio_length)
-            file_results.extend(file_transcriptions)
-        return file_results
+        while wav_path is not None:
+            if wav_set is None:
+                wav_set, audio_length = split_to_dataset(wav_path, batch_size=FLAGS.test_batch_size)
+            run_transcription(wav_set, wav_path, log_path, audio_length)
+            wav_set = None
+            wav_path, log_path = next(path_pairs, (None, None))
+
+
+def mkdirs(path):
+    try:
+        os.makedirs(path)
+    except OSError as ex:
+        if not (ex.errno == errno.EEXIST and os.path.isdir(path)):
+            raise ex
+
 
 def main(_):
     initialize_globals()
 
-    if not FLAGS.transcribe:
-        log_error('You need to specify what files to use for transcription via '
-                  'the --transcribe flag.')
+    if not FLAGS.src:
+        log_error('You need to specify which files to transcribe via the --src flag.')
         exit(1)
 
     from DeepSpeech import create_model, try_loading # pylint: disable=cyclic-import
-    file_results = transcribe(FLAGS.transcribe.split(','), create_model, try_loading)
 
-    if FLAGS.output_file:
-        # Save decoded tuples as JSON, converting NumPy floats to Python floats
-        json.dump(file_results, open(FLAGS.output_file, 'w'), default=float)
+    src_path = os.path.abspath(FLAGS.src)
+    dst_path = None
+
+    def scan():
+        for root, dirs, files in os.walk(src_path):
+            created = False
+            dst_parent = os.path.join(dst_path, os.path.relpath(root, src_path))
+            for file in files:
+                base, ext = os.path.splitext(file)
+                if ext == '.wav':
+                    if not created:
+                        if not os.path.exists(dst_parent):
+                            mkdirs(dst_parent)
+                        created = True
+                    yield os.path.join(root, file), os.path.join(dst_parent, base + '.tlog')
+
+    def one_pair():
+        yield src_path, dst_path
+
+    if os.path.isdir(src_path):
+        dst_path = os.path.abspath(FLAGS.dst) if FLAGS.dst else src_path
+        if os.path.isdir(dst_path):
+            transcribe(scan(), create_model, try_loading)
+        else:
+            log_error('If --src specifies a directory to scan, --dst also has to point to an existing directory.')
+            exit(1)
+    elif os.path.isfile(src_path):
+        if FLAGS.dst:
+            dst_path = os.path.abspath(FLAGS.dst)
+        else:
+            base, ext = os.path.splitext(src_path)
+            dst_path = base + '.tlog'
+        if os.path.isfile(dst_path) or os.path.isdir(os.path.dirname(dst_path)):
+            transcribe(one_pair(), create_model, try_loading)
+        else:
+            log_error('Cannot write to path in --dst')
+            exit(1)
+    else:
+        log_error('--src neither pointing to an existing file nor to an existing directory')
+        exit(1)
 
 
 if __name__ == '__main__':
     create_flags()
-    tf.app.flags.DEFINE_string('transcribe', '', 'path to a WAV or text file with speech '
-                                                 'or paths to speech files to transcribe')
-    tf.app.flags.DEFINE_string('output_file', '', 'path to a JSON file to save all transcribed phrases')
+    tf.app.flags.DEFINE_string('src', '', 'source path to a WAV file or directory to scan for WAV files. '
+                                          'If --dst not set, transcripts will be written in-place '
+                                          'using the source filenames with suffix ".tlog" instead of ".wav".')
+    tf.app.flags.DEFINE_string('dst', '', 'target path to a transcript file or a directory to store transcripts. '
+                                          'If --src is a directory, this one also has to be a directory '
+                                          'and the required sub-dir tree of --src will get replicated.')
+    tf.app.flags.DEFINE_boolean('force', False, 'Forces re-transcribing and overwriting '
+                                                'of already existing transcription files')
     tf.app.run(main)
