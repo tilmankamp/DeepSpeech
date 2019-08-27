@@ -8,7 +8,6 @@ from functools import partial
 import numpy as np
 import pandas
 import tensorflow as tf
-import datetime
 
 from tensorflow.contrib.framework.python.ops import audio_ops as contrib_audio
 
@@ -102,12 +101,19 @@ def create_dataset(csvs, batch_size, cache_path=''):
     return dataset
 
 
-def split_to_dataset(wav_file, batch_size=1, aggressiveness=3, cache_path=''):
+def split_audio_file(audio_file,
+                     batch_size=1,
+                     aggressiveness=3,
+                     outlier_fraction=0,
+                     outlier_batch_size=None,
+                     cache_path=''):
     multiplier = 1.0 / (1 << 15)
-    segments, sample_rate, audio_length = vad_segment_generator(wav_file, aggressiveness)
+    segments, sample_rate, audio_length = vad_segment_generator(audio_file, aggressiveness)
+    # order ascending by sample duration - so length outliers are at the end of the list
+    segments = sorted(list(segments), key=lambda s: s[2] - s[1])
 
-    def generate_values():
-        for segment in segments:
+    def generate_values(sgmts, bs):
+        for segment in sgmts:
             segment_buffer, time_start, time_end = segment
             samples = np.frombuffer(segment_buffer, dtype=np.int16)
             samples = samples * multiplier
@@ -122,17 +128,26 @@ def split_to_dataset(wav_file, batch_size=1, aggressiveness=3, cache_path=''):
         samples = tf.data.Dataset.zip((time_start, time_end, features, features_len))
         return samples.padded_batch(batch_size, padded_shapes=([], [], [None, Config.n_input], []))
 
-    num_gpus = len(Config.available_devices)
+    def batch_ds(sgmts, bs):
+        return (tf.data.Dataset.from_generator(partial(generate_values, sgmts, bs),
+                                               output_types=(tf.int32, tf.int32, tf.float32, tf.int32))
+                               .map(to_mfccs, num_parallel_calls=tf.data.experimental.AUTOTUNE)
+                               .cache(cache_path)
+                               .window(bs)
+                               .flat_map(batch_fn))
 
-    dataset = (tf.data.Dataset.from_generator(generate_values,
-                                              output_types=(tf.int32, tf.int32, tf.float32, tf.int32))
-                              .map(to_mfccs, num_parallel_calls=tf.data.experimental.AUTOTUNE)
-                              .cache(cache_path)
-                              .window(batch_size, drop_remainder=True)
-                              .flat_map(batch_fn)
-                              .prefetch(num_gpus))
-
-    return dataset, audio_length
+    assert outlier_fraction < 0.5
+    if outlier_fraction > 0 and len(segments) > 1:
+        d = max(1, int(len(segments) * (1 - outlier_fraction)))
+        dataset = batch_ds(segments[0:d], batch_size)
+        if outlier_batch_size is None:
+            outlier_batch_size = max(1, int(batch_size / 2))
+        outliers = batch_ds(segments[d:], outlier_batch_size)
+        dataset = dataset.concatenate(outliers)
+    else:
+        dataset = batch_ds(segments, batch_size)
+    dataset = dataset.prefetch(len(Config.available_devices))
+    return dataset, len(segments)
 
 
 def secs_to_hours(secs):
