@@ -146,6 +146,10 @@ def main(_):
                     if not FLAGS.force and os.path.exists(tlog):
                         log_error('Transcription log "{}" already existing - not transcribing'.format(tlog))
                         continue
+                    if not os.path.exists(os.path.join(root.replace('/audio/', '/transcripts/extracted/'),
+                                                       base.replace('full', '') + '.xml')):
+                        log_error('Audio file "{}" without original transcript - not transcribing'.format(file))
+                        continue
                     if not created:
                         if not os.path.exists(dst_parent):
                             mkdirs(dst_parent)
