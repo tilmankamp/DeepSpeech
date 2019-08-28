@@ -44,6 +44,8 @@ def transcribe(path_pairs, create_model, try_loading):
     # Transpose to batch major and apply softmax for decoder
     transposed = tf.nn.softmax(tf.transpose(logits, [1, 0, 2]))
 
+    tf.train.get_or_create_global_step()
+
     # Get number of accessible CPU cores for this process
     try:
         num_processes = cpu_count()
