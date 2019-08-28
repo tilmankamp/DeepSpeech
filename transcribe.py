@@ -17,7 +17,7 @@ from util.logging import log_error, log_info, log_progress, create_progressbar
 
 def split_audio_file_flags(audio_file):
     return split_audio_file(audio_file,
-                            batch_size=FLAGS.test_batch_size,
+                            batch_size=FLAGS.batch_size,
                             aggressiveness=FLAGS.vad_aggressiveness,
                             outlier_fraction=FLAGS.outlier_fraction,
                             outlier_batch_size=FLAGS.outlier_batch_size,
@@ -44,8 +44,6 @@ def transcribe(path_pairs, create_model, try_loading):
     # Transpose to batch major and apply softmax for decoder
     transposed = tf.nn.softmax(tf.transpose(logits, [1, 0, 2]))
 
-    tf.train.get_or_create_global_step()
-
     # Get number of accessible CPU cores for this process
     try:
         num_processes = cpu_count()
@@ -61,15 +59,16 @@ def transcribe(path_pairs, create_model, try_loading):
         if not loaded:
             loaded = try_loading(session, saver, 'checkpoint', 'most recent')
         if not loaded:
-            log_error('Checkpoint directory ({}) does not contain a valid checkpoint state.'.format(FLAGS.checkpoint_dir))
+            log_error('Checkpoint directory ({}) does not contain a valid checkpoint state.'
+                      .format(FLAGS.checkpoint_dir))
             exit(1)
 
-        def run_transcription(data_set, audio_path, log_path, num_samples):
+        def run_transcription(index, data_set, audio_path, log_path, num_samples):
             transcriptions = []
-            bar = create_progressbar(prefix='Transcribing file "{}" | '.format(audio_path),
+            bar = create_progressbar(prefix='Transcribing file {} "{}" | '.format(index, audio_path),
                                      max_value=num_samples,
                                      widgets=[progressbar.AdaptiveETA()]).start()
-            log_progress('Transcribing file "{}"...'.format(audio_path))
+            log_progress('Transcribing file {}, "{}"...'.format(index, audio_path))
 
             # Initialize iterator to the appropriate dataset
             session.run(iterator.make_initializer(data_set))
@@ -102,10 +101,12 @@ def transcribe(path_pairs, create_model, try_loading):
             log_info('Writing transcription log to "{}"...'.format(log_path))
             json.dump(transcriptions, open(log_path, 'w'), default=float)
 
+        index = 0
         while audio_path is not None:
             if data_set is None:
                 data_set, number_of_samples = split_audio_file_flags(audio_path)
-            run_transcription(data_set, audio_path, log_path, number_of_samples)
+            index += 1
+            run_transcription(index, data_set, audio_path, log_path, number_of_samples)
             data_set = None
             audio_path, log_path = next(path_pairs, (None, None))
 
@@ -115,7 +116,7 @@ def mkdirs(path):
         os.makedirs(path)
     except OSError as ex:
         if not (ex.errno == errno.EEXIST and os.path.isdir(path)):
-            log_error('Cannot create directory at ' + path)
+            log_error('Cannot create directory at "{}"'.format(path))
             exit(1)
 
 
@@ -195,6 +196,7 @@ if __name__ == '__main__':
                                                 'transcription logs (.tlog)')
     tf.app.flags.DEFINE_integer('vad_aggressiveness', 3, 'How aggressive (0=lowest, 3=highest) the VAD should '
                                                          'split audio')
+    tf.app.flags.DEFINE_integer('batch_size', 40, 'Default batch size')
     tf.app.flags.DEFINE_float('outlier_fraction', 0, 'Fraction of samples per file that are to be considered '
                                                      'duration outliers')
     tf.app.flags.DEFINE_integer('outlier_batch_size', None, 'Batch size for duration outliers '
