@@ -68,7 +68,7 @@ def transcribe(path_pairs, create_model, try_loading):
             transcriptions = []
             bar = create_progressbar(prefix='Transcribing file "{}" | '.format(audio_path),
                                      max_value=num_samples,
-                                     widgets=[progressbar.ETA()]).start()
+                                     widgets=[progressbar.AdaptiveETA()]).start()
             log_progress('Transcribing file "{}"...'.format(audio_path))
 
             # Initialize iterator to the appropriate dataset
@@ -130,6 +130,7 @@ def main(_):
 
     src_path = os.path.abspath(FLAGS.src)
     dst_path = None
+    formats = FLAGS.formats.split(',')
 
     def scan():
         for root, dirs, files in os.walk(src_path):
@@ -137,7 +138,7 @@ def main(_):
             dst_parent = os.path.join(dst_path, os.path.relpath(root, src_path))
             for file in files:
                 base, ext = os.path.splitext(file)
-                if ext == '.mp3':
+                if ext in formats:
                     tlog = os.path.join(dst_parent, base + '.tlog')
                     if not FLAGS.force and os.path.exists(tlog):
                         log_error('Transcription log "{}" already existing - not transcribing'.format(tlog))
@@ -189,6 +190,7 @@ if __name__ == '__main__':
     tf.app.flags.DEFINE_string('dst', '', 'path for writing the transcription log or logs (.tlog). '
                                           'If --src is a directory, this one also has to be a directory '
                                           'and the required sub-dir tree of --src will get replicated.')
+    tf.app.flags.DEFINE_string('formats', '.wav', 'Comma separated list of audio file suffixes to scan for')
     tf.app.flags.DEFINE_boolean('force', False, 'Forces re-transcribing and overwriting of already existing '
                                                 'transcription logs (.tlog)')
     tf.app.flags.DEFINE_integer('vad_aggressiveness', 3, 'How aggressive (0=lowest, 3=highest) the VAD should '
