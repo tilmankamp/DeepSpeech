@@ -3,6 +3,7 @@
 from __future__ import absolute_import, division, print_function
 
 import os
+import glob
 import json
 import errno
 import progressbar
@@ -146,8 +147,10 @@ def main(_):
                     if not FLAGS.force and os.path.exists(tlog):
                         log_error('Transcription log "{}" already existing - not transcribing'.format(tlog))
                         continue
-                    if not os.path.exists(os.path.join(root.replace('/audio/', '/transcripts/extracted/'),
-                                                       base.replace('full', '') + '.xml')):
+                    t_dir = root.replace('/audio/', '/transcripts/extracted/')
+                    base_name = base.replace('full', '')
+                    if len(glob.glob(os.path.join(t_dir, base_name.lower() + '*.xml'))) == 0 and \
+                            len(glob.glob(os.path.join(t_dir, base_name.upper() + '*.xml'))) == 0:
                         log_error('Audio file "{}" without original transcript - not transcribing'.format(file))
                         continue
                     if not created:
