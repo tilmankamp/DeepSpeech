@@ -1,6 +1,6 @@
 #!/bin/bash
 
-set -xe
+set -x
 
 apt-get install -y python3-venv
 python3 -m venv /tmp/venv
@@ -15,20 +15,68 @@ pip install $(python3 util/taskcluster.py --decoder)
 mkdir -p ../keep/summaries
 
 data="${SHARED_DIR}/data"
-fis="${data}/LDC/fisher"
-swb="${data}/LDC/LDC97S62/swb"
-lbs="${data}/OpenSLR/LibriSpeech/librivox"
+swc="${data}/UHH/SWC/german-"
+tuda="${data}/UHH/TUDA/tuda-v2-"
+mlabs="${data}/Caito/M-AILABS/de_DE/de_DE_"
+cv="${data}/mozilla/CommonVoice/de_340h_2019-06-12/clips/"
+
+german_dir="${ML_GROUP_DIR}/languages/german"
+lm_vocab="${german_dir}/clean_vocab.txt"
+lm_arpa="${german_dir}/words.arpa"
+lm_binary="${german_dir}/german-lm.binary"
+lm_trie="${german_dir}/german-lm.trie"
+
+if [[ ! -f "${lm_trie}" ]]; then
+    mkdir -p "${german_dir}"
+
+    if [[ ! -f "${lm_vocab}" ]]; then
+        git clone https://github.com/ynop/deepspeech-german.git
+        pushd deepspeech-german
+            pip install -r requirements.txt
+            pip install llvmlite==0.30.0
+            wget http://ltdata1.informatik.uni-hamburg.de/kaldi_tuda_de/German_sentences_8mil_filtered_maryfied.txt.gz
+            gunzip German_sentences_8mil_filtered_maryfied.txt.gz
+            ./prepare_vocab.py German_sentences_8mil_filtered_maryfied.txt "${lm_vocab}"
+        popd
+    fi
+
+    if [[ ! -f "${lm_binary}" ]]; then
+        apt-get install -y libboost-all-dev libeigen3-dev cmake
+        git clone https://github.com/kpu/kenlm.git
+        pushd kenlm
+            mkdir -p build
+            pushd build
+                cmake ..
+                make -j 4
+                make install
+            popd
+        popd
+        mkdir -p /root/lmtmp
+        lmplz --text "${lm_vocab}" --arpa "${lm_arpa}" --order 5 --prune 0 0 0 1 --memory 50% --temp_prefix /root/lmtmp/
+        build_binary -a 255 -q 8 trie "${lm_arpa}" "${lm_binary}"
+    fi
+
+    mkdir -p /root/nc
+    python util/taskcluster.py --target /root/nc --arch gpu
+    /root/nc/generate_trie languages/de/alphabet.txt "${lm_binary}" "${lm_trie}"
+fi
 
 python -u DeepSpeech.py \
-  --train_files "${fis}-train.csv","${swb}-train.csv","${lbs}-train-clean-100.csv","${lbs}-train-clean-360.csv","${lbs}-train-other-500.csv" \
-  --dev_files "${lbs}-dev-clean.csv"\
-  --test_files "${lbs}-test-clean.csv" \
-  --train_batch_size 24 \
-  --dev_batch_size 48 \
-  --test_batch_size 48 \
+  --alphabet_config_path "languages/de/alphabet.txt" \
+  --lm_binary_path "${lm_binary}" \
+  --lm_trie_path "${lm_trie}" \
+  --train_files "${swc}train.csv,${tuda}train.csv,${mlabs}train.csv,${cv}train.csv" \
+  --dev_files "${mlabs}dev.csv"\
+  --test_files "${mlabs}test.csv" \
+  --feature_cache "${german_dir}/aligner-feature-cache" \
+  --train_batch_size 20 \
+  --dev_batch_size 40 \
+  --test_batch_size 40 \
+  --use_cudnn_rnn \
   --n_hidden 2048 \
-  --learning_rate 0.0001 \
+  --learning_rate 0.00008 \
   --dropout_rate 0.2 \
-  --epoch 13 \
+  --epochs 100 \
+  --noearly_stop \
   --checkpoint_dir "../keep" \
   --summary_dir "../keep/summaries"
