@@ -3,6 +3,7 @@
 from __future__ import absolute_import, division, print_function
 
 import os
+import gc
 import sys
 import json
 import tensorflow as tf
@@ -119,7 +120,9 @@ def main(_):
         if any(map(lambda e: not os.path.isdir(os.path.dirname(e[1])), catalog_entries)):
             log_error('Missing destination directory for at least one catalog entry')
             sys.exit(1)
-        transcribe(catalog_entries, create_model, try_loading)
+        for offset in range(0, len(catalog_entries), FLAGS.files_per_session):
+            transcribe(catalog_entries[offset:offset + FLAGS.files_per_session], create_model, try_loading)
+            gc.collect()
     else:
         dst_path = os.path.abspath(FLAGS.dst) if FLAGS.dst else os.path.splitext(src_path)[0] + '.tlog'
         if os.path.isfile(dst_path):
@@ -151,4 +154,5 @@ if __name__ == '__main__':
     tf.app.flags.DEFINE_integer('batch_size', 40, 'Default batch size')
     tf.app.flags.DEFINE_float('outlier_duration_ms', 10000, 'Duration in ms after which samples are considered outliers')
     tf.app.flags.DEFINE_integer('outlier_batch_size', 1, 'Batch size for duration outliers (defaults to 1)')
+    tf.app.flags.DEFINE_integer('files_per_session', 100, 'Batch size for duration outliers (defaults to 1)')
     tf.app.run(main)
