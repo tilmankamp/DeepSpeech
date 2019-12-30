@@ -65,18 +65,16 @@ python -u DeepSpeech.py \
   --alphabet_config_path "languages/de/alphabet.txt" \
   --lm_binary_path "${lm_binary}" \
   --lm_trie_path "${lm_trie}" \
-  --train_files "${swc}train.csv,${tuda}train.csv,${mlabs}train.csv,${cv}train.csv" \
-  --dev_files "${mlabs}dev.csv"\
-  --test_files "${mlabs}test.csv" \
-  --feature_cache "${german_dir}/aligner-feature-cache" \
-  --train_batch_size 20 \
-  --dev_batch_size 40 \
-  --test_batch_size 40 \
-  --use_cudnn_rnn \
-  --n_hidden 2048 \
-  --learning_rate 0.00008 \
-  --dropout_rate 0.2 \
-  --epochs 100 \
+  --train_files "${swc}train.csv" \
+  --dev_files "${swc}dev.csv"\
+  --test_files "${swc}test.csv" \
+  --feature_cache "${german_dir}/swc-feature-cache" \
+  --train_batch_size 24 \
+  --dev_batch_size 36 \
+  --test_batch_size 36 \
+  --learning_rate 0.0001 \
+  --dropout_rate 0.30 \
+  --epochs 1 \
   --noearly_stop \
   --checkpoint_dir "../keep" \
   --summary_dir "../keep/summaries"
