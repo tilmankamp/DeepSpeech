@@ -1,6 +1,7 @@
 import os
 import sox
 import wave
+import opuslib
 import tempfile
 import collections
 from webrtcvad import Vad
@@ -133,3 +134,40 @@ def vad_split(audio_frames,
         yield b''.join(voiced_frames), \
               frame_duration_ms * (frame_index - len(voiced_frames)), \
               frame_duration_ms * (frame_index + 1)
+
+
+def encode_opus(audio_format, pcm_data):
+    def pack_number(n, num_bytes):
+        return n.to_bytes(num_bytes, 'big', signed=False)
+    rate, channels, width = audio_format
+    frame_size = 60 * rate // 1000
+    encoder = opuslib.Encoder(rate, channels, opuslib.APPLICATION_AUDIO)
+    chunk_size = frame_size * channels * width
+    opus = [pack_number(len(pcm_data), 4), pack_number(rate, 2), pack_number(channels, 1), pack_number(width, 1)]
+    for i in range(0, len(pcm_data), chunk_size):
+        chunk = pcm_data[i:i + chunk_size]
+        encoded = encoder.encode(chunk, frame_size)
+        opus.append(pack_number(len(encoded), 2))
+        opus.append(encoded)
+    return b''.join(opus)
+
+
+def decode_opus(opus_data):
+    def unpack_number(data):
+        return int.from_bytes(data, 'big', signed=False)
+    pcm_len = unpack_number(opus_data[0:4])
+    rate = unpack_number(opus_data[4:6])
+    channels = unpack_number(opus_data[6:7])
+    width = unpack_number(opus_data[7:8])
+    offset = 8
+    frame_size = 60 * rate // 1000
+    decoder = opuslib.Decoder(rate, channels)
+    pcm_data = []
+    while offset < len(opus_data):
+        chunk_size = unpack_number(opus_data[offset:offset + 2])
+        offset += 2
+        chunk = opus_data[offset:offset + chunk_size]
+        offset += chunk_size
+        decoded = decoder.decode(chunk, frame_size)
+        pcm_data.append(decoded)
+    return (rate, channels, width), (b''.join(pcm_data))[:pcm_len]
