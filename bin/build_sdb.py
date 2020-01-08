@@ -16,6 +16,7 @@ import json
 import wave
 import argparse
 import progressbar
+# import shutil
 
 from pathlib import Path
 from multiprocessing.pool import Pool
@@ -69,6 +70,7 @@ def read_csvs():
 
 
 def build_sample_entry(sample):
+    # shutil.copy(sample.wav_filename, CLI_ARGS.target + '.samples/' + sample.wav_filename.split('/')[-1])
     with wave.open(sample.wav_filename, 'r') as wav_file:
         audio_format = get_audio_format(wav_file)
         pcm_data = wav_file.readframes(wav_file.getnframes())
@@ -95,6 +97,7 @@ def build_sdb():
         offset_samples = sdb_file.tell()
         sdb_file.write((0).to_bytes(BIGINT_SIZE, BIG_ENDIAN))
         sdb_file.write(len(samples).to_bytes(BIGINT_SIZE, BIG_ENDIAN))
+        # os.mkdir(CLI_ARGS.target + '.samples')
         with Pool() as pool:
             bar = progressbar.ProgressBar(max_value=len(samples), widgets=SIMPLE_BAR)
             for buffer in bar(pool.imap(build_sample_entry, samples)):

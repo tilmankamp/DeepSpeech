@@ -136,16 +136,16 @@ def vad_split(audio_frames,
               frame_duration_ms * (frame_index + 1)
 
 
-def encode_opus(audio_format, pcm_data):
+def encode_opus(audio_format, audio_data):
     def pack_number(n, num_bytes):
         return n.to_bytes(num_bytes, 'big', signed=False)
     rate, channels, width = audio_format
     frame_size = 60 * rate // 1000
     encoder = opuslib.Encoder(rate, channels, opuslib.APPLICATION_AUDIO)
     chunk_size = frame_size * channels * width
-    opus = [pack_number(len(pcm_data), 4), pack_number(rate, 2), pack_number(channels, 1), pack_number(width, 1)]
-    for i in range(0, len(pcm_data), chunk_size):
-        chunk = pcm_data[i:i + chunk_size]
+    opus = [pack_number(len(audio_data), 4), pack_number(rate, 2), pack_number(channels, 1), pack_number(width, 1)]
+    for i in range(0, len(audio_data), chunk_size):
+        chunk = audio_data[i:i + chunk_size]
         encoded = encoder.encode(chunk, frame_size)
         opus.append(pack_number(len(encoded), 2))
         opus.append(encoded)
@@ -159,15 +159,17 @@ def decode_opus(opus_data):
     rate = unpack_number(opus_data[4:6])
     channels = unpack_number(opus_data[6:7])
     width = unpack_number(opus_data[7:8])
+    audio_format = (rate, channels, width)
     offset = 8
     frame_size = 60 * rate // 1000
     decoder = opuslib.Decoder(rate, channels)
-    pcm_data = []
+    audio_data = []
     while offset < len(opus_data):
         chunk_size = unpack_number(opus_data[offset:offset + 2])
         offset += 2
         chunk = opus_data[offset:offset + chunk_size]
         offset += chunk_size
         decoded = decoder.decode(chunk, frame_size)
-        pcm_data.append(decoded)
-    return (rate, channels, width), (b''.join(pcm_data))[:pcm_len]
+        audio_data.append(decoded)
+    audio_data = b''.join(audio_data)[:pcm_len]
+    return audio_format, audio_data
