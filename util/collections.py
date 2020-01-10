@@ -1,11 +1,13 @@
 # -*- coding: utf-8 -*-
+import io
 import csv
 import json
 import wave
+import numpy as np
 
 from pathlib import Path
 from collections.abc import Sequence, Iterable
-from util.audio import decode_opus, get_audio_format, get_duration
+from util.audio import AUDIO_TYPE_WAV, AUDIO_TYPE_OPUS, read_duration, read_audio
 
 BIG_ENDIAN = 'big'
 INT_SIZE = 4
@@ -14,11 +16,26 @@ MAGIC = b'SAMPLEDB'
 
 
 class Sample:
-    def __init__(self, audio_format, audio_data, transcript):
-        self.audio_format = audio_format
-        self.audio_data = audio_data
+    def __init__(self, sample_id, audio_type, raw_data, transcript):
+        self.id = sample_id
+        self.audio_type = audio_type
+        self.audio_format = None
+        self.audio = None
+        self.audio_file = io.BytesIO(raw_data)
         self.transcript = transcript
-        self.duration = get_duration(audio_data, audio_format=audio_format)
+        self.duration = read_duration(audio_type, self.audio_file)
+
+    def prepare_audio(self):
+        self.audio_format, pcm_data = read_audio(self.audio_type, self.audio_file)
+        rate, channels, width = self.audio_format
+        if width < 1 or width > 4 or width == 3:
+            raise ValueError('Unsupported sample width: {}'.format(width))
+        dtype = [None, np.int8, np.int16, None, np.int32][width]
+        samples = np.frombuffer(pcm_data, dtype=dtype)
+        samples = samples[::channels]  # limited to mono for now
+        # later something like: range(channels).map(lambda c: samples[c::channels])
+        samples = samples.astype(np.float32) / np.iinfo(dtype).max
+        self.audio = np.expand_dims(samples, axis=1)
 
 
 class SDB(Sequence):
@@ -87,8 +104,8 @@ class SDB(Sequence):
     def __getitem__(self, i):
         opus_data, transcript = self.read_row(i, self.speech_index, self.transcript_index)
         transcript = transcript.decode()
-        audio_format, audio_data = decode_opus(opus_data)
-        return Sample(audio_format, audio_data, transcript)
+        sample_id = self.sdb_filename + ':' + str(i)
+        return Sample(sample_id, AUDIO_TYPE_OPUS, opus_data, transcript)
 
     def __len__(self):
         return len(self.offsets)
@@ -97,6 +114,7 @@ class SDB(Sequence):
 class CSV(Sequence):
     def __init__(self, csv_filename):
         super().__init__()
+        self.csv_filename = csv_filename
         self.rows = []
         csv_dir = Path(csv_filename).parent
         with open(csv_filename, 'r') as csv_file:
@@ -109,11 +127,8 @@ class CSV(Sequence):
 
     def __getitem__(self, i):
         wav_filename, transcript = self.rows[i]
-        with wave.open(wav_filename, 'r') as wav_file:
-            audio_format = get_audio_format(wav_file)
-            num_samples = wav_file.getnframes()
-            audio_data = wav_file.readframes(num_samples)
-        return Sample(audio_format, audio_data, transcript)
+        with open(wav_filename, 'rb') as wav_file:
+            return Sample(wav_filename, AUDIO_TYPE_WAV, wav_file.read(), transcript)
 
     def __len__(self):
         return len(self.rows)
@@ -124,7 +139,7 @@ class Interleaved(Iterable):
         super().__init__()
         self.cols = cols
 
-    def __iter__(self):
+    def get_samples(self):
         firsts = []
         for col in self.cols:
             it = iter(col)
@@ -142,6 +157,11 @@ class Interleaved(Iterable):
             except StopIteration:
                 continue
             firsts.append((it, first))
+
+    def __iter__(self):
+        for sample in self.get_samples():
+            sample.prepare_audio()
+            yield sample
 
 
 def collection_from_file(filename):

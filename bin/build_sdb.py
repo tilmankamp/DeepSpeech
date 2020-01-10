@@ -11,6 +11,7 @@ import os
 import sys
 sys.path.insert(1, os.path.join(sys.path[0], '..'))
 
+import io
 import csv
 import json
 import wave
@@ -21,7 +22,7 @@ import progressbar
 from pathlib import Path
 from multiprocessing.pool import Pool
 from util.downloader import SIMPLE_BAR
-from util.audio import encode_opus, get_audio_format
+from util.audio import write_opus, read_audio_format_from_wav_file
 
 BIG_ENDIAN = 'big'
 
@@ -72,9 +73,11 @@ def read_csvs():
 def build_sample_entry(sample):
     # shutil.copy(sample.wav_filename, CLI_ARGS.target + '.samples/' + sample.wav_filename.split('/')[-1])
     with wave.open(sample.wav_filename, 'r') as wav_file:
-        audio_format = get_audio_format(wav_file)
+        audio_format = read_audio_format_from_wav_file(wav_file)
         pcm_data = wav_file.readframes(wav_file.getnframes())
-        opus = encode_opus(audio_format, pcm_data)
+    opus_file = io.BytesIO()
+    write_opus(opus_file, audio_format, pcm_data)
+    opus = opus_file.getbuffer()
     opus_len = len(opus).to_bytes(INT_SIZE, BIG_ENDIAN)
     transcript = sample.transcript.encode()
     transcript_len = len(transcript).to_bytes(INT_SIZE, BIG_ENDIAN)

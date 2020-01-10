@@ -73,10 +73,8 @@ def samples_to_mfccs(samples, sample_rate, train_phase=False):
     return mfccs, tf.shape(input=mfccs)[0]
 
 
-def audiofile_to_features(wav_filename, train_phase=False):
-    samples = tf.io.read_file(wav_filename)
-    decoded = contrib_audio.decode_wav(samples, desired_channels=1)
-    features, features_len = samples_to_mfccs(decoded.audio, decoded.sample_rate, train_phase=train_phase)
+def audio_to_features(audio, sample_rate, train_phase=False):
+    features, features_len = samples_to_mfccs(audio, sample_rate, train_phase=train_phase)
 
     if train_phase:
         if FLAGS.data_aug_features_multiplicative > 0:
@@ -88,10 +86,17 @@ def audiofile_to_features(wav_filename, train_phase=False):
     return features, features_len
 
 
-def entry_to_features(wav_filename, transcript, train_phase):
+def audiofile_to_features(wav_filename, train_phase=False):
+    samples = tf.io.read_file(wav_filename)
+    decoded = contrib_audio.decode_wav(samples, desired_channels=1)
+    return audio_to_features(decoded.audio, decoded.sample_rate, train_phase=train_phase)
+
+
+def entry_to_features(sample_id, audio, sample_rate, transcript, train_phase=False):
     # https://bugs.python.org/issue32117
-    features, features_len = audiofile_to_features(wav_filename, train_phase=train_phase)
-    return wav_filename, features, features_len, tf.SparseTensor(*transcript)
+    features, features_len = audio_to_features(audio, sample_rate, train_phase=train_phase)
+    sparse_transcript = tf.SparseTensor(*transcript)
+    return sample_id, features, features_len, sparse_transcript
 
 
 def to_sparse_tuple(sequence):
@@ -105,31 +110,38 @@ def to_sparse_tuple(sequence):
 
 def create_dataset(sources, batch_size, enable_cache=False, cache_path=None, train_phase=False):
     def generate_values():
-        col = collection_from_files(sources)
-        for sample in col:
-            sample_rate, _, sample_width = sample.audio_format
-            multiplier = 1.0 / (1 << (8 * sample_width - 1))
-            sample_data = np.frombuffer(sample.audio_data, dtype=np.int16)
-            sample_data = sample_data * multiplier
-            sample_data = np.expand_dims(sample_data, axis=1)
-            yield sample.id, sample_rate, sample_data, sample.transcript
+        for sample in collection_from_files(sources):
+            transcript = to_sparse_tuple(text_to_char_array(sample.transcript, Config.alphabet))
+            yield sample.id, sample.audio, sample.audio_format[0], transcript
 
-    def to_mfccs(sample_id, sample_rate, samples, transcript):
-        features, features_len = samples_to_mfccs(samples, sample_rate, train_phase=train_phase)
-        if train_phase:
-            if FLAGS.data_aug_features_multiplicative > 0:
-                features = features*tf.random.normal(mean=1, stddev=FLAGS.data_aug_features_multiplicative, shape=tf.shape(features))
-            if FLAGS.data_aug_features_additive > 0:
-                features = features+tf.random.normal(mean=0.0, stddev=FLAGS.data_aug_features_additive, shape=tf.shape(features))
-        return sample_id, features, features_len, tf.SparseTensor(*transcript)
+    # Batching a dataset of 2D SparseTensors creates 3D batches, which fail
+    # when passed to tf.nn.ctc_loss, so we reshape them to remove the extra
+    # dimension here.
+    def sparse_reshape(sparse):
+        shape = sparse.dense_shape
+        return tf.sparse.reshape(sparse, [shape[0], shape[2]])
 
-    dataset = (tf.data.Dataset
-               .from_generator(generate_values, output_types=(tf.string, tf.int32, tf.float32))
-               .map(to_mfccs, num_parallel_calls=tf.data.experimental.AUTOTUNE)
-               .padded_batch(batch_size, padded_shapes=([], [None, Config.n_input], [])))
+    def batch_fn(wav_filenames, features, features_len, transcripts):
+        features = tf.data.Dataset.zip((features, features_len))
+        features = features.padded_batch(batch_size,
+                                         padded_shapes=([None, Config.n_input], []))
+        transcripts = transcripts.batch(batch_size).map(sparse_reshape)
+        wav_filenames = wav_filenames.batch(batch_size)
+        return tf.data.Dataset.zip((wav_filenames, features, transcripts))
+
+    num_gpus = len(Config.available_devices)
+    process_fn = partial(entry_to_features, train_phase=train_phase)
+
+    dataset = (tf.data.Dataset.from_generator(generate_values,
+                                              output_types=(tf.string, tf.int32, tf.float32, (tf.int64, tf.int32, tf.int64)))
+                              .map(process_fn, num_parallel_calls=tf.data.experimental.AUTOTUNE))
+
     if enable_cache:
         dataset = dataset.cache(cache_path)
-    dataset = (dataset.prefetch(len(Config.available_devices)))
+
+    dataset = (dataset.window(batch_size, drop_remainder=True).flat_map(batch_fn)
+                      .prefetch(num_gpus))
+
     return dataset
 
 

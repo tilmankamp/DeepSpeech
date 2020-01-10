@@ -1,4 +1,5 @@
 import os
+import io
 import sox
 import wave
 import opuslib
@@ -11,22 +12,28 @@ DEFAULT_CHANNELS = 1
 DEFAULT_WIDTH = 2
 DEFAULT_FORMAT = (DEFAULT_RATE, DEFAULT_CHANNELS, DEFAULT_WIDTH)
 
+AUDIO_TYPE_WAV = 'audio/wav'
+AUDIO_TYPE_OPUS = 'audio/opus'
 
-def get_audio_format(wav_file):
+
+def write_audio_format_to_wav_file(wav_file, audio_format=DEFAULT_FORMAT):
+    rate, channels, width = audio_format
+    wav_file.setframerate(rate)
+    wav_file.setnchannels(channels)
+    wav_file.setsampwidth(width)
+
+
+def read_audio_format_from_wav_file(wav_file):
     return wav_file.getframerate(), wav_file.getnchannels(), wav_file.getsampwidth()
 
 
-def get_num_samples(audio_data, audio_format=DEFAULT_FORMAT):
+def get_num_samples(buffer_len, audio_format=DEFAULT_FORMAT):
     _, channels, width = audio_format
-    return len(audio_data) // (channels * width)
+    return buffer_len // (channels * width)
 
 
-def get_duration(audio_data, audio_format=DEFAULT_FORMAT):
-    return get_num_samples(audio_data, audio_format) / audio_format[0]
-
-
-def get_duration_ms(audio_data, audio_format=DEFAULT_FORMAT):
-    return get_duration(audio_data, audio_format) * 1000
+def get_pcm_duration(pcm_len, audio_format=DEFAULT_FORMAT):
+    return get_num_samples(pcm_len, audio_format) / audio_format[0]
 
 
 def convert_audio(src_audio_path, dst_audio_path, file_type=None, audio_format=DEFAULT_FORMAT):
@@ -47,7 +54,7 @@ class AudioFile:
     def __enter__(self):
         if self.audio_path.endswith('.wav'):
             self.open_file = wave.open(self.audio_path, 'r')
-            if get_audio_format(self.open_file) == self.audio_format:
+            if read_audio_format_from_wav_file(self.open_file) == self.audio_format:
                 if self.as_path:
                     self.open_file.close()
                     return self.audio_path
@@ -68,12 +75,12 @@ class AudioFile:
 
 
 def read_frames(wav_file, frame_duration_ms=30, yield_remainder=False):
-    audio_format = get_audio_format(wav_file)
+    audio_format = read_audio_format_from_wav_file(wav_file)
     frame_size = int(audio_format[0] * (frame_duration_ms / 1000.0))
     while True:
         try:
             data = wav_file.readframes(frame_size)
-            if not yield_remainder and get_duration_ms(data, audio_format) < frame_duration_ms:
+            if not yield_remainder and get_pcm_duration(len(data), audio_format) * 1000 < frame_duration_ms:
                 break
             yield data
         except EOFError:
@@ -107,7 +114,7 @@ def vad_split(audio_frames,
     frame_duration_ms = 0
     frame_index = 0
     for frame_index, frame in enumerate(audio_frames):
-        frame_duration_ms = get_duration_ms(frame, audio_format)
+        frame_duration_ms = get_pcm_duration(len(frame), audio_format) * 1000
         if int(frame_duration_ms) not in [10, 20, 30]:
             raise ValueError('VAD-splitting only supported for frame durations 10, 20, or 30 ms')
         is_speech = vad.is_speech(frame, sample_rate)
@@ -136,40 +143,97 @@ def vad_split(audio_frames,
               frame_duration_ms * (frame_index + 1)
 
 
-def encode_opus(audio_format, audio_data):
-    def pack_number(n, num_bytes):
-        return n.to_bytes(num_bytes, 'big', signed=False)
+def pack_number(n, num_bytes):
+    return n.to_bytes(num_bytes, 'big', signed=False)
+
+
+def unpack_number(data):
+    return int.from_bytes(data, 'big', signed=False)
+
+
+def write_opus(opus_file, audio_format, audio_data):
     rate, channels, width = audio_format
     frame_size = 60 * rate // 1000
     encoder = opuslib.Encoder(rate, channels, opuslib.APPLICATION_AUDIO)
     chunk_size = frame_size * channels * width
-    opus = [pack_number(len(audio_data), 4), pack_number(rate, 2), pack_number(channels, 1), pack_number(width, 1)]
+    opus_file.write(pack_number(len(audio_data), 4))
+    opus_file.write(pack_number(rate, 2))
+    opus_file.write(pack_number(channels, 1))
+    opus_file.write(pack_number(width, 1))
     for i in range(0, len(audio_data), chunk_size):
         chunk = audio_data[i:i + chunk_size]
         encoded = encoder.encode(chunk, frame_size)
-        opus.append(pack_number(len(encoded), 2))
-        opus.append(encoded)
-    return b''.join(opus)
+        opus_file.write(pack_number(len(encoded), 2))
+        opus_file.write(encoded)
 
 
-def decode_opus(opus_data):
-    def unpack_number(data):
-        return int.from_bytes(data, 'big', signed=False)
-    pcm_len = unpack_number(opus_data[0:4])
-    rate = unpack_number(opus_data[4:6])
-    channels = unpack_number(opus_data[6:7])
-    width = unpack_number(opus_data[7:8])
-    audio_format = (rate, channels, width)
-    offset = 8
+def read_opus_header(opus_file):
+    opus_file.seek(0)
+    pcm_len = unpack_number(opus_file.read(4))
+    rate = unpack_number(opus_file.read(2))
+    channels = unpack_number(opus_file.read(1))
+    width = unpack_number(opus_file.read(1))
+    return pcm_len, (rate, channels, width)
+
+
+def read_opus(opus_file):
+    pcm_len, audio_format = read_opus_header(opus_file)
+    rate, channels, _ = audio_format
     frame_size = 60 * rate // 1000
     decoder = opuslib.Decoder(rate, channels)
-    audio_data = []
-    while offset < len(opus_data):
-        chunk_size = unpack_number(opus_data[offset:offset + 2])
-        offset += 2
-        chunk = opus_data[offset:offset + chunk_size]
-        offset += chunk_size
+    audio_data = bytearray()
+    while len(audio_data) < pcm_len:
+        chunk_size = unpack_number(opus_file.read(2))
+        chunk = opus_file.read(chunk_size)
         decoded = decoder.decode(chunk, frame_size)
-        audio_data.append(decoded)
-    audio_data = b''.join(audio_data)[:pcm_len]
+        audio_data.extend(decoded)
+    audio_data = audio_data[:pcm_len]
     return audio_format, audio_data
+
+
+def read_wav(wav_data):
+    with io.BytesIO(wav_data) as base_wav_file:
+        with wave.open(base_wav_file, 'rb') as wav_file:
+            return read_audio_format_from_wav_file(wav_file), wav_file.readframes()
+
+
+def read_audio(audio_type, audio_file):
+    if audio_type == AUDIO_TYPE_WAV:
+        return read_wav(audio_file)
+    elif audio_type == AUDIO_TYPE_OPUS:
+        return read_opus(audio_file)
+    else:
+        raise ValueError('Unsupported audio format: {}'.format(audio_type))
+
+
+def read_wav_duration(wav_file):
+    with wave.open(wav_file, 'rb') as wav_file_reader:
+        return wav_file_reader.getnframes() / wav_file_reader.getframerate()
+
+
+def read_opus_duration(opus_file):
+    pcm_len, audio_format = read_opus_header(opus_file)
+    return get_pcm_duration(pcm_len, audio_format)
+
+
+def read_duration(audio_type, audio_file):
+    if audio_type == AUDIO_TYPE_WAV:
+        return read_wav_duration(audio_file)
+    elif audio_type == AUDIO_TYPE_OPUS:
+        return read_opus_duration(audio_file)
+    else:
+        raise ValueError('Unsupported audio format: {}'.format(audio_type))
+
+
+def convert_to_wav(audio_type, audio_file):
+    audio_format = None
+    if audio_type == AUDIO_TYPE_WAV:
+        return audio_file
+    else:
+        audio_format, audio_data = read_audio(audio_type, audio_file)
+    memory_wav_file = io.BytesIO()
+    with wave.open(memory_wav_file, 'wb') as wav_file:
+        write_audio_format_to_wav_file(wav_file, audio_format)
+        wav_file.writeframes(audio_data)
+    memory_wav_file.seek(0)
+    return memory_wav_file
