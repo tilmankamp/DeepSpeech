@@ -1,18 +1,21 @@
 # -*- coding: utf-8 -*-
+import os
 import io
 import csv
 import json
-import wave
-import numpy as np
+import time
 
 from pathlib import Path
+from multiprocessing.dummy import Pool as ThreadPool
 from collections.abc import Sequence, Iterable
-from util.audio import AUDIO_TYPE_WAV, AUDIO_TYPE_OPUS, read_duration, read_audio
+
+from util.audio import AUDIO_TYPE_WAV, AUDIO_TYPE_OPUS, read_duration, read_audio, pcm_to_np
 
 BIG_ENDIAN = 'big'
 INT_SIZE = 4
 BIGINT_SIZE = 2 * INT_SIZE
 MAGIC = b'SAMPLEDB'
+BUFFER_SIZE = 128 * 1024 * 1024
 
 
 class Sample:
@@ -25,24 +28,12 @@ class Sample:
         self.transcript = transcript
         self.duration = read_duration(audio_type, self.audio_file)
 
-    def prepare_audio(self):
-        self.audio_format, pcm_data = read_audio(self.audio_type, self.audio_file)
-        rate, channels, width = self.audio_format
-        if width < 1 or width > 4 or width == 3:
-            raise ValueError('Unsupported sample width: {}'.format(width))
-        dtype = [None, np.int8, np.int16, None, np.int32][width]
-        samples = np.frombuffer(pcm_data, dtype=dtype)
-        samples = samples[::channels]  # limited to mono for now
-        # later something like: range(channels).map(lambda c: samples[c::channels])
-        samples = samples.astype(np.float32) / np.iinfo(dtype).max
-        self.audio = np.expand_dims(samples, axis=1)
 
-
-class SDB(Sequence):
+class SDB(Iterable):
     def __init__(self, sdb_filename):
         super().__init__()
         self.sdb_filename = sdb_filename
-        with open(sdb_filename, 'rb') as sdb_file:
+        with open(sdb_filename, 'rb', buffering=BUFFER_SIZE) as sdb_file:
             magic = sdb_file.read(len(MAGIC))
             if magic != MAGIC:
                 raise RuntimeError('No Sample Database')
@@ -87,7 +78,7 @@ class SDB(Sequence):
         column_data = [None] * len(columns)
         found = 0
         if not 0 <= row_index < len(self.offsets):
-            raise RuntimeError('Wrong sample index')
+            raise RuntimeError('Wrong sample index: {} - has to be between 0 and {}'.format(row_index, len(self.offsets)))
         with open(self.sdb_filename, 'rb') as sdb_file:
             sdb_file.seek(self.offsets[row_index] + INT_SIZE)
             for index in range(len(self.schema)):
@@ -107,11 +98,15 @@ class SDB(Sequence):
         sample_id = self.sdb_filename + ':' + str(i)
         return Sample(sample_id, AUDIO_TYPE_OPUS, opus_data, transcript)
 
+    def __iter__(self):
+        for i in range(len(self.offsets)):
+            yield self[i]
+
     def __len__(self):
         return len(self.offsets)
 
 
-class CSV(Sequence):
+class CSV(Iterable):
     def __init__(self, csv_filename):
         super().__init__()
         self.csv_filename = csv_filename
@@ -123,12 +118,17 @@ class CSV(Sequence):
                 wav_filename = Path(row['wav_filename'])
                 if not wav_filename.is_absolute():
                     wav_filename = csv_dir / wav_filename
-                self.rows.append((str(wav_filename), row['transcript']))
+                self.rows.append((str(wav_filename), int(row['wav_filesize']), row['transcript']))
+        self.rows.sort(key=lambda r: r[1])
 
     def __getitem__(self, i):
-        wav_filename, transcript = self.rows[i]
+        wav_filename, _, transcript = self.rows[i]
         with open(wav_filename, 'rb') as wav_file:
             return Sample(wav_filename, AUDIO_TYPE_WAV, wav_file.read(), transcript)
+
+    def __iter__(self):
+        for i in range(len(self.rows)):
+            yield self[i]
 
     def __len__(self):
         return len(self.rows)
@@ -139,29 +139,54 @@ class Interleaved(Iterable):
         super().__init__()
         self.cols = cols
 
-    def get_samples(self):
+    def __iter__(self):
         firsts = []
-        for col in self.cols:
+        for index, col in enumerate(self.cols):
             it = iter(col)
             try:
                 first = next(it)
-                firsts.append((it, first))
+                firsts.append((index, it, first))
             except StopIteration:
                 continue
         while len(firsts) > 0:
-            firsts.sort(key=lambda it_first: it_first[1].duration)
-            it, first = firsts.pop(0)
+            firsts.sort(key=lambda it_first: it_first[2].duration)
+            index, it, first = firsts.pop(0)
             yield first
             try:
                 first = next(it)
             except StopIteration:
                 continue
-            firsts.append((it, first))
+            firsts.append((index, it, first))
 
-    def __iter__(self):
-        for sample in self.get_samples():
-            sample.prepare_audio()
-            yield sample
+    def __len__(self):
+        return sum(map(lambda c: len(c), self.cols))
+
+
+class LimitingPool:
+    def __init__(self, processes=None, limit_factor=2, sleeping_for=0.1):
+        self.processes = os.cpu_count() if processes is None else processes
+        self.pool = ThreadPool(processes=processes)
+        self.sleeping_for = sleeping_for
+        self.max_parallel = self.processes * limit_factor
+        self.processing = 0
+
+    def __enter__(self):
+        return self
+
+    def limit(self, it):
+        for obj in it:
+            while self.processing >= self.max_parallel:
+                time.sleep(self.sleeping_for)
+            self.processing += 1
+            yield obj
+
+    def map(self, fun, it):
+        for obj in self.pool.imap(fun, self.limit(it)):
+            self.processing -= 1
+            yield obj
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.pool.close()
 
 
 def collection_from_file(filename):
@@ -178,8 +203,22 @@ def collection_from_file(filename):
 
 def collection_from_files(filenames):
     if len(filenames) == 0:
-        raise RuntimeError('No filenames provided')
+        raise RuntimeError('No files')
     if len(filenames) == 1:
         return collection_from_file(filenames[0])
     cols = list(map(lambda filename: collection_from_file(filename), filenames))
     return Interleaved(*cols)
+
+
+def _prepare_sample_audio(sample):
+    sample.audio_format, pcm_data = read_audio(sample.audio_type, sample.audio_file)
+    sample.audio = pcm_to_np(sample.audio_format, pcm_data)
+    sample.audio_file.close()
+    sample.audio_file = None
+    return sample
+
+
+def prepare_audio(col):
+    with LimitingPool() as pool:
+        for current_sample in pool.map(_prepare_sample_audio, col):
+            yield current_sample

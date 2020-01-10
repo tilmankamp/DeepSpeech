@@ -5,6 +5,7 @@ import wave
 import opuslib
 import tempfile
 import collections
+import numpy as np
 from webrtcvad import Vad
 
 DEFAULT_RATE = 16000
@@ -27,9 +28,9 @@ def read_audio_format_from_wav_file(wav_file):
     return wav_file.getframerate(), wav_file.getnchannels(), wav_file.getsampwidth()
 
 
-def get_num_samples(buffer_len, audio_format=DEFAULT_FORMAT):
+def get_num_samples(pcm_len, audio_format=DEFAULT_FORMAT):
     _, channels, width = audio_format
-    return buffer_len // (channels * width)
+    return pcm_len // (channels * width)
 
 
 def get_pcm_duration(pcm_len, audio_format=DEFAULT_FORMAT):
@@ -151,9 +152,13 @@ def unpack_number(data):
     return int.from_bytes(data, 'big', signed=False)
 
 
+def get_opus_frame_size(rate):
+    return 60 * rate // 1000
+
+
 def write_opus(opus_file, audio_format, audio_data):
     rate, channels, width = audio_format
-    frame_size = 60 * rate // 1000
+    frame_size = get_opus_frame_size(rate)
     encoder = opuslib.Encoder(rate, channels, opuslib.APPLICATION_AUDIO)
     chunk_size = frame_size * channels * width
     opus_file.write(pack_number(len(audio_data), 4))
@@ -179,7 +184,7 @@ def read_opus_header(opus_file):
 def read_opus(opus_file):
     pcm_len, audio_format = read_opus_header(opus_file)
     rate, channels, _ = audio_format
-    frame_size = 60 * rate // 1000
+    frame_size = get_opus_frame_size(rate)
     decoder = opuslib.Decoder(rate, channels)
     audio_data = bytearray()
     while len(audio_data) < pcm_len:
@@ -191,10 +196,12 @@ def read_opus(opus_file):
     return audio_format, audio_data
 
 
-def read_wav(wav_data):
-    with io.BytesIO(wav_data) as base_wav_file:
-        with wave.open(base_wav_file, 'rb') as wav_file:
-            return read_audio_format_from_wav_file(wav_file), wav_file.readframes()
+def read_wav(wav_file):
+    wav_file.seek(0)
+    with wave.open(wav_file, 'rb') as wav_file_reader:
+        audio_format = read_audio_format_from_wav_file(wav_file_reader)
+        pcm_data = wav_file_reader.readframes(wav_file_reader.getnframes())
+        return audio_format, pcm_data
 
 
 def read_audio(audio_type, audio_file):
@@ -207,6 +214,7 @@ def read_audio(audio_type, audio_file):
 
 
 def read_wav_duration(wav_file):
+    wav_file.seek(0)
     with wave.open(wav_file, 'rb') as wav_file_reader:
         return wav_file_reader.getnframes() / wav_file_reader.getframerate()
 
@@ -225,15 +233,12 @@ def read_duration(audio_type, audio_file):
         raise ValueError('Unsupported audio format: {}'.format(audio_type))
 
 
-def convert_to_wav(audio_type, audio_file):
-    audio_format = None
-    if audio_type == AUDIO_TYPE_WAV:
-        return audio_file
-    else:
-        audio_format, audio_data = read_audio(audio_type, audio_file)
-    memory_wav_file = io.BytesIO()
-    with wave.open(memory_wav_file, 'wb') as wav_file:
-        write_audio_format_to_wav_file(wav_file, audio_format)
-        wav_file.writeframes(audio_data)
-    memory_wav_file.seek(0)
-    return memory_wav_file
+def pcm_to_np(audio_format, pcm_data):
+    _, channels, width = audio_format
+    if width < 1 or width > 4 or width == 3:
+        raise ValueError('Unsupported sample width: {}'.format(width))
+    dtype = [None, np.int8, np.int16, None, np.int32][width]
+    samples = np.frombuffer(pcm_data, dtype=dtype)
+    samples = samples[::channels]  # limited to mono for now
+    samples = samples.astype(np.float32) / np.iinfo(dtype).max
+    return np.expand_dims(samples, axis=1)

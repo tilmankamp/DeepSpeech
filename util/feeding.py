@@ -15,8 +15,8 @@ from util.config import Config
 from util.text import text_to_char_array
 from util.flags import FLAGS
 from util.spectrogram_augmentations import augment_freq_time_mask, augment_dropout, augment_pitch_and_tempo, augment_speed_up, augment_sparse_warp
-from util.audio import read_frames_from_file, vad_split, DEFAULT_FORMAT
-from util.collections import collection_from_files
+from util.audio import read_frames_from_file, vad_split, pcm_to_np, DEFAULT_FORMAT
+from util.collections import collection_from_files, prepare_audio
 
 def read_csvs(csv_files):
     sets = []
@@ -110,8 +110,9 @@ def to_sparse_tuple(sequence):
 
 def create_dataset(sources, batch_size, enable_cache=False, cache_path=None, train_phase=False):
     def generate_values():
-        for sample in collection_from_files(sources):
-            transcript = to_sparse_tuple(text_to_char_array(sample.transcript, Config.alphabet))
+        for sample in prepare_audio(collection_from_files(sources)):
+            transcript = Config.alphabet.encode(sample.transcript)
+            transcript = to_sparse_tuple(transcript)
             yield sample.id, sample.audio, sample.audio_format[0], transcript
 
     # Batching a dataset of 2D SparseTensors creates 3D batches, which fail
@@ -121,27 +122,23 @@ def create_dataset(sources, batch_size, enable_cache=False, cache_path=None, tra
         shape = sparse.dense_shape
         return tf.sparse.reshape(sparse, [shape[0], shape[2]])
 
-    def batch_fn(wav_filenames, features, features_len, transcripts):
+    def batch_fn(sample_ids, features, features_len, transcripts):
         features = tf.data.Dataset.zip((features, features_len))
-        features = features.padded_batch(batch_size,
-                                         padded_shapes=([None, Config.n_input], []))
+        features = features.padded_batch(batch_size, padded_shapes=([None, Config.n_input], []))
         transcripts = transcripts.batch(batch_size).map(sparse_reshape)
-        wav_filenames = wav_filenames.batch(batch_size)
-        return tf.data.Dataset.zip((wav_filenames, features, transcripts))
+        sample_ids = sample_ids.batch(batch_size)
+        return tf.data.Dataset.zip((sample_ids, features, transcripts))
 
-    num_gpus = len(Config.available_devices)
     process_fn = partial(entry_to_features, train_phase=train_phase)
 
     dataset = (tf.data.Dataset.from_generator(generate_values,
-                                              output_types=(tf.string, tf.int32, tf.float32, (tf.int64, tf.int32, tf.int64)))
+                                              output_types=(tf.string, tf.float32, tf.int32,
+                                                            (tf.int64, tf.int32, tf.int64)))
                               .map(process_fn, num_parallel_calls=tf.data.experimental.AUTOTUNE))
-
     if enable_cache:
         dataset = dataset.cache(cache_path)
-
     dataset = (dataset.window(batch_size, drop_remainder=True).flat_map(batch_fn)
-                      .prefetch(num_gpus))
-
+                      .prefetch(len(Config.available_devices)))
     return dataset
 
 
@@ -151,21 +148,17 @@ def split_audio_file(audio_path,
                      aggressiveness=3,
                      outlier_duration_ms=10000,
                      outlier_batch_size=1):
-    sample_rate, _, sample_width = audio_format
-    multiplier = 1.0 / (1 << (8 * sample_width - 1))
 
     def generate_values():
         frames = read_frames_from_file(audio_path)
         segments = vad_split(frames, aggressiveness=aggressiveness)
         for segment in segments:
             segment_buffer, time_start, time_end = segment
-            samples = np.frombuffer(segment_buffer, dtype=np.int16)
-            samples = samples * multiplier
-            samples = np.expand_dims(samples, axis=1)
+            samples = pcm_to_np(audio_format, segment_buffer)
             yield time_start, time_end, samples
 
     def to_mfccs(time_start, time_end, samples):
-        features, features_len = samples_to_mfccs(samples, sample_rate)
+        features, features_len = samples_to_mfccs(samples, audio_format[0])
         return time_start, time_end, features, features_len
 
     def create_batch_set(bs, criteria):

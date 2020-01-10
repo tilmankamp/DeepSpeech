@@ -63,7 +63,7 @@ def read_csvs():
                 wav_filename = Path(row['wav_filename'])
                 if not wav_filename.is_absolute():
                     wav_filename = csv_dir / wav_filename
-                sample = Sample(str(wav_filename), row['wav_filesize'], row['transcript'])
+                sample = Sample(str(wav_filename), int(row['wav_filesize']), row['transcript'])
                 samples.append(sample)
     print('Sorting samples...')
     samples.sort(key=lambda s: s.wav_filesize)
@@ -101,7 +101,7 @@ def build_sdb():
         sdb_file.write((0).to_bytes(BIGINT_SIZE, BIG_ENDIAN))
         sdb_file.write(len(samples).to_bytes(BIGINT_SIZE, BIG_ENDIAN))
         # os.mkdir(CLI_ARGS.target + '.samples')
-        with Pool() as pool:
+        with Pool(32) as pool:
             bar = progressbar.ProgressBar(max_value=len(samples), widgets=SIMPLE_BAR)
             for buffer in bar(pool.imap(build_sample_entry, samples)):
                 offsets.append(sdb_file.tell())
