@@ -7,6 +7,7 @@ import numpy as np
 import tensorflow as tf
 
 from tensorflow.python.ops import gen_audio_ops as contrib_audio
+from multiprocessing import Queue
 
 from util.config import Config
 from util.text import text_to_char_array
@@ -94,7 +95,28 @@ def to_sparse_tuple(sequence):
     return indices, sequence, shape
 
 
-def create_dataset(sources, batch_size, enable_cache=False, cache_path=None, train_phase=False):
+class ExceptionBox:
+    def __init__(self):
+        self.exception = None
+
+    def raise_if_set(self):
+        if self.exception is not None:
+            raise self.exception  # pylint: disable = raising-bad-type
+
+
+def remember_exception(iterable, exception_box=None):
+    def do_iterate():
+        try:
+            for obj in iterable():
+                yield obj
+        except StopIteration:
+            return
+        except Exception as ex:  # pylint: disable = broad-except
+            exception_box.exception = ex
+    return iterable if exception_box is None else do_iterate
+
+
+def create_dataset(sources, batch_size, enable_cache=False, cache_path=None, train_phase=False, exception_box=None):
     def generate_values():
         for sample in samples_from_files(sources):
             transcript = text_to_char_array(sample.transcript, Config.alphabet, context=sample.id)
@@ -117,7 +139,7 @@ def create_dataset(sources, batch_size, enable_cache=False, cache_path=None, tra
 
     process_fn = partial(entry_to_features, train_phase=train_phase)
 
-    dataset = (tf.data.Dataset.from_generator(generate_values,
+    dataset = (tf.data.Dataset.from_generator(remember_exception(generate_values, exception_box),
                                               output_types=(tf.string, tf.float32, tf.int32,
                                                             (tf.int64, tf.int32, tf.int64)))
                               .map(process_fn, num_parallel_calls=tf.data.experimental.AUTOTUNE))
@@ -133,8 +155,8 @@ def split_audio_file(audio_path,
                      batch_size=1,
                      aggressiveness=3,
                      outlier_duration_ms=10000,
-                     outlier_batch_size=1):
-
+                     outlier_batch_size=1,
+                     exception_box=None):
     def generate_values():
         frames = read_frames_from_file(audio_path)
         segments = vad_split(frames, aggressiveness=aggressiveness)
@@ -149,7 +171,8 @@ def split_audio_file(audio_path,
 
     def create_batch_set(bs, criteria):
         return (tf.data.Dataset
-                .from_generator(generate_values, output_types=(tf.int32, tf.int32, tf.float32))
+                .from_generator(remember_exception(generate_values, exception_box),
+                                output_types=(tf.int32, tf.int32, tf.float32))
                 .map(to_mfccs, num_parallel_calls=tf.data.experimental.AUTOTUNE)
                 .filter(criteria)
                 .padded_batch(bs, padded_shapes=([], [], [None, Config.n_input], [])))

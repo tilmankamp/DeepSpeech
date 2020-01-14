@@ -24,7 +24,7 @@ from six.moves import zip, range
 from tensorflow.python.tools import freeze_graph, strip_unused_lib
 from tensorflow.python.framework import errors_impl
 from util.config import Config, initialize_globals
-from util.feeding import create_dataset, samples_to_mfccs, audiofile_to_features
+from util.feeding import create_dataset, samples_to_mfccs, audiofile_to_features, ExceptionBox
 from util.flags import create_flags, FLAGS
 from util.logging import log_info, log_error, log_debug, log_progress, create_progressbar
 
@@ -433,12 +433,15 @@ def train():
             FLAGS.augmentation_sparse_warp):
         do_cache_dataset = False
 
+    exception_box = ExceptionBox()
+
     # Create training and validation datasets
     train_set = create_dataset(FLAGS.train_files.split(','),
                                batch_size=FLAGS.train_batch_size,
                                enable_cache=FLAGS.feature_cache and do_cache_dataset,
                                cache_path=FLAGS.feature_cache,
-                               train_phase=True)
+                               train_phase=True,
+                               exception_box=exception_box)
 
     iterator = tfv1.data.Iterator.from_structure(tfv1.data.get_output_types(train_set),
                                                  tfv1.data.get_output_shapes(train_set),
@@ -448,8 +451,9 @@ def train():
     train_init_op = iterator.make_initializer(train_set)
 
     if FLAGS.dev_files:
-        dev_csvs = FLAGS.dev_files.split(',')
-        dev_sets = [create_dataset([csv], batch_size=FLAGS.dev_batch_size, train_phase=False) for csv in dev_csvs]
+        dev_sources = FLAGS.dev_files.split(',')
+        dev_sets = [create_dataset([source], batch_size=FLAGS.dev_batch_size, train_phase=False)
+                    for source in dev_sources]
         dev_init_ops = [iterator.make_initializer(dev_set) for dev_set in dev_sets]
 
     # Dropout
@@ -607,6 +611,7 @@ def train():
                     else:
                         raise
                 except tf.errors.OutOfRangeError:
+                    exception_box.raise_if_set()
                     break
 
                 if problem_files.size > 0:
@@ -645,12 +650,12 @@ def train():
                     # Validation
                     dev_loss = 0.0
                     total_steps = 0
-                    for csv, init_op in zip(dev_csvs, dev_init_ops):
-                        log_progress('Validating epoch %d on %s...' % (epoch, csv))
-                        set_loss, steps = run_set('dev', epoch, init_op, dataset=csv)
+                    for source, init_op in zip(dev_sources, dev_init_ops):
+                        log_progress('Validating epoch %d on %s...' % (epoch, source))
+                        set_loss, steps = run_set('dev', epoch, init_op, dataset=source)
                         dev_loss += set_loss * steps
                         total_steps += steps
-                        log_progress('Finished validating epoch %d on %s - loss: %f' % (epoch, csv, set_loss))
+                        log_progress('Finished validating epoch %d on %s - loss: %f' % (epoch, source, set_loss))
                     dev_loss = dev_loss / total_steps
 
                     dev_losses.append(dev_loss)

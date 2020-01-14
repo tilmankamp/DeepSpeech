@@ -7,8 +7,6 @@ import time
 
 from pathlib import Path
 from multiprocessing.dummy import Pool as ThreadPool
-from collections.abc import Sequence, Iterable
-
 from util.audio import AUDIO_TYPE_WAV, AUDIO_TYPE_OPUS, read_duration, read_audio, pcm_to_np
 
 BIG_ENDIAN = 'big'
@@ -35,7 +33,7 @@ class Sample:
         self.audio_file = None
 
 
-class SDB(Iterable):
+class SDB:
     def __init__(self, sdb_filename):
         super().__init__()
         self.sdb_filename = sdb_filename
@@ -112,7 +110,7 @@ class SDB(Iterable):
         return len(self.offsets)
 
 
-class CSV(Iterable):
+class CSV:
     def __init__(self, csv_filename):
         super().__init__()
         self.csv_filename = csv_filename
@@ -140,7 +138,7 @@ class CSV(Iterable):
         return len(self.rows)
 
 
-class Interleaved(Iterable):
+class Interleaved:
     def __init__(self, *cols):
         super().__init__()
         self.cols = cols
@@ -200,7 +198,7 @@ def _load_audio(sample):
     return sample
 
 
-def prepare_audio(col):
+def load_audio(col):
     with LimitingPool() as pool:
         for current_sample in pool.map(_load_audio, col):
             yield current_sample
@@ -214,18 +212,18 @@ def _samples_from_file(filename):
     elif suffix == 'csv':
         col = CSV(filename)
     else:
-        raise RuntimeError('Unknown file suffix: ".{}"'.format(suffix))
+        raise ValueError('Unknown file suffix: ".{}"'.format(suffix))
     return col
 
 
 def samples_from_file(filename):
-    return prepare_audio(_samples_from_file(filename))
+    return load_audio(_samples_from_file(filename))
 
 
 def samples_from_files(filenames):
     if len(filenames) == 0:
-        raise RuntimeError('No files')
+        raise ValueError('No files')
     if len(filenames) == 1:
-        return _samples_from_file(filenames[0])
-    cols = list(map(lambda filename: _samples_from_file(filename), filenames))
-    return prepare_audio(Interleaved(*cols))
+        return samples_from_file(filenames[0])
+    cols = list(map(_samples_from_file, filenames))
+    return load_audio(Interleaved(*cols))
