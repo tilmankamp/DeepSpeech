@@ -121,19 +121,22 @@ class UTF8Alphabet(object):
         return ''
 
 
-def text_to_char_array(series, alphabet):
+def text_to_char_array(transcript, alphabet, context=None):
     r"""
-    Given a Pandas Series containing transcript string, map characters to
+    Given a transcript string, map characters to
     integers and return a numpy array representing the processed string.
+    Use a string in `context` for adding text to raised exceptions.
     """
+    context = '' if context is None else 'While processing: {}\n'.format(context)
     try:
-        transcript = np.asarray(alphabet.encode(series['transcript']))
+        transcript = alphabet.encode(transcript)
         if len(transcript) == 0:
-            raise ValueError('While processing: {}\nFound an empty transcript! You must include a transcript for all training data.'.format(series['wav_filename']))
+            raise ValueError('{}Found an empty transcript! You must include a transcript for all training data.'
+                             .format(context))
         return transcript
     except KeyError as e:
         # Provide the row context (especially wav_filename) for alphabet errors
-        raise ValueError('While processing: {}\n{}'.format(series['wav_filename'], e))
+        raise ValueError('{}{}'.format(context, e))
 
 
 # The following code is from: http://hetland.org/coding/python/levenshtein.py

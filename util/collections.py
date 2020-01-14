@@ -28,6 +28,12 @@ class Sample:
         self.transcript = transcript
         self.duration = read_duration(audio_type, self.audio_file)
 
+    def load_audio(self):
+        self.audio_format, pcm_data = read_audio(self.audio_type, self.audio_file)
+        self.audio = pcm_to_np(self.audio_format, pcm_data)
+        self.audio_file.close()
+        self.audio_file = None
+
 
 class SDB(Iterable):
     def __init__(self, sdb_filename):
@@ -167,29 +173,40 @@ class LimitingPool:
         self.processes = os.cpu_count() if processes is None else processes
         self.pool = ThreadPool(processes=processes)
         self.sleeping_for = sleeping_for
-        self.max_parallel = self.processes * limit_factor
-        self.processing = 0
+        self.max_ahead = self.processes * limit_factor
+        self.processed = 0
 
     def __enter__(self):
         return self
 
     def limit(self, it):
         for obj in it:
-            while self.processing >= self.max_parallel:
+            while self.processed >= self.max_ahead:
                 time.sleep(self.sleeping_for)
-            self.processing += 1
+            self.processed += 1
             yield obj
 
     def map(self, fun, it):
         for obj in self.pool.imap(fun, self.limit(it)):
-            self.processing -= 1
+            self.processed -= 1
             yield obj
 
     def __exit__(self, exc_type, exc_value, traceback):
         self.pool.close()
 
 
-def collection_from_file(filename):
+def _load_audio(sample):
+    sample.load_audio()
+    return sample
+
+
+def prepare_audio(col):
+    with LimitingPool() as pool:
+        for current_sample in pool.map(_load_audio, col):
+            yield current_sample
+
+
+def _samples_from_file(filename):
     col = None
     suffix = filename.split('.')[-1].lower()
     if suffix == 'sdb':
@@ -201,24 +218,14 @@ def collection_from_file(filename):
     return col
 
 
-def collection_from_files(filenames):
+def samples_from_file(filename):
+    return prepare_audio(_samples_from_file(filename))
+
+
+def samples_from_files(filenames):
     if len(filenames) == 0:
         raise RuntimeError('No files')
     if len(filenames) == 1:
-        return collection_from_file(filenames[0])
-    cols = list(map(lambda filename: collection_from_file(filename), filenames))
-    return Interleaved(*cols)
-
-
-def _prepare_sample_audio(sample):
-    sample.audio_format, pcm_data = read_audio(sample.audio_type, sample.audio_file)
-    sample.audio = pcm_to_np(sample.audio_format, pcm_data)
-    sample.audio_file.close()
-    sample.audio_file = None
-    return sample
-
-
-def prepare_audio(col):
-    with LimitingPool() as pool:
-        for current_sample in pool.map(_prepare_sample_audio, col):
-            yield current_sample
+        return _samples_from_file(filenames[0])
+    cols = list(map(lambda filename: _samples_from_file(filename), filenames))
+    return prepare_audio(Interleaved(*cols))

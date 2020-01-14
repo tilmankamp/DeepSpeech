@@ -1,12 +1,9 @@
 # -*- coding: utf-8 -*-
 from __future__ import absolute_import, division, print_function
 
-import os
-
 from functools import partial
 
 import numpy as np
-import pandas
 import tensorflow as tf
 
 from tensorflow.python.ops import gen_audio_ops as contrib_audio
@@ -16,18 +13,7 @@ from util.text import text_to_char_array
 from util.flags import FLAGS
 from util.spectrogram_augmentations import augment_freq_time_mask, augment_dropout, augment_pitch_and_tempo, augment_speed_up, augment_sparse_warp
 from util.audio import read_frames_from_file, vad_split, pcm_to_np, DEFAULT_FORMAT
-from util.collections import collection_from_files, prepare_audio
-
-def read_csvs(csv_files):
-    sets = []
-    for csv in csv_files:
-        file = pandas.read_csv(csv, encoding='utf-8', na_filter=False)
-        #FIXME: not cross-platform
-        csv_dir = os.path.dirname(os.path.abspath(csv))
-        file['wav_filename'] = file['wav_filename'].str.replace(r'(^[^/])', lambda m: os.path.join(csv_dir, m.group(1))) # pylint: disable=cell-var-from-loop
-        sets.append(file)
-    # Concat all sets, drop any extra columns, re-index the final result as 0..N
-    return pandas.concat(sets, join='inner', ignore_index=True)
+from util.collections import samples_from_files
 
 
 def samples_to_mfccs(samples, sample_rate, train_phase=False):
@@ -110,8 +96,8 @@ def to_sparse_tuple(sequence):
 
 def create_dataset(sources, batch_size, enable_cache=False, cache_path=None, train_phase=False):
     def generate_values():
-        for sample in prepare_audio(collection_from_files(sources)):
-            transcript = Config.alphabet.encode(sample.transcript)
+        for sample in samples_from_files(sources):
+            transcript = text_to_char_array(sample.transcript, Config.alphabet, context=sample.id)
             transcript = to_sparse_tuple(transcript)
             yield sample.id, sample.audio, sample.audio_format[0], transcript
 
