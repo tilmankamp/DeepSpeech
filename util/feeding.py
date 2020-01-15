@@ -7,14 +7,14 @@ import numpy as np
 import tensorflow as tf
 
 from tensorflow.python.ops import gen_audio_ops as contrib_audio
-from multiprocessing import Queue
 
 from util.config import Config
 from util.text import text_to_char_array
 from util.flags import FLAGS
 from util.spectrogram_augmentations import augment_freq_time_mask, augment_dropout, augment_pitch_and_tempo, augment_speed_up, augment_sparse_warp
-from util.audio import read_frames_from_file, vad_split, pcm_to_np, DEFAULT_FORMAT
+from util.audio import convert_samples, read_frames_from_file, vad_split, pcm_to_np, DEFAULT_FORMAT, AUDIO_TYPE_NP
 from util.collections import samples_from_files
+from util.helpers import remember_exception
 
 
 def samples_to_mfccs(samples, sample_rate, train_phase=False):
@@ -95,30 +95,9 @@ def to_sparse_tuple(sequence):
     return indices, sequence, shape
 
 
-class ExceptionBox:
-    def __init__(self):
-        self.exception = None
-
-    def raise_if_set(self):
-        if self.exception is not None:
-            raise self.exception  # pylint: disable = raising-bad-type
-
-
-def remember_exception(iterable, exception_box=None):
-    def do_iterate():
-        try:
-            for obj in iterable():
-                yield obj
-        except StopIteration:
-            return
-        except Exception as ex:  # pylint: disable = broad-except
-            exception_box.exception = ex
-    return iterable if exception_box is None else do_iterate
-
-
 def create_dataset(sources, batch_size, enable_cache=False, cache_path=None, train_phase=False, exception_box=None):
     def generate_values():
-        for sample in samples_from_files(sources):
+        for sample in convert_samples(samples_from_files(sources), AUDIO_TYPE_NP):
             transcript = text_to_char_array(sample.transcript, Config.alphabet, context=sample.id)
             transcript = to_sparse_tuple(transcript)
             yield sample.id, sample.audio, sample.audio_format[0], transcript
@@ -184,9 +163,3 @@ def split_audio_file(audio_path,
     dataset = nds.concatenate(ods)
     dataset = dataset.prefetch(len(Config.available_devices))
     return dataset
-
-
-def secs_to_hours(secs):
-    hours, remainder = divmod(secs, 3600)
-    minutes, seconds = divmod(remainder, 60)
-    return '%d:%02d:%02d' % (hours, minutes, seconds)

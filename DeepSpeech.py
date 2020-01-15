@@ -24,9 +24,10 @@ from six.moves import zip, range
 from tensorflow.python.tools import freeze_graph, strip_unused_lib
 from tensorflow.python.framework import errors_impl
 from util.config import Config, initialize_globals
-from util.feeding import create_dataset, samples_to_mfccs, audiofile_to_features, ExceptionBox
+from util.feeding import create_dataset, samples_to_mfccs, audiofile_to_features
 from util.flags import create_flags, FLAGS
 from util.logging import log_info, log_error, log_debug, log_progress, create_progressbar
+from util.helpers import ExceptionBox
 
 
 # Graph Creation
@@ -452,8 +453,10 @@ def train():
 
     if FLAGS.dev_files:
         dev_sources = FLAGS.dev_files.split(',')
-        dev_sets = [create_dataset([source], batch_size=FLAGS.dev_batch_size, train_phase=False)
-                    for source in dev_sources]
+        dev_sets = [create_dataset([source],
+                                   batch_size=FLAGS.dev_batch_size,
+                                   train_phase=False,
+                                   exception_box=exception_box) for source in dev_sources]
         dev_init_ops = [iterator.make_initializer(dev_set) for dev_set in dev_sets]
 
     # Dropout

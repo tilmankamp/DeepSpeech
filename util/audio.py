@@ -1,19 +1,70 @@
 import os
+import io
 import sox
 import wave
 import opuslib
 import tempfile
 import collections
 import numpy as np
+
 from webrtcvad import Vad
+from functools import partial
+from util.helpers import LimitingPool
 
 DEFAULT_RATE = 16000
 DEFAULT_CHANNELS = 1
 DEFAULT_WIDTH = 2
 DEFAULT_FORMAT = (DEFAULT_RATE, DEFAULT_CHANNELS, DEFAULT_WIDTH)
 
-AUDIO_TYPE_WAV = 'audio/wav'
-AUDIO_TYPE_OPUS = 'audio/opus'
+AUDIO_TYPE_NP = 'np'
+AUDIO_TYPE_PCM = 'pcm'
+AUDIO_FILE_PREFIX = 'audio/'
+AUDIO_TYPE_WAV = AUDIO_FILE_PREFIX + 'wav'
+AUDIO_TYPE_OPUS = AUDIO_FILE_PREFIX + 'opus'
+LOADABLE_FILE_FORMATS = [AUDIO_TYPE_WAV, AUDIO_TYPE_OPUS]
+
+OPUS_PCM_LEN_SIZE = 4
+OPUS_RATE_SIZE = 2
+OPUS_CHANNELS_SIZE = 1
+OPUS_WIDTH_SIZE = 1
+OPUS_CHUNK_LEN_SIZE = 2
+
+NP_TYPE_LOOKUP = [None, np.int8, np.int16, None, np.int32]
+
+
+class Sample:
+    def __init__(self, audio_type, raw_data):
+        self.audio_type = audio_type
+        self.audio_format = None
+        self.audio = io.BytesIO(raw_data)
+        self.duration = read_duration(audio_type, self.audio)
+
+    def convert(self, new_audio_type):
+        if self.audio_type == new_audio_type:
+            return
+        if new_audio_type == AUDIO_TYPE_PCM and self.audio_type[:6] == AUDIO_FILE_PREFIX:
+            self.audio_format, audio = read_audio(self.audio_type, self.audio)
+            self.audio.close()
+            self.audio = audio
+            self.audio_type = AUDIO_TYPE_PCM
+        elif new_audio_type == AUDIO_TYPE_NP:
+            self.convert(AUDIO_TYPE_PCM)
+            self.audio = pcm_to_np(self.audio_format, self.audio)
+        else:
+            raise RuntimeError('Audio conversion from "{}" to "{}" not supported'
+                               .format(self.audio_type, new_audio_type))
+
+
+def _convert_sample(sample, audio_type=AUDIO_TYPE_PCM):
+    sample.convert(audio_type)
+    return sample
+
+
+def convert_samples(samples, audio_type=AUDIO_TYPE_PCM):
+    with LimitingPool() as pool:
+        convert_sample_fn = partial(_convert_sample, audio_type=audio_type)
+        for current_sample in pool.map(convert_sample_fn, samples):
+            yield current_sample
 
 
 def write_audio_format_to_wav_file(wav_file, audio_format=DEFAULT_FORMAT):
@@ -160,23 +211,23 @@ def write_opus(opus_file, audio_format, audio_data):
     frame_size = get_opus_frame_size(rate)
     encoder = opuslib.Encoder(rate, channels, opuslib.APPLICATION_AUDIO)
     chunk_size = frame_size * channels * width
-    opus_file.write(pack_number(len(audio_data), 4))
-    opus_file.write(pack_number(rate, 2))
-    opus_file.write(pack_number(channels, 1))
-    opus_file.write(pack_number(width, 1))
+    opus_file.write(pack_number(len(audio_data), OPUS_PCM_LEN_SIZE))
+    opus_file.write(pack_number(rate, OPUS_RATE_SIZE))
+    opus_file.write(pack_number(channels, OPUS_CHANNELS_SIZE))
+    opus_file.write(pack_number(width, OPUS_WIDTH_SIZE))
     for i in range(0, len(audio_data), chunk_size):
         chunk = audio_data[i:i + chunk_size]
         encoded = encoder.encode(chunk, frame_size)
-        opus_file.write(pack_number(len(encoded), 2))
+        opus_file.write(pack_number(len(encoded), OPUS_CHUNK_LEN_SIZE))
         opus_file.write(encoded)
 
 
 def read_opus_header(opus_file):
     opus_file.seek(0)
-    pcm_len = unpack_number(opus_file.read(4))
-    rate = unpack_number(opus_file.read(2))
-    channels = unpack_number(opus_file.read(1))
-    width = unpack_number(opus_file.read(1))
+    pcm_len = unpack_number(opus_file.read(OPUS_PCM_LEN_SIZE))
+    rate = unpack_number(opus_file.read(OPUS_RATE_SIZE))
+    channels = unpack_number(opus_file.read(OPUS_CHANNELS_SIZE))
+    width = unpack_number(opus_file.read(OPUS_WIDTH_SIZE))
     return pcm_len, (rate, channels, width)
 
 
@@ -187,8 +238,8 @@ def read_opus(opus_file):
     decoder = opuslib.Decoder(rate, channels)
     audio_data = bytearray()
     while len(audio_data) < pcm_len:
-        chunk_size = unpack_number(opus_file.read(2))
-        chunk = opus_file.read(chunk_size)
+        chunk_len = unpack_number(opus_file.read(OPUS_CHUNK_LEN_SIZE))
+        chunk = opus_file.read(chunk_len)
         decoded = decoder.decode(chunk, frame_size)
         audio_data.extend(decoded)
     audio_data = audio_data[:pcm_len]
@@ -236,7 +287,7 @@ def pcm_to_np(audio_format, pcm_data):
     _, channels, width = audio_format
     if width < 1 or width > 4 or width == 3:
         raise ValueError('Unsupported sample width: {}'.format(width))
-    dtype = [None, np.int8, np.int16, None, np.int32][width]
+    dtype = NP_TYPE_LOOKUP[width]
     samples = np.frombuffer(pcm_data, dtype=dtype)
     samples = samples[::channels]  # limited to mono for now
     samples = samples.astype(np.float32) / np.iinfo(dtype).max

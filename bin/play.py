@@ -15,19 +15,19 @@ import random
 import argparse
 import simpleaudio
 
-from util.audio import read_audio
-from util.collections import collection_from_file
+from util.collections import samples_from_file
+from util.audio import AUDIO_TYPE_PCM
 
 
 def play_collection():
-    col = collection_from_file(CLI_ARGS.collection)
+    samples = samples_from_file(CLI_ARGS.collection, buffering=0)
     while True:
-        index = random.randrange(0, len(col))
-        sample = col[index]
+        index = random.randrange(0, len(samples))
+        sample = samples[index]
         print('Sample index: {} - transcript: "{}"'.format(index, sample.transcript))
-        audio_format, audio_data = read_audio(sample.audio_type, sample.audio_file)
-        rate, channels, width = audio_format
-        wave_obj = simpleaudio.WaveObject(audio_data, channels, width, rate)
+        sample.convert(AUDIO_TYPE_PCM)
+        rate, channels, width = sample.audio_format
+        wave_obj = simpleaudio.WaveObject(sample.audio, channels, width, rate)
         play_obj = wave_obj.play()
         play_obj.wait_done()
 
