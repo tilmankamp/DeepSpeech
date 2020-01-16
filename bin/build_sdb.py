@@ -101,7 +101,8 @@ def build_sdb():
         sdb_file.write((0).to_bytes(BIGINT_SIZE, BIG_ENDIAN))
         sdb_file.write(len(samples).to_bytes(BIGINT_SIZE, BIG_ENDIAN))
         # os.mkdir(CLI_ARGS.target + '.samples')
-        with Pool(32) as pool:
+        num_workers = os.cpu_count() * CLI_ARGS.load_factor if CLI_ARGS.load_factor > 0 else 1
+        with Pool(num_workers) as pool:
             bar = progressbar.ProgressBar(max_value=len(samples), widgets=SIMPLE_BAR)
             for buffer in bar(pool.imap(build_sample_entry, samples)):
                 offsets.append(sdb_file.tell())
@@ -124,6 +125,8 @@ def build_sdb():
 def handle_args():
     parser = argparse.ArgumentParser(description='Tool for building Sample Databases (.sdb files) '
                                                  'from DeepSpeech CSV files')
+    parser.add_argument('--load_factor', type=int, default=1,
+                        help='CPU-multiplier for the number of parallel workers - 0 for 1 worker')
     parser.add_argument('csvs', nargs='+', help='CSV files')
     parser.add_argument('target', help='Sample DB to create')
     return parser.parse_args()

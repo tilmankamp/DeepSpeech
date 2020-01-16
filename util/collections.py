@@ -91,7 +91,8 @@ class SDB:
         column_data = [None] * len(columns)
         found = 0
         if not 0 <= row_index < len(self.offsets):
-            raise ValueError('Wrong sample index: {} - has to be between 0 and {}'.format(row_index, len(self.offsets)))
+            raise ValueError('Wrong sample index: {} - has to be between 0 and {}'
+                             .format(row_index, len(self.offsets) - 1))
         self.sdb_file.seek(self.offsets[row_index] + INT_SIZE)
         for index in range(len(self.schema)):
             chunk_len = int.from_bytes(self.sdb_file.read(INT_SIZE), BIG_ENDIAN)
@@ -189,6 +190,6 @@ def samples_from_files(filenames, buffering=BUFFER_SIZE):
     if len(filenames) == 0:
         raise ValueError('No files')
     if len(filenames) == 1:
-        return samples_from_file(filenames[0])
+        return samples_from_file(filenames[0], buffering=buffering)
     cols = list(map(partial(samples_from_file, buffering=buffering), filenames))
     return Interleaved(*cols)

@@ -77,6 +77,10 @@ echo "Moving ${sample_name} to LDC93S1.wav"
 mv "${DS_ROOT_TASK}/DeepSpeech/ds/data/smoke_test/${sample_name}" "${DS_ROOT_TASK}/DeepSpeech/ds/data/smoke_test/LDC93S1.wav"
 
 pushd ${HOME}/DeepSpeech/ds/
+    time ./bin/run-tc-ldc93s1_new_sdb.sh 220 "${sample_rate}"
+    # Run twice to test preprocessed features
+    time ./bin/run-tc-ldc93s1_new_sdb_csv.sh 109 "${sample_rate}"
+    time ./bin/run-tc-ldc93s1_new_sdb_csv.sh 1 "${sample_rate}"
     # Run twice to test preprocessed features
     time ./bin/run-tc-ldc93s1_new.sh 219 "${sample_rate}"
     time ./bin/run-tc-ldc93s1_new.sh 1 "${sample_rate}"
@@ -96,6 +100,7 @@ fi;
 
 pushd ${HOME}/DeepSpeech/ds/
     time ./bin/run-tc-ldc93s1_checkpoint.sh
+    time ./bin/run-tc-ldc93s1_checkpoint_sdb.sh
 popd
 
 deactivate
