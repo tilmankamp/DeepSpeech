@@ -42,10 +42,9 @@ class SDB:
         self.offsets = []
         self.sdb_filename = sdb_filename
         self.sdb_file = open(sdb_filename, 'rb', buffering=buffering)
-        magic = self.sdb_file.read(len(MAGIC))
-        if magic != MAGIC:
+        if self.sdb_file.read(len(MAGIC)) != MAGIC:
             raise RuntimeError('No Sample Database')
-        meta_chunk_len = int.from_bytes(self.sdb_file.read(BIGINT_SIZE), BIG_ENDIAN)
+        meta_chunk_len = self.read_big_int()
         self.meta = json.loads(self.sdb_file.read(meta_chunk_len))
         if SCHEMA_KEY not in self.meta:
             raise RuntimeError('Missing schema')
@@ -62,12 +61,17 @@ class SDB:
         text_type = self.schema[self.transcript_index][MIME_TYPE_KEY]
         if text_type != MIME_TYPE_TEXT:
             raise RuntimeError('Unsupported text type: {}'.format(text_type))
-        sample_chunk_len = int.from_bytes(self.sdb_file.read(BIGINT_SIZE), BIG_ENDIAN)
-        self.sdb_file.seek(sample_chunk_len, 1)
-        self.sdb_file.read(BIGINT_SIZE)
-        num_samples = int.from_bytes(self.sdb_file.read(BIGINT_SIZE), BIG_ENDIAN)
+        sample_chunk_len = self.read_big_int()
+        self.sdb_file.seek(sample_chunk_len + BIGINT_SIZE, 1)
+        num_samples = self.read_big_int()
         for _ in range(num_samples):
-            self.offsets.append(int.from_bytes(self.sdb_file.read(BIGINT_SIZE), BIG_ENDIAN))
+            self.offsets.append(self.read_big_int())
+
+    def read_int(self):
+        return int.from_bytes(self.sdb_file.read(INT_SIZE), BIG_ENDIAN)
+
+    def read_big_int(self):
+        return int.from_bytes(self.sdb_file.read(BIGINT_SIZE), BIG_ENDIAN)
 
     def find_column(self, content=None, mime_type=None):
         criteria = []
@@ -95,7 +99,7 @@ class SDB:
                              .format(row_index, len(self.offsets) - 1))
         self.sdb_file.seek(self.offsets[row_index] + INT_SIZE)
         for index in range(len(self.schema)):
-            chunk_len = int.from_bytes(self.sdb_file.read(INT_SIZE), BIG_ENDIAN)
+            chunk_len = self.read_int()
             if index in columns:
                 column_data[columns.index(index)] = self.sdb_file.read(chunk_len)
                 found += 1

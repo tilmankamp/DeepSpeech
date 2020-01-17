@@ -8,7 +8,6 @@ import collections
 import numpy as np
 
 from webrtcvad import Vad
-from functools import partial
 from util.helpers import LimitingPool
 
 DEFAULT_RATE = 16000
@@ -30,40 +29,55 @@ OPUS_WIDTH_SIZE = 1
 OPUS_CHUNK_LEN_SIZE = 2
 
 NP_TYPE_LOOKUP = [None, np.int8, np.int16, None, np.int32]
+UNSUPPORTED_TYPE = 'Unsupported audio type: {}'
 
 
 class Sample:
-    def __init__(self, audio_type, raw_data):
+    def __init__(self, audio_type, raw_data, audio_format=None):
         self.audio_type = audio_type
-        self.audio_format = None
-        self.audio = io.BytesIO(raw_data)
-        self.duration = read_duration(audio_type, self.audio)
+        self.audio_format = audio_format
+        if audio_type in LOADABLE_FILE_FORMATS:
+            self.audio = io.BytesIO(raw_data)
+            self.duration = read_duration(audio_type, self.audio)
+        else:
+            self.audio = raw_data
+            if self.audio_format is None:
+                raise ValueError('For audio type "{}" parameter "audio_format" is mandatory')
+            if audio_type == AUDIO_TYPE_PCM:
+                self.duration = get_pcm_duration(len(self.audio), self.audio_format)
+            elif audio_type == AUDIO_TYPE_NP:
+                self.duration = get_np_duration(len(self.audio), self.audio_format)
+            else:
+                raise ValueError(UNSUPPORTED_TYPE.format(self.audio_type))
 
     def convert(self, new_audio_type):
         if self.audio_type == new_audio_type:
             return
-        if new_audio_type == AUDIO_TYPE_PCM and self.audio_type[:6] == AUDIO_FILE_PREFIX:
+        if new_audio_type == AUDIO_TYPE_PCM and self.audio_type in LOADABLE_FILE_FORMATS:
             self.audio_format, audio = read_audio(self.audio_type, self.audio)
             self.audio.close()
             self.audio = audio
-            self.audio_type = AUDIO_TYPE_PCM
         elif new_audio_type == AUDIO_TYPE_NP:
             self.convert(AUDIO_TYPE_PCM)
             self.audio = pcm_to_np(self.audio_format, self.audio)
+        elif new_audio_type in LOADABLE_FILE_FORMATS:
+            self.convert(AUDIO_TYPE_PCM)
+            audio_bytes = io.BytesIO()
+            write_audio(new_audio_type, audio_bytes, self.audio_format, self.audio)
+            audio_bytes.seek(0)
+            self.audio = audio_bytes
         else:
             raise RuntimeError('Audio conversion from "{}" to "{}" not supported'
                                .format(self.audio_type, new_audio_type))
+        self.audio_type = new_audio_type
 
 
-def _convert_sample(sample, audio_type=AUDIO_TYPE_PCM):
-    sample.convert(audio_type)
-    return sample
-
-
-def convert_samples(samples, audio_type=AUDIO_TYPE_PCM):
-    with LimitingPool() as pool:
-        convert_sample_fn = partial(_convert_sample, audio_type=audio_type)
-        for current_sample in pool.map(convert_sample_fn, samples):
+def convert_samples(samples, audio_type=AUDIO_TYPE_PCM, processes=None):
+    def convert_sample(sample):
+        sample.convert(audio_type)
+        return sample
+    with LimitingPool(processes=processes) as pool:
+        for current_sample in pool.map(convert_sample, samples):
             yield current_sample
 
 
@@ -85,6 +99,10 @@ def get_num_samples(pcm_len, audio_format=DEFAULT_FORMAT):
 
 def get_pcm_duration(pcm_len, audio_format=DEFAULT_FORMAT):
     return get_num_samples(pcm_len, audio_format) / audio_format[0]
+
+
+def get_np_duration(np_len, audio_format=DEFAULT_FORMAT):
+    return np_len / audio_format[0]
 
 
 def convert_audio(src_audio_path, dst_audio_path, file_type=None, audio_format=DEFAULT_FORMAT):
@@ -246,6 +264,12 @@ def read_opus(opus_file):
     return audio_format, audio_data
 
 
+def write_wav(wav_file, audio_format, pcm_data):
+    with wave.open(wav_file, 'wb') as wav_file_writer:
+        write_audio_format_to_wav_file(wav_file_writer, audio_format)
+        wav_file_writer.writeframes(pcm_data)
+
+
 def read_wav(wav_file):
     wav_file.seek(0)
     with wave.open(wav_file, 'rb') as wav_file_reader:
@@ -257,10 +281,17 @@ def read_wav(wav_file):
 def read_audio(audio_type, audio_file):
     if audio_type == AUDIO_TYPE_WAV:
         return read_wav(audio_file)
-    elif audio_type == AUDIO_TYPE_OPUS:
+    if audio_type == AUDIO_TYPE_OPUS:
         return read_opus(audio_file)
-    else:
-        raise ValueError('Unsupported audio format: {}'.format(audio_type))
+    raise ValueError(UNSUPPORTED_TYPE.format(audio_type))
+
+
+def write_audio(audio_type, audio_file, audio_format, pcm_data):
+    if audio_type == AUDIO_TYPE_WAV:
+        return write_wav(audio_file, audio_format, pcm_data)
+    if audio_type == AUDIO_TYPE_OPUS:
+        return write_opus(audio_file, audio_format, pcm_data)
+    raise ValueError(UNSUPPORTED_TYPE.format(audio_type))
 
 
 def read_wav_duration(wav_file):
@@ -277,10 +308,9 @@ def read_opus_duration(opus_file):
 def read_duration(audio_type, audio_file):
     if audio_type == AUDIO_TYPE_WAV:
         return read_wav_duration(audio_file)
-    elif audio_type == AUDIO_TYPE_OPUS:
+    if audio_type == AUDIO_TYPE_OPUS:
         return read_opus_duration(audio_file)
-    else:
-        raise ValueError('Unsupported audio format: {}'.format(audio_type))
+    raise ValueError(UNSUPPORTED_TYPE.format(audio_type))
 
 
 def pcm_to_np(audio_format, pcm_data):

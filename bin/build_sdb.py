@@ -11,115 +11,72 @@ import os
 import sys
 sys.path.insert(1, os.path.join(sys.path[0], '..'))
 
-import io
-import csv
 import json
-import wave
 import argparse
 import progressbar
-# import shutil
 
-from pathlib import Path
-from multiprocessing.pool import Pool
 from util.downloader import SIMPLE_BAR
-from util.audio import write_opus, read_audio_format_from_wav_file
+from util.audio import convert_samples, AUDIO_TYPE_OPUS
+from util.collections import samples_from_files
 
 BIG_ENDIAN = 'big'
-
 INT_SIZE = 4
 BIGINT_SIZE = 2 * INT_SIZE
 MAGIC = b'SAMPLEDB'
-LEN_OFFSET = len(MAGIC)
-INDEX_OFFSET_OFFSET = LEN_OFFSET + BIGINT_SIZE
-FIRST_ENTRY_OFFSET = INDEX_OFFSET_OFFSET + BIGINT_SIZE
 META = {
     'schema': [
-        {
-            'content': 'speech',
-            'mime-type': 'audio/opus'
-        },
-        {
-            'content': 'transcript',
-            'mime-type': 'text/plain'
-        }
+        {'content': 'speech', 'mime-type': 'audio/opus'},
+        {'content': 'transcript', 'mime-type': 'text/plain'}
     ]
 }
 
-class Sample:
-    def __init__(self, wav_filename, wav_filesize, transcript):
-        self.wav_filename = wav_filename
-        self.wav_filesize = wav_filesize
-        self.transcript = transcript
-
-
-def read_csvs():
-    samples = []
-    for csv_path in CLI_ARGS.csvs:
-        csv_dir = Path(csv_path).parent
-        print('Reading "{}"...'.format(csv_path))
-        with open(csv_path, 'r') as csv_file:
-            reader = csv.DictReader(csv_file)
-            for row in reader:
-                wav_filename = Path(row['wav_filename'])
-                if not wav_filename.is_absolute():
-                    wav_filename = csv_dir / wav_filename
-                sample = Sample(str(wav_filename), int(row['wav_filesize']), row['transcript'])
-                samples.append(sample)
-    print('Sorting samples...')
-    samples.sort(key=lambda s: s.wav_filesize)
-    return samples
-
 
 def build_sample_entry(sample):
-    # shutil.copy(sample.wav_filename, CLI_ARGS.target + '.samples/' + sample.wav_filename.split('/')[-1])
-    with wave.open(sample.wav_filename, 'r') as wav_file:
-        audio_format = read_audio_format_from_wav_file(wav_file)
-        pcm_data = wav_file.readframes(wav_file.getnframes())
-    opus_file = io.BytesIO()
-    write_opus(opus_file, audio_format, pcm_data)
-    opus = opus_file.getbuffer()
-    opus_len = len(opus).to_bytes(INT_SIZE, BIG_ENDIAN)
+    def to_bytes(n):
+        return n.to_bytes(INT_SIZE, BIG_ENDIAN)
+    opus = sample.audio.getbuffer()
+    opus_len = to_bytes(len(opus))
     transcript = sample.transcript.encode()
-    transcript_len = len(transcript).to_bytes(INT_SIZE, BIG_ENDIAN)
-    entry_len = (len(opus_len) + len(opus) + len(transcript_len) + len(transcript)).to_bytes(INT_SIZE, BIG_ENDIAN)
+    transcript_len = to_bytes(len(transcript))
+    entry_len = to_bytes(len(opus_len) + len(opus) + len(transcript_len) + len(transcript))
     return b''.join([entry_len, opus_len, opus, transcript_len, transcript])
 
 
 def build_sdb():
-    samples = read_csvs()
+    def to_bytes(n):
+        return n.to_bytes(BIGINT_SIZE, BIG_ENDIAN)
+    samples = samples_from_files(CLI_ARGS.sources)
     offsets = []
     with open(CLI_ARGS.target, 'wb') as sdb_file:
         sdb_file.write(MAGIC)
 
         print('Writing meta data...')
         meta_data = json.dumps(META).encode()
-        sdb_file.write(len(meta_data).to_bytes(BIGINT_SIZE, BIG_ENDIAN))
+        sdb_file.write(to_bytes(len(meta_data)))
         sdb_file.write(meta_data)
 
         print('Writing samples...')
         offset_samples = sdb_file.tell()
-        sdb_file.write((0).to_bytes(BIGINT_SIZE, BIG_ENDIAN))
-        sdb_file.write(len(samples).to_bytes(BIGINT_SIZE, BIG_ENDIAN))
-        # os.mkdir(CLI_ARGS.target + '.samples')
+        sdb_file.write(to_bytes(0))
+        sdb_file.write(to_bytes(len(samples)))
         num_workers = os.cpu_count() * CLI_ARGS.load_factor if CLI_ARGS.load_factor > 0 else 1
-        with Pool(num_workers) as pool:
-            bar = progressbar.ProgressBar(max_value=len(samples), widgets=SIMPLE_BAR)
-            for buffer in bar(pool.imap(build_sample_entry, samples)):
-                offsets.append(sdb_file.tell())
-                sdb_file.write(buffer)
+        bar = progressbar.ProgressBar(max_value=len(samples), widgets=SIMPLE_BAR)
+        for sample in bar(convert_samples(samples, audio_type=AUDIO_TYPE_OPUS, processes=num_workers)):
+            buffer = build_sample_entry(sample)
+            offsets.append(sdb_file.tell())
+            sdb_file.write(buffer)
         offset_index = sdb_file.tell()
         sdb_file.seek(offset_samples)
-        sdb_file.write((offset_index - offset_samples - BIGINT_SIZE).to_bytes(BIGINT_SIZE, BIG_ENDIAN))
+        sdb_file.write(to_bytes(offset_index - offset_samples - BIGINT_SIZE))
 
         print('Writing indices...')
-        sdb_file.seek(offset_index)
-        sdb_file.write((0).to_bytes(BIGINT_SIZE, BIG_ENDIAN))
-        sdb_file.write(len(samples).to_bytes(BIGINT_SIZE, BIG_ENDIAN))
+        sdb_file.seek(offset_index + BIGINT_SIZE)
+        sdb_file.write(to_bytes(len(samples)))
         for offset in offsets:
-            sdb_file.write(offset.to_bytes(BIGINT_SIZE, BIG_ENDIAN))
+            sdb_file.write(to_bytes(offset))
         offset_end = sdb_file.tell()
         sdb_file.seek(offset_index)
-        sdb_file.write((offset_end - offset_index - BIGINT_SIZE).to_bytes(BIGINT_SIZE, BIG_ENDIAN))
+        sdb_file.write(to_bytes(offset_end - offset_index - BIGINT_SIZE))
 
 
 def handle_args():
@@ -127,7 +84,7 @@ def handle_args():
                                                  'from DeepSpeech CSV files')
     parser.add_argument('--load_factor', type=int, default=1,
                         help='CPU-multiplier for the number of parallel workers - 0 for 1 worker')
-    parser.add_argument('csvs', nargs='+', help='CSV files')
+    parser.add_argument('sources', nargs='+', help='Source collections (.csv and Sample DB files)')
     parser.add_argument('target', help='Sample DB to create')
     return parser.parse_args()
 
