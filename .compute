@@ -2,15 +2,46 @@
 
 set -xe
 
+project_dir=`pwd`
+
 apt-get install -y python3-venv
 python3 -m venv /tmp/venv
 source /tmp/venv/bin/activate
 
+pip install -U setuptools wheel pip
 pip install -r <(grep -v tensorflow requirements.txt)
-pip install tensorflow-gpu==1.15.0
+pip install tensorflow-gpu==1.14
 
 # Install ds_ctcdecoder package from TaskCluster
 pip install $(python3 util/taskcluster.py --decoder)
+
+scorer="${ML_GROUP_DIR}/ds/en-utf8.scorer"
+if [ ! -f "${scorer}" ]; then
+  apt-get install -y cmake libboost-all-dev libeigen3-dev
+  pushd /root
+    git clone https://github.com/kpu/kenlm.git
+    pushd kenlm
+      mkdir -p build
+      pushd build
+        cmake ..
+        make -j 24
+        make install
+      popd
+    popd
+    printf "\n ****** Installed KenLM ****** \n\n\n\n"
+    mkdir -p lm
+    pushd lm
+      python "${project_dir}/data/lm/generate_lm.py"
+      python "${project_dir}/data/lm/generate_package.py" \
+        --lm lm.binary \
+        --vocab librispeech-vocab-500k.txt \
+        --force_utf8 true \
+        --package "${scorer}" \
+        --default_alpha 0.931289039105002 \
+        --default_beta 1.1834137581510284
+    popd
+  popd
+fi
 
 mkdir -p ../keep/summaries
 
@@ -18,17 +49,24 @@ data="${SHARED_DIR}/data"
 fis="${data}/LDC/fisher"
 swb="${data}/LDC/LDC97S62/swb"
 lbs="${data}/OpenSLR/LibriSpeech/librivox"
+cv="${data}/mozilla/CommonVoice/en_1087h_2019-06-12/clips"
+npr="${data}/NPR/WAMU/sets/v0.3"
 
 python -u DeepSpeech.py \
-  --train_files "${fis}-train.csv","${swb}-train.csv","${lbs}-train-clean-100.csv","${lbs}-train-clean-360.csv","${lbs}-train-other-500.csv" \
-  --dev_files "${lbs}-dev-clean.csv"\
+  --train_files "${npr}/best-train.csv","${npr}/good-train.csv","${cv}/train.csv","${fis}-train.csv","${swb}-train.csv","${lbs}-train-clean-100.csv","${lbs}-train-clean-360.csv","${lbs}-train-other-500.csv" \
+  --dev_files "${lbs}-dev-clean.csv" \
   --test_files "${lbs}-test-clean.csv" \
-  --train_batch_size 24 \
-  --dev_batch_size 48 \
-  --test_batch_size 48 \
+  --train_batch_size 128 \
+  --dev_batch_size 128 \
+  --test_batch_size 128 \
+  --utf8 \
+  --scorer "${scorer}" \
+  --train_cudnn \
   --n_hidden 2048 \
+  --feature_cache "${ML_GROUP_DIR}/ds/ds_all_fixed_mfcc.cache" \
   --learning_rate 0.0001 \
-  --dropout_rate 0.2 \
-  --epoch 13 \
+  --dropout_rate 0.40 \
+  --epochs 100 \
+  --noearly_stop \
   --checkpoint_dir "../keep" \
   --summary_dir "../keep/summaries"
