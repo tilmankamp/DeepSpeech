@@ -17,18 +17,20 @@ pip install $(python3 util/taskcluster.py --decoder)
 
 scorer="${ML_GROUP_DIR}/ds/en-utf8.scorer"
 if [ ! -f "${scorer}" ]; then
-  apt-get install -y cmake libboost-all-dev libeigen3-dev
   pushd /root
-    git clone https://github.com/kpu/kenlm.git
-    pushd kenlm
-      mkdir -p build
-      pushd build
-        cmake ..
-        make -j 24
-        make install
+    if [ ! -d "kenlm" ]; then
+      git clone https://github.com/kpu/kenlm.git
+      pushd kenlm
+        mkdir -p build
+        pushd build
+          apt-get install -y cmake libboost-all-dev libeigen3-dev
+          cmake ..
+          make -j 24
+          make install
+        popd
       popd
-    popd
-    printf "\n ****** Installed KenLM ****** \n\n\n\n"
+      printf "\n ****** Installed KenLM ****** \n\n\n\n"
+    fi
     mkdir -p lm
     pushd lm
       python "${project_dir}/data/lm/generate_lm.py"
@@ -70,3 +72,4 @@ python -u DeepSpeech.py \
   --noearly_stop \
   --checkpoint_dir "../keep" \
   --summary_dir "../keep/summaries"
+

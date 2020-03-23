@@ -24,14 +24,16 @@ def main():
       with io.TextIOWrapper(io.BufferedReader(gzip.open(data_upper)), encoding='utf8') as upper:
         for line in upper:
           line_lower = line.lower()
-          counter.update(line_lower.split())
-          lower.write(line_lower)
+          chars = list(line_lower)
+          counter.update(chars)
+          lower.write(' '.join(chars))
 
     # Build pruned LM.
     lm_path = os.path.join(tmp, 'lm.arpa')
     print('Creating ARPA file...')
     subprocess.check_call([
       'lmplz', '--order', '5',
+               '--discount_fallback',
                '--temp_prefix', tmp,
                '--memory', '50%',
                '--text', data_lower,
