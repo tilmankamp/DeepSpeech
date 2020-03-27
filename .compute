@@ -36,8 +36,8 @@ python -u DeepSpeech.py \
   --dropout_rate 0.40 \
   --epochs 150 \
   --noearly_stop \
-  --alphabet_config_path "${ML_GROUP_DIR}/language-models/de/alphabet.txt" \
-  --scorer "${ML_GROUP_DIR}/language-models/de/tmp.scorer" \
+  --alphabet_config_path "${ML_GROUP_DIR}/language-models/pt/alphabet.txt" \
+  --scorer "${ML_GROUP_DIR}/language-models/pt/tmp.scorer" \
   --feature_cache "../tmp/feature.cache" \
   --checkpoint_dir "../keep" \
   --summary_dir "../keep/summaries"
