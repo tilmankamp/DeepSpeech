@@ -376,6 +376,6 @@ def np_to_pcm(np_data, audio_format=DEFAULT_FORMAT):
     assert audio_format.channels == 1  # only mono supported for now
     dtype = get_dtype(audio_format)
     np_data = np_data.squeeze()
-    np_data *= dtype.max
+    np_data = np_data * np.iinfo(dtype).max
     np_data = np_data.astype(dtype)
     return bytearray(np_data.tobytes())

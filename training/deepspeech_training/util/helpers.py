@@ -79,11 +79,11 @@ class LimitingPool:
     """Limits unbound ahead-processing of multiprocessing.Pool's imap method
     before items get consumed by the iteration caller.
     This prevents OOM issues in situations where items represent larger memory allocations."""
-    def __init__(self, processes=None, process_ahead=None, sleeping_for=0.1):
+    def __init__(self, processes=None, initializer=None, initargs=None, process_ahead=None, sleeping_for=0.1):
         self.process_ahead = os.cpu_count() if process_ahead is None else process_ahead
         self.sleeping_for = sleeping_for
         self.processed = 0
-        self.pool = Pool(processes=processes)
+        self.pool = Pool(processes=processes, initializer=initializer, initargs=initargs)
 
     def __enter__(self):
         return self

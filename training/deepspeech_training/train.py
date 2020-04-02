@@ -423,6 +423,7 @@ def train():
     # Create training and validation datasets
     train_set = create_dataset(FLAGS.train_files.split(','),
                                batch_size=FLAGS.train_batch_size,
+                               overlay_specs=FLAGS.overlay,
                                enable_cache=FLAGS.feature_cache and do_cache_dataset,
                                cache_path=FLAGS.feature_cache,
                                train_phase=True,
