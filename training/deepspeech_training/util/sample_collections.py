@@ -1,15 +1,13 @@
 # -*- coding: utf-8 -*-
 import os
-import re
 import csv
-import math
 import json
 import random
-import numpy as np
 
 from pathlib import Path
 from functools import partial
-from multiprocessing import Queue, Process
+
+from .signal_augmentations import parse_augmentation
 from .helpers import MEGABYTE, GIGABYTE, Interleaved, LimitingPool
 from .audio import Sample, DEFAULT_FORMAT, AUDIO_TYPE_WAV, AUDIO_TYPE_OPUS, AUDIO_TYPE_NP, SERIALIZABLE_AUDIO_TYPES
 
@@ -27,25 +25,6 @@ MIME_TYPE_KEY = 'mime-type'
 MIME_TYPE_TEXT = 'text/plain'
 CONTENT_TYPE_SPEECH = 'speech'
 CONTENT_TYPE_TRANSCRIPT = 'transcript'
-
-OVERLAY_PARSER = re.compile(r'^([^\[]*)(\[([^\[]*)\])?$')
-OVERLAY_QUEUE_SIZE = 16
-
-
-class Overlay:
-    def __init__(self,
-                 sample_source,
-                 snr_db_min=3.0,
-                 snr_db_max=30.0,
-                 n_layers_min=5,
-                 n_layers_max=5,
-                 p_factor=1.0):
-        self.sample_source = sample_source
-        self.snr_db_min = snr_db_min
-        self.snr_db_max = snr_db_max
-        self.n_layers_min = n_layers_min
-        self.n_layers_max = n_layers_max
-        self.p_factor = p_factor
 
 
 class LabeledSample(Sample):
@@ -389,116 +368,48 @@ def samples_from_sources(sample_sources, buffering=BUFFER_SIZE, labeled=None):
     return Interleaved(*cols, key=lambda s: s.duration)
 
 
-def get_overlay_from_spec(overlay_spec):
-    match = OVERLAY_PARSER.match(overlay_spec)
-    if not match:
-        raise ValueError('Overlay specification has wrong format')
-    overlay = Overlay(match[1])
-    parameters = match[3]
-    parameters = [] if parameters is None else parameters.split(',')
-    for parameter in parameters:
-        key, value = tuple(list(map(str.strip, (parameter.split('=') + ['', ''])))[:2])
-        if hasattr(overlay, key):
-            default_value = getattr(overlay, key)
-            try:
-                if isinstance(default_value, int):
-                    value = int(value)
-                elif isinstance(default_value, float):
-                    value = float(value)
-            except ValueError as ve:
-                raise ValueError('Problem parsing value of overlay parameter "{}": {}'.format(key, ve))
-            setattr(overlay, key, value)
-        else:
-            raise ValueError('Unknown overlay parameter "{}"'.format(key))
-    return overlay
+class PreparationContext:
+    def __init__(self, target_audio_type, augmentations):
+        self.target_audio_type = target_audio_type
+        self.augmentations = augmentations
 
 
-def enqueue_overlay_samples(sample_source, queue, buffering=BUFFER_SIZE):
-    samples = samples_from_source(sample_source, buffering=buffering, labeled=False)
-    while True:
-        for sample in samples:
-            queue.put(sample)
+PREPARATION_CONTEXT = None
 
 
-def dbfs(sample_data):
-    return 20.0 * math.log10(math.sqrt(np.mean(sample_data**2).item(0))) + 3.0103
+def init_preparation_worker(preparation_context):
+    global PREPARATION_CONTEXT
+    PREPARATION_CONTEXT = preparation_context
 
 
-def gain_db_to_ratio(gain_db):
-    return math.pow(10.0, gain_db / 20.0)
-
-
-OVERLAYS = []
-OVERLAY_PICK_RANGE = 0.0
-
-
-def init_preparation_worker(overlays):
-    global OVERLAYS, OVERLAY_PICK_RANGE  # pylint: disable=global-statement
-    OVERLAYS = overlays
-    for overlay in overlays:
-        OVERLAY_PICK_RANGE += overlay.p_factor
-        overlay.current_sample = None
-    OVERLAY_PICK_RANGE = max(1.0, OVERLAY_PICK_RANGE)
-
-
-def prepare_sample(sample):
-    sample.change_audio_type(new_audio_type=AUDIO_TYPE_NP)
-    pick_value = random.uniform(0.0, OVERLAY_PICK_RANGE)
-    overlay = None
-    for o in OVERLAYS:  # randomly selecting an overlay or none at all (allowed if sum of p_factors < 1)
-        if pick_value <= o.p_factor:
-            overlay = o
-            break
-        pick_value -= o.p_factor
-    if overlay is None:
-        return sample
-    n_layers = random.randint(overlay.n_layers_min, overlay.n_layers_max)
-    sample_data = sample.audio
-    n_samples = len(sample_data)
-    overlay_data = np.zeros_like(sample_data)
-    for _ in range(n_layers):
-        overlay_offset = 0
-        while overlay_offset < n_samples:
-            if overlay.current_sample is None:
-                overlay_sample = overlay.queue.get()
-                overlay_sample.change_audio_type(new_audio_type=AUDIO_TYPE_NP)
-                overlay.current_sample = overlay_sample.audio
-            n_required = n_samples - overlay_offset
-            n_current = len(overlay.current_sample)
-            if n_required >= n_current:  # take it completely
-                overlay_data[overlay_offset:overlay_offset + n_current] += overlay.current_sample
-                overlay_offset += n_current
-                overlay.current_sample = None
-            else:  # take required slice from head and keep tail for next layer or sample
-                overlay_data[overlay_offset:overlay_offset + n_required] += overlay.current_sample[0:n_required]
-                overlay_offset += n_required
-                overlay.current_sample = overlay.current_sample[n_required:]
-    snr_db = random.uniform(overlay.snr_db_min, overlay.snr_db_max)
-    overlay_gain = dbfs(sample_data) - dbfs(overlay_data) - snr_db
-    sample_data += overlay_data * gain_db_to_ratio(overlay_gain)
-    sample_data = np.maximum(np.minimum(sample_data, 1.0), -1.0)
-    sample.audio = sample_data
+def prepare_sample(sample, context=None):
+    context = PREPARATION_CONTEXT if context is None else context
+    for augmentation in context.augmentations:
+        if random.random() < augmentation.p:
+            augmentation.apply(sample)
+    sample.change_audio_type(new_audio_type=context.target_audio_type)
     return sample
 
 
-def prepare_training_samples(sources, overlay_specs=None, buffering=BUFFER_SIZE, process_ahead=None):
-    samples = samples_from_sources(sources, buffering=buffering, labeled=True)
-    overlays = [] if overlay_specs is None else list(map(get_overlay_from_spec, overlay_specs))
-    enqueue_processes = []
+def prepare_samples(samples,
+                    audio_type=AUDIO_TYPE_NP,
+                    augmentation_specs=None,
+                    buffering=BUFFER_SIZE,
+                    process_ahead=None,
+                    pool=True):
+    augmentations = [] if augmentation_specs is None else list(map(parse_augmentation, augmentation_specs))
     try:
-        for overlay in overlays:
-            overlay.queue = Queue(OVERLAY_QUEUE_SIZE)
-            enqueue_process = Process(target=enqueue_overlay_samples,
-                                      args=(overlay.sample_source, overlay.queue),
-                                      kwargs={'buffering': buffering})
-            enqueue_processes.append(enqueue_process)
-            enqueue_process.start()
-        with LimitingPool(process_ahead=process_ahead,
-                          initializer=init_preparation_worker,
-                          initargs=(overlays,)) as pool:
-            yield from pool.imap(prepare_sample, samples)
+        for augmentation in augmentations:
+            augmentation.start(buffering=buffering)
+        context = PreparationContext(audio_type, augmentations)
+        if pool:
+            with LimitingPool(process_ahead=process_ahead,
+                              initializer=init_preparation_worker,
+                              initargs=(context,)) as pool:
+                yield from pool.imap(prepare_sample, samples)
+        else:
+            for sample in samples:
+                yield prepare_sample(sample, context=context)
     finally:
-        for enqueue_process in enqueue_processes:
-            enqueue_process.terminate()
-        for enqueue_process in enqueue_processes:
-            enqueue_process.join()
+        for augmentation in augmentations:
+            augmentation.stop()

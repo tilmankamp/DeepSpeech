@@ -13,7 +13,7 @@ from .text import text_to_char_array
 from .flags import FLAGS
 from .spectrogram_augmentations import augment_freq_time_mask, augment_dropout, augment_pitch_and_tempo, augment_speed_up, augment_sparse_warp
 from .audio import read_frames_from_file, vad_split, pcm_to_np, DEFAULT_FORMAT
-from .sample_collections import prepare_training_samples
+from .sample_collections import samples_from_sources, prepare_samples
 from .helpers import remember_exception, MEGABYTE
 
 
@@ -109,7 +109,7 @@ def to_sparse_tuple(sequence):
 
 def create_dataset(sources,
                    batch_size,
-                   overlay_specs=None,
+                   augmentation_specs=None,
                    enable_cache=False,
                    cache_path=None,
                    train_phase=False,
@@ -117,10 +117,11 @@ def create_dataset(sources,
                    process_ahead=None,
                    buffering=1 * MEGABYTE):
     def generate_values():
-        samples = prepare_training_samples(sources,
-                                           overlay_specs=overlay_specs,
-                                           buffering=buffering,
-                                           process_ahead=2 * batch_size if process_ahead is None else process_ahead)
+        samples = samples_from_sources(sources, buffering=buffering, labeled=True)
+        samples = prepare_samples(samples,
+                                  augmentation_specs=augmentation_specs,
+                                  buffering=buffering,
+                                  process_ahead=2 * batch_size if process_ahead is None else process_ahead)
         for sample in samples:
             transcript = text_to_char_array(sample.transcript, Config.alphabet, context=sample.sample_id)
             transcript = to_sparse_tuple(transcript)

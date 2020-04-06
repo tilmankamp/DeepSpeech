@@ -9,38 +9,40 @@ import random
 import sys
 
 from deepspeech_training.util.audio import AUDIO_TYPE_PCM
-from deepspeech_training.util.sample_collections import LabeledSample, samples_from_file
+from deepspeech_training.util.sample_collections import LabeledSample, samples_from_source, prepare_samples
 
 
-def play_sample(samples, index):
-    if index < 0:
-        index = len(samples) + index
-    if CLI_ARGS.random:
-        index = random.randint(0, len(samples))
-    elif index >= len(samples):
-        print("No sample with index {}".format(CLI_ARGS.start))
-        sys.exit(1)
-    sample = samples[index]
-    print('Sample "{}"'.format(sample.sample_id))
-    if isinstance(sample, LabeledSample):
-        print('  "{}"'.format(sample.transcript))
-    sample.change_audio_type(AUDIO_TYPE_PCM)
-    rate, channels, width = sample.audio_format
-    wave_obj = simpleaudio.WaveObject(sample.audio, channels, width, rate)
-    play_obj = wave_obj.play()
-    play_obj.wait_done()
-
-
-def play_collection():
-    samples = samples_from_file(CLI_ARGS.collection, buffering=0)
+def get_samples_in_play_order():
+    samples = samples_from_source(CLI_ARGS.collection, buffering=0)
     played = 0
     index = CLI_ARGS.start
     while True:
         if 0 <= CLI_ARGS.number <= played:
             return
-        play_sample(samples, index)
+        if CLI_ARGS.random:
+            yield samples[random.randint(0, len(samples))]
+        elif index < 0:
+            yield samples[len(samples) + index]
+        elif index >= len(samples):
+            print("No sample with index {}".format(CLI_ARGS.start))
+            sys.exit(1)
+        else:
+            yield samples[index]
         played += 1
         index = (index + 1) % len(samples)
+
+
+def play_collection():
+    samples = get_samples_in_play_order()
+    samples = prepare_samples(samples, audio_type=AUDIO_TYPE_PCM, augmentation_specs=CLI_ARGS.augment, pool=False)
+    for sample in samples:
+        print('Sample "{}"'.format(sample.sample_id))
+        if isinstance(sample, LabeledSample):
+            print('  "{}"'.format(sample.transcript))
+        rate, channels, width = sample.audio_format
+        wave_obj = simpleaudio.WaveObject(sample.audio, channels, width, rate)
+        play_obj = wave_obj.play()
+        play_obj.wait_done()
 
 
 def handle_args():
@@ -65,6 +67,11 @@ def handle_args():
         "--random",
         action="store_true",
         help="If samples should be played in random order",
+    )
+    parser.add_argument(
+        "--augment",
+        action='append',
+        help="Add an augmentation operation",
     )
     return parser.parse_args()
 

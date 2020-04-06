@@ -1,6 +1,7 @@
 import os
 import io
 import wave
+import math
 import tempfile
 import collections
 import numpy as np
@@ -379,3 +380,11 @@ def np_to_pcm(np_data, audio_format=DEFAULT_FORMAT):
     np_data = np_data * np.iinfo(dtype).max
     np_data = np_data.astype(dtype)
     return bytearray(np_data.tobytes())
+
+
+def dbfs(sample_data):
+    return 20.0 * math.log10(math.sqrt(np.mean(sample_data**2).item(0))) + 3.0103
+
+
+def gain_db_to_ratio(gain_db):
+    return math.pow(10.0, gain_db / 20.0)
