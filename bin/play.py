@@ -20,7 +20,7 @@ def get_samples_in_play_order():
         if 0 <= CLI_ARGS.number <= played:
             return
         if CLI_ARGS.random:
-            yield samples[random.randint(0, len(samples))]
+            yield samples[random.randint(0, len(samples) - 1)]
         elif index < 0:
             yield samples[len(samples) + index]
         elif index >= len(samples):
@@ -34,7 +34,7 @@ def get_samples_in_play_order():
 
 def play_collection():
     samples = get_samples_in_play_order()
-    samples = prepare_samples(samples, audio_type=AUDIO_TYPE_PCM, augmentation_specs=CLI_ARGS.augment, pool=False)
+    samples = prepare_samples(samples, audio_type=AUDIO_TYPE_PCM, augmentation_specs=CLI_ARGS.augment, process_ahead=0)
     for sample in samples:
         print('Sample "{}"'.format(sample.sample_id))
         if isinstance(sample, LabeledSample):

@@ -161,3 +161,9 @@ def min_max_float(value):
     if pair[0] > pair[1]:
         raise ValueError('First value of min-max value greater than second value')
     return pair
+
+
+def call_if_exists(o, name, *args, **kwargs):
+    method = getattr(o, name, None)
+    if callable(method):
+        method(*args, **kwargs)

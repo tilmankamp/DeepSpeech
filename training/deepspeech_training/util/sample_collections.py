@@ -8,7 +8,7 @@ from pathlib import Path
 from functools import partial
 
 from .signal_augmentations import parse_augmentation
-from .helpers import MEGABYTE, GIGABYTE, Interleaved, LimitingPool
+from .helpers import MEGABYTE, GIGABYTE, Interleaved, LimitingPool, call_if_exists
 from .audio import Sample, DEFAULT_FORMAT, AUDIO_TYPE_WAV, AUDIO_TYPE_OPUS, AUDIO_TYPE_NP, SERIALIZABLE_AUDIO_TYPES
 
 BIG_ENDIAN = 'big'
@@ -395,21 +395,20 @@ def prepare_samples(samples,
                     audio_type=AUDIO_TYPE_NP,
                     augmentation_specs=None,
                     buffering=BUFFER_SIZE,
-                    process_ahead=None,
-                    pool=True):
+                    process_ahead=None):
     augmentations = [] if augmentation_specs is None else list(map(parse_augmentation, augmentation_specs))
     try:
         for augmentation in augmentations:
-            augmentation.start(buffering=buffering)
+            call_if_exists(augmentation, 'start', buffering=buffering)
         context = PreparationContext(audio_type, augmentations)
-        if pool:
+        if process_ahead == 0:
+            for sample in samples:
+                yield prepare_sample(sample, context=context)
+        else:
             with LimitingPool(process_ahead=process_ahead,
                               initializer=init_preparation_worker,
                               initargs=(context,)) as pool:
                 yield from pool.imap(prepare_sample, samples)
-        else:
-            for sample in samples:
-                yield prepare_sample(sample, context=context)
     finally:
         for augmentation in augmentations:
-            augmentation.stop()
+            call_if_exists(augmentation, 'stop')
