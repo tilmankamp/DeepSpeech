@@ -118,14 +118,14 @@ class Sample:
 
 
 def _change_audio_type(sample_and_audio_type):
-    sample, audio_type = sample_and_audio_type
-    sample.change_audio_type(audio_type)
+    sample, audio_type, bitrate = sample_and_audio_type
+    sample.change_audio_type(audio_type, bitrate=bitrate)
     return sample
 
 
-def change_audio_types(samples, audio_type=AUDIO_TYPE_PCM, processes=None, process_ahead=None):
+def change_audio_types(samples, audio_type=AUDIO_TYPE_PCM, bitrate=None, processes=None, process_ahead=None):
     with LimitingPool(processes=processes, process_ahead=process_ahead) as pool:
-        yield from pool.imap(_change_audio_type, map(lambda s: (s, audio_type), samples))
+        yield from pool.imap(_change_audio_type, map(lambda s: (s, audio_type, bitrate), samples))
 
 
 def read_audio_format_from_wav_file(wav_file):
@@ -387,7 +387,7 @@ def np_to_pcm(np_data, audio_format=DEFAULT_FORMAT):
     return np_data.tobytes()
 
 
-def dbfs(sample_data, frame_size=128):
+def compute_dbfs(sample_data, frame_size=128):
     def ms_to_dbfs(mean):
         return 20.0 * math.log10(math.sqrt(mean)) + 3.0103
     sample_data = sample_data ** 2

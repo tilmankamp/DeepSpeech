@@ -109,6 +109,7 @@ def to_sparse_tuple(sequence):
 
 def create_dataset(sources,
                    batch_size,
+                   repetitions=1,
                    augmentation_specs=None,
                    enable_cache=False,
                    cache_path=None,
@@ -119,6 +120,7 @@ def create_dataset(sources,
     def generate_values():
         samples = samples_from_sources(sources, buffering=buffering, labeled=True)
         samples = prepare_samples(samples,
+                                  repetitions=repetitions,
                                   augmentation_specs=augmentation_specs,
                                   buffering=buffering,
                                   process_ahead=2 * batch_size if process_ahead is None else process_ahead)

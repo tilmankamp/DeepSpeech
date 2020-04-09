@@ -3,8 +3,10 @@ import sys
 import time
 import heapq
 import semver
+import random
 
 from multiprocessing import Pool
+from collections import namedtuple
 
 KILO = 1024
 KILOBYTE = 1 * KILO
@@ -12,6 +14,8 @@ MEGABYTE = KILO * KILOBYTE
 GIGABYTE = KILO * MEGABYTE
 TERABYTE = KILO * GIGABYTE
 SIZE_PREFIX_LOOKUP = {'k': KILOBYTE, 'm': MEGABYTE, 'g': GIGABYTE, 't': TERABYTE}
+
+ValueRange = namedtuple('ValueRange', 'start end r')
 
 
 def parse_file_size(file_size):
@@ -133,34 +137,45 @@ def remember_exception(iterable, exception_box=None):
     return iterable if exception_box is None else do_iterate
 
 
-def value_pair(value, separator=',', target_type=int):
+def get_value_range(value, target_type):
     if type(value) is str:
-        values = value.split(separator)
-        if len(values) == 1:
-            values.append(values[0])
-        elif len(values) > 2:
-            raise ValueError('Wrong format for number pair')
-        return target_type(values[0]), target_type(values[1])
+        r = target_type(0)
+        parts = value.split('~')
+        if len(parts) == 2:
+            value = parts[0]
+            r = target_type(parts[1])
+        elif len(parts) > 2:
+            raise ValueError('Cannot parse value range')
+        parts = value.split(':')
+        if len(parts) == 1:
+            parts.append(parts[0])
+        elif len(parts) > 2:
+            raise ValueError('Cannot parse value range')
+        return ValueRange(target_type(parts[0]), target_type(parts[1]), r)
     elif type(value) is tuple:
-        if len(value) != 2:
-            raise ValueError('Wrong number of numbers in pair')
-        return target_type(value[0]), target_type(value[1])
+        if len(value) == 2:
+            return ValueRange(target_type(value[0]), target_type(value[1]), 0)
+        elif len(value) == 3:
+            return ValueRange(target_type(value[0]), target_type(value[1]), target_type(value[1]))
+        else:
+            raise ValueError('Cannot convert to ValueRange: Wrong tuple size')
     else:
-        return target_type(value), target_type(value)
+        return ValueRange(target_type(value), target_type(value), 0)
 
 
-def min_max_int(value):
-    pair = value_pair(value, separator='~', target_type=int)
-    if pair[0] > pair[1]:
-        raise ValueError('First value of min-max value greater than second value')
-    return pair
+def int_range(value):
+    return get_value_range(value, int)
 
 
-def min_max_float(value):
-    pair = value_pair(value, separator='~', target_type=float)
-    if pair[0] > pair[1]:
-        raise ValueError('First value of min-max value greater than second value')
-    return pair
+def float_range(value):
+    return get_value_range(value, float)
+
+
+def pick_value_from_range(value_range, clock=None):
+    clock = random.random() if clock is None else max(0.0, min(1.0, float(clock)))
+    value = value_range.start + clock * (value_range.end - value_range.start)
+    value = random.uniform(value - value_range.r, value + value_range.r)
+    return round(value) if isinstance(value_range.start, int) else value
 
 
 def call_if_exists(o, name, *args, **kwargs):

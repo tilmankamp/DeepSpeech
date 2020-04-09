@@ -34,7 +34,11 @@ def get_samples_in_play_order():
 
 def play_collection():
     samples = get_samples_in_play_order()
-    samples = prepare_samples(samples, audio_type=AUDIO_TYPE_PCM, augmentation_specs=CLI_ARGS.augment, process_ahead=0)
+    samples = prepare_samples(samples,
+                              audio_type=AUDIO_TYPE_PCM,
+                              augmentation_specs=CLI_ARGS.augment,
+                              process_ahead=0,
+                              fixed_clock=CLI_ARGS.clock)
     for sample in samples:
         print('Sample "{}"'.format(sample.sample_id))
         if isinstance(sample, LabeledSample):
@@ -72,6 +76,14 @@ def handle_args():
         "--augment",
         action='append',
         help="Add an augmentation operation",
+    )
+    parser.add_argument(
+        "--clock",
+        type=float,
+        default=0.5,
+        help="Simulates clock value used for augmentations during training."
+             "Ranges from 0.0 (representing parameter start values) to"
+             "1.0 (representing parameter end values)",
     )
     return parser.parse_args()
 

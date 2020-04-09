@@ -30,7 +30,7 @@ def build_sdb():
         bar = progressbar.ProgressBar(max_value=len(samples), widgets=SIMPLE_BAR)
         for sample in bar(
             change_audio_types(
-                samples, audio_type=audio_type, processes=CLI_ARGS.workers
+                samples, audio_type=audio_type, bitrate=CLI_ARGS.bitrate, processes=CLI_ARGS.workers
             )
         ):
             sdb_writer.add(sample)
@@ -54,6 +54,11 @@ def handle_args():
         default="opus",
         choices=AUDIO_TYPE_LOOKUP.keys(),
         help="Audio representation inside target SDB",
+    )
+    parser.add_argument(
+        "--bitrate",
+        type=int,
+        help="Bitrate for lossy compressed SDB samples like in case of --audio-type opus",
     )
     parser.add_argument(
         "--workers", type=int, default=None, help="Number of encoding SDB workers"

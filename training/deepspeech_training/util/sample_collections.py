@@ -52,7 +52,13 @@ class LabeledSample(Sample):
 
 class DirectSDBWriter:
     """Sample collection writer for creating a Sample DB (SDB) file"""
-    def __init__(self, sdb_filename, buffering=BUFFER_SIZE, audio_type=AUDIO_TYPE_OPUS, id_prefix=None, labeled=True):
+    def __init__(self,
+                 sdb_filename,
+                 buffering=BUFFER_SIZE,
+                 audio_type=AUDIO_TYPE_OPUS,
+                 bitrate=None,
+                 id_prefix=None,
+                 labeled=True):
         """
         Parameters
         ----------
@@ -62,6 +68,8 @@ class DirectSDBWriter:
             Write-buffer size to use while writing the SDB file
         audio_type : str
             See util.audio.Sample.__init__ .
+        bitrate : int
+            Bitrate for sample-compression in case of lossy audio_type (e.g. AUDIO_TYPE_OPUS)
         id_prefix : str
             Prefix for IDs of written samples - defaults to sdb_filename
         labeled : bool or None
@@ -74,6 +82,7 @@ class DirectSDBWriter:
         if audio_type not in SERIALIZABLE_AUDIO_TYPES:
             raise ValueError('Audio type "{}" not supported'.format(audio_type))
         self.audio_type = audio_type
+        self.bitrate = bitrate
         self.sdb_file = open(sdb_filename, 'wb', buffering=buffering)
         self.offsets = []
         self.num_samples = 0
@@ -103,7 +112,7 @@ class DirectSDBWriter:
     def add(self, sample):
         def to_bytes(n):
             return n.to_bytes(INT_SIZE, BIG_ENDIAN)
-        sample.change_audio_type(self.audio_type)
+        sample.change_audio_type(self.audio_type, bitrate=self.bitrate)
         opus = sample.audio.getbuffer()
         opus_len = to_bytes(len(opus))
         if self.labeled:
@@ -382,11 +391,12 @@ def init_preparation_worker(preparation_context):
     PREPARATION_CONTEXT = preparation_context
 
 
-def prepare_sample(sample, context=None):
+def prepare_sample(timed_sample, context=None):
     context = PREPARATION_CONTEXT if context is None else context
+    sample, clock = timed_sample
     for augmentation in context.augmentations:
         if random.random() < augmentation.p:
-            augmentation.apply(sample)
+            augmentation.apply(sample, clock)
     sample.change_audio_type(new_audio_type=context.target_audio_type)
     return sample
 
@@ -395,20 +405,30 @@ def prepare_samples(samples,
                     audio_type=AUDIO_TYPE_NP,
                     augmentation_specs=None,
                     buffering=BUFFER_SIZE,
-                    process_ahead=None):
+                    process_ahead=None,
+                    repetitions=1,
+                    fixed_clock=None):
+    def timed_samples():
+        for repetition in range(repetitions):
+            for sample_index, sample in enumerate(samples):
+                if fixed_clock is None:
+                    yield sample, (repetition * len(samples) + sample_index) / (repetitions * len(samples))
+                else:
+                    yield sample, fixed_clock
+
     augmentations = [] if augmentation_specs is None else list(map(parse_augmentation, augmentation_specs))
     try:
         for augmentation in augmentations:
             call_if_exists(augmentation, 'start', buffering=buffering)
         context = PreparationContext(audio_type, augmentations)
         if process_ahead == 0:
-            for sample in samples:
-                yield prepare_sample(sample, context=context)
+            for timed_sample in timed_samples():
+                yield prepare_sample(timed_sample, context=context)
         else:
             with LimitingPool(process_ahead=process_ahead,
                               initializer=init_preparation_worker,
                               initargs=(context,)) as pool:
-                yield from pool.imap(prepare_sample, samples)
+                yield from pool.imap(prepare_sample, timed_samples())
     finally:
         for augmentation in augmentations:
             call_if_exists(augmentation, 'stop')

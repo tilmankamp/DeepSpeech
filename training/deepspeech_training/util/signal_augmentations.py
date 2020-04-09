@@ -7,8 +7,8 @@ import numpy as np
 
 from librosa.core import resample
 from multiprocessing import Queue, Process
-from .audio import gain_db_to_ratio, dbfs, AUDIO_TYPE_NP, AUDIO_TYPE_PCM, AUDIO_TYPE_OPUS
-from .helpers import min_max_int, min_max_float, MEGABYTE
+from .audio import gain_db_to_ratio, compute_dbfs, AUDIO_TYPE_NP, AUDIO_TYPE_PCM, AUDIO_TYPE_OPUS
+from .helpers import int_range, float_range, pick_value_from_range, MEGABYTE
 
 SPEC_PARSER = re.compile(r'^([a-z]+)(\[(.*)\])?$')
 BUFFER_SIZE = 1 * MEGABYTE
@@ -23,11 +23,11 @@ def enqueue_overlay_samples(sample_source, queue, buffering=BUFFER_SIZE):
 
 
 class Overlay:
-    def __init__(self, source, snr=3.0, layers=1, p=1.0):
+    def __init__(self, source, p=1.0, snr=3.0, layers=1):
         self.source = source
-        self.snr = min_max_float(snr)
-        self.layers = min_max_int(layers)
         self.p = float(p)
+        self.snr = float_range(snr)
+        self.layers = int_range(layers)
         self.queue = Queue(max(1, math.floor(self.p * self.layers[1] * os.cpu_count())))
         self.current_sample = None
         self.enqueue_process = None
@@ -38,20 +38,19 @@ class Overlay:
                                        kwargs={'buffering': buffering})
         self.enqueue_process.start()
 
-    def apply(self, sample):
+    def apply(self, sample, clock):
         sample.change_audio_type(new_audio_type=AUDIO_TYPE_NP)
-        n_layers = random.randint(self.layers[0], self.layers[1])
+        n_layers = pick_value_from_range(self.layers, clock=clock)
         audio = sample.audio
-        n_samples = len(audio)
         overlay_data = np.zeros_like(audio)
         for _ in range(n_layers):
             overlay_offset = 0
-            while overlay_offset < n_samples:
+            while overlay_offset < len(audio):
                 if self.current_sample is None:
                     next_overlay_sample = self.queue.get()
                     next_overlay_sample.change_audio_type(new_audio_type=AUDIO_TYPE_NP)
                     self.current_sample = next_overlay_sample.audio
-                n_required = n_samples - overlay_offset
+                n_required = len(audio) - overlay_offset
                 n_current = len(self.current_sample)
                 if n_required >= n_current:  # take it completely
                     overlay_data[overlay_offset:overlay_offset + n_current] += self.current_sample
@@ -61,8 +60,8 @@ class Overlay:
                     overlay_data[overlay_offset:overlay_offset + n_required] += self.current_sample[0:n_required]
                     overlay_offset += n_required
                     self.current_sample = self.current_sample[n_required:]
-        snr_db = random.uniform(self.snr[0], self.snr[1])
-        overlay_gain = dbfs(audio).max - dbfs(overlay_data).max - snr_db
+        snr_db = pick_value_from_range(self.snr, clock=clock)
+        overlay_gain = compute_dbfs(audio).max - compute_dbfs(overlay_data).max - snr_db
         audio += overlay_data * gain_db_to_ratio(overlay_gain)
         audio = np.maximum(np.minimum(audio, 1.0), -1.0)
         sample.audio = audio
@@ -73,18 +72,18 @@ class Overlay:
 
 
 class Reverb:
-    def __init__(self, delay=5.0, decay=(0.4, 0.9), p=1.0):
-        self.delay = min_max_float(delay)
-        self.decay = min_max_float(decay)
+    def __init__(self, p=1.0, delay=(0.5, 0.5, 0.2), decay=(0.6, 0.6, 0.25)):
         self.p = float(p)
+        self.delay = float_range(delay)
+        self.decay = float_range(decay)
 
-    def apply(self, sample):
+    def apply(self, sample, clock):
         sample.change_audio_type(new_audio_type=AUDIO_TYPE_NP)
         audio = sample.audio
-        orig_dbfs = dbfs(audio)
+        orig_dbfs = compute_dbfs(audio)
         rate = sample.audio_format.rate
-        delay_factor = random.uniform(self.delay[0], self.delay[1])
-        decay_factor = random.uniform(self.decay[0], self.decay[1])
+        delay_factor = pick_value_from_range(self.delay, clock=clock)
+        decay_factor = pick_value_from_range(self.decay, clock=clock)
         result = np.copy(audio)
         for delay in [0.0281, 0.0317, 0.0407, 0.0134]:
             decay = random.uniform(0.2, 0.8) * decay_factor
@@ -97,19 +96,19 @@ class Reverb:
                 layer[w2:w2 + width] += decay * decay_factor * layer[w1:w1 + width]
             result += layer
         audio = result
-        audio *= gain_db_to_ratio(orig_dbfs.max - dbfs(audio).max)
+        audio *= gain_db_to_ratio(orig_dbfs.max - compute_dbfs(audio).max)
         audio = np.maximum(np.minimum(audio, 1.0), -1.0)
         sample.audio = audio
 
 
 class Resample:
-    def __init__(self, rate=8000, p=1.0):
-        self.rate = min_max_int(rate)
+    def __init__(self, p=1.0, rate=8000):
         self.p = float(p)
+        self.rate = int_range(rate)
 
-    def apply(self, sample):
+    def apply(self, sample, clock):
         sample.change_audio_type(new_audio_type=AUDIO_TYPE_NP)
-        rate = random.randint(self.rate[0], self.rate[1])
+        rate = pick_value_from_range(self.rate, clock=clock)
         audio = sample.audio
         audio = np.swapaxes(audio, 0, 1)
         audio = resample(audio, sample.audio_format.rate, rate)
@@ -118,58 +117,44 @@ class Resample:
         sample.audio = audio
 
 
-class Compress:
-    def __init__(self, bitrate=3200, p=1.0):
-        self.bitrate = min_max_int(bitrate)
+class Codec:
+    def __init__(self, p=1.0, bitrate=3200):
         self.p = float(p)
+        self.bitrate = int_range(bitrate)
 
-    def apply(self, sample):
-        bitrate = random.randint(self.bitrate[0], self.bitrate[1])
-        sample.change_audio_type(new_audio_type=AUDIO_TYPE_PCM)
-        sample.change_audio_type(new_audio_type=AUDIO_TYPE_OPUS, bitrate=bitrate)
+    def apply(self, sample, clock):
+        bitrate = pick_value_from_range(self.bitrate, clock=clock)
+        sample.change_audio_type(new_audio_type=AUDIO_TYPE_PCM)  # decoding to ensure it has to get encoded again
+        sample.change_audio_type(new_audio_type=AUDIO_TYPE_OPUS, bitrate=bitrate)  # will get decoded again downstream
 
 
 class Gaps:
-    def __init__(self, n=(1, 4), size=(100, 1000), p=1.0):
-        self.n = min_max_int(n)
-        self.size = min_max_int(size)
+    def __init__(self, p=1.0, n=(3, 3, 2), size=(1000, 1000, 900)):
         self.p = float(p)
+        self.n = int_range(n)
+        self.size = int_range(size)
 
-    def apply(self, sample):
+    def apply(self, sample, clock):
         sample.change_audio_type(new_audio_type=AUDIO_TYPE_NP)
         audio = sample.audio
-        n = random.randint(self.n[0], self.n[1])
+        n = pick_value_from_range(self.n, clock=clock)
         for _ in range(n):
-            size = random.randint(self.size[0], self.size[1])
+            size = pick_value_from_range(self.size, clock=clock)
             offset = max(0, random.randint(0, len(audio) - size - 1))
             audio[offset:offset + size] = 0
         sample.audio = audio
 
 
-class Amplify:
-    def __init__(self, db=-10.0, p=1.0):
-        self.db = min_max_float(db)
-        self.p = float(p)
-
-    def apply(self, sample):
-        sample.change_audio_type(new_audio_type=AUDIO_TYPE_NP)
-        audio = sample.audio
-        db = random.uniform(self.db[0], self.db[1])
-        audio *= gain_db_to_ratio(db)
-        audio = np.maximum(np.minimum(audio, 1.0), -1.0)
-        sample.audio = audio
-
-
 class Volume:
-    def __init__(self, dbfs=(-20.0, 0.0), p=1.0):
-        self.target_dbfs = min_max_float(dbfs)
+    def __init__(self, p=1.0, dbfs=0.0):
         self.p = float(p)
+        self.target_dbfs = float_range(dbfs)
 
-    def apply(self, sample):
+    def apply(self, sample, clock):
         sample.change_audio_type(new_audio_type=AUDIO_TYPE_NP)
         audio = sample.audio
-        target_dbfs = random.uniform(self.target_dbfs[0], self.target_dbfs[1])
-        current_dbfs = dbfs(audio).max
+        target_dbfs = pick_value_from_range(self.target_dbfs, clock=clock)
+        current_dbfs = compute_dbfs(audio).max
         audio *= gain_db_to_ratio(target_dbfs - current_dbfs)
         audio = np.maximum(np.minimum(audio, 1.0), -1.0)
         sample.audio = audio
