@@ -15,16 +15,15 @@ pip install tensorflow-gpu==1.14
 mkdir -p ../keep/summaries
 
 data="${SHARED_DIR}/data"
-fis="${data}/LDC/fisher"
-swb="${data}/LDC/LDC97S62/swb"
-lbs="${data}/OpenSLR/LibriSpeech/librivox"
-cv="${data}/mozilla/CommonVoice/en_1087h_2019-06-12/clips"
-npr="${data}/NPR/WAMU/sets/v0.3"
+swc="${data}/UHH/SWC/german-"
+tuda="${data}/UHH/TUDA/tuda-v2-"
+mlabs="${data}/Caito/M-AILABS/de_DE/de_DE_"
+cv="${data}/mozilla/CommonVoice/de_340h_2019-06-12/clips/"
 
 python -u DeepSpeech.py \
-  --train_files "${npr}/best-train.sdb","${npr}/good-train.sdb","${cv}/train.sdb","${fis}-train.sdb","${swb}-train.sdb","${lbs}-train-clean-100.sdb","${lbs}-train-clean-360.sdb","${lbs}-train-other-500.sdb" \
-  --dev_files "${lbs}-dev-clean.sdb" \
-  --test_files "${lbs}-test-clean.sdb" \
+  --train_files "${swc}train.csv,${tuda}train.csv,${mlabs}train.csv,${cv}train.csv" \
+  --dev_files "${mlabs}dev.csv"\
+  --test_files "${mlabs}test.csv" \
   --train_batch_size 24 \
   --dev_batch_size 48 \
   --test_batch_size 48 \
@@ -32,7 +31,7 @@ python -u DeepSpeech.py \
   --n_hidden 2048 \
   --learning_rate 0.0001 \
   --dropout_rate 0.40 \
-  --epochs 150 \
+  --epochs 80 \
   --noearly_stop \
   --alphabet_config_path "${ML_GROUP_DIR}/language-models/de/alphabet.txt" \
   --scorer "${ML_GROUP_DIR}/language-models/de/tmp.scorer" \
