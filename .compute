@@ -15,25 +15,33 @@ pip install tensorflow-gpu==1.14
 mkdir -p ../keep/summaries
 
 data="${SHARED_DIR}/data"
-fis="${data}/LDC/fisher"
-swb="${data}/LDC/LDC97S62/swb"
-lbs="${data}/OpenSLR/LibriSpeech/librivox"
-cv="${data}/mozilla/CommonVoice/en_1087h_2019-06-12/clips"
-npr="${data}/NPR/WAMU/sets/v0.3"
+target="${USER_DIR}/converted"
 
-python -u DeepSpeech.py \
-  --train_files "${npr}/best-train.sdb","${npr}/good-train.sdb","${cv}/train.sdb","${fis}-train.sdb","${swb}-train.sdb","${lbs}-train-clean-100.sdb","${lbs}-train-clean-360.sdb","${lbs}-train-other-500.sdb" \
-  --dev_files "${lbs}-dev-clean.sdb" \
-  --test_files "${lbs}-test-clean.sdb" \
-  --train_batch_size 24 \
-  --dev_batch_size 48 \
-  --test_batch_size 48 \
-  --train_cudnn \
-  --n_hidden 2048 \
-  --learning_rate 0.0001 \
-  --dropout_rate 0.40 \
-  --epochs 150 \
-  --noearly_stop \
-  --feature_cache "../tmp/feature.cache" \
-  --checkpoint_dir "../keep" \
-  --summary_dir "../keep/summaries"
+declare -a source_csvs=(
+  "NPR/WAMU/sets/v0.3/best-train.csv"
+  "NPR/WAMU/sets/v0.3/good-train.csv"
+  "mozilla/CommonVoice/en_1087h_2019-06-12/clips/train.csv"
+  "LDC/fisher-train.csv"
+  "LDC/LDC97S62/swb-train.csv"
+  "OpenSLR/LibriSpeech/librivox-train-clean-100.csv"
+  "OpenSLR/LibriSpeech/librivox-train-clean-360.csv"
+  "OpenSLR/LibriSpeech/librivox-train-other-500.csv"
+  "OpenSLR/LibriSpeech/librivox-dev-clean.csv"
+  "OpenSLR/LibriSpeech/librivox-test-clean.csv"
+)
+
+for source_csv in "${source_csvs[@]}"; do
+  csv="${data}/${source_csv}"
+  sdb="${target}/${source_csv%.csv}.sdb"
+  compressed_sdb="${target}/${source_csv%.csv}.compressed.sdb"
+  mkdir -p $(dirname "${sdb}")
+  if [ ! -f "${sdb}" ]; then
+  	echo "Converting ${csv} to ${sdb}..."
+  	bin/build_sdb.py --audio-type wav "$csv" "${sdb}"
+  fi
+  if [ ! -f "${compressed_sdb}" ]; then
+  	echo "Compressing ${sdb} to ${compressed_sdb}..."
+  	bin/build_sdb.py --audio-type opus "${sdb}" "${compressed_sdb}"
+  fi
+done
+
