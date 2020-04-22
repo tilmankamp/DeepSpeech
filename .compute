@@ -25,8 +25,8 @@ python -u DeepSpeech.py \
   --dev_files "${mlabs}dev.csv"\
   --test_files "${mlabs}test.csv" \
   --train_batch_size 24 \
-  --dev_batch_size 48 \
-  --test_batch_size 48 \
+  --dev_batch_size 24 \
+  --test_batch_size 24 \
   --train_cudnn \
   --n_hidden 2048 \
   --learning_rate 0.0001 \
