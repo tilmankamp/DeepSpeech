@@ -18,15 +18,15 @@ data="${SHARED_DIR}/data"
 swc="${data}/UHH/SWC/german-"
 tuda="${data}/UHH/TUDA/tuda-v2-"
 mlabs="${data}/Caito/M-AILABS/de_DE/de_DE_"
-cv="${data}/mozilla/CommonVoice/de_340h_2019-06-12/clips/"
+cv="${data}/mozilla/CommonVoice/de_538h_2019-12-10/"
 
 python -u DeepSpeech.py \
-  --train_files "${swc}train.csv,${tuda}train.csv,${mlabs}train.csv,${cv}train.csv" \
-  --dev_files "${mlabs}dev.csv"\
-  --test_files "${mlabs}test.csv" \
-  --train_batch_size 24 \
-  --dev_batch_size 24 \
-  --test_batch_size 24 \
+  --train_files "${swc}train.sdb,${tuda}train.sdb,${mlabs}train.sdb,${cv}train.sdb" \
+  --dev_files "${cv}dev.sdb"\
+  --test_files "${cv}test.sdb" \
+  --train_batch_size 12 \
+  --dev_batch_size 12 \
+  --test_batch_size 12 \
   --train_cudnn \
   --n_hidden 2048 \
   --learning_rate 0.0001 \
@@ -37,4 +37,5 @@ python -u DeepSpeech.py \
   --scorer "${ML_GROUP_DIR}/language-models/de/tmp.scorer" \
   --feature_cache "../tmp/feature.cache" \
   --checkpoint_dir "../keep" \
+  --log_level 0 \
   --summary_dir "../keep/summaries"
