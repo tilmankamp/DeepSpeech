@@ -2,7 +2,7 @@
 
 set -xe
 
-apt-get install -y python3-venv libopus0
+apt-get install -y python3-venv libopus0 libsndfile1-dev
 
 python3 -m venv /tmp/venv
 source /tmp/venv/bin/activate
@@ -12,8 +12,6 @@ pip install .
 pip uninstall -y tensorflow
 pip install tensorflow-gpu==1.14
 
-mkdir -p ../keep/summaries
-
 data="${SHARED_DIR}/data"
 fis="${data}/LDC/fisher"
 swb="${data}/LDC/LDC97S62/swb"
@@ -21,19 +19,57 @@ lbs="${data}/OpenSLR/LibriSpeech/librivox"
 cv="${data}/mozilla/CommonVoice/en_1087h_2019-06-12/clips"
 npr="${data}/NPR/WAMU/sets/v0.3"
 
-python -u DeepSpeech.py \
-  --train_files "${npr}/best-train.sdb","${npr}/good-train.sdb","${cv}/train.sdb","${fis}-train.sdb","${swb}-train.sdb","${lbs}-train-clean-100.sdb","${lbs}-train-clean-360.sdb","${lbs}-train-other-500.sdb" \
-  --dev_files "${lbs}-dev-clean.sdb" \
-  --test_files "${lbs}-test-clean.sdb" \
-  --train_batch_size 24 \
-  --dev_batch_size 48 \
-  --test_batch_size 48 \
-  --train_cudnn \
-  --n_hidden 2048 \
-  --learning_rate 0.0001 \
-  --dropout_rate 0.40 \
-  --epochs 150 \
-  --noearly_stop \
-  --feature_cache "../tmp/feature.cache" \
-  --checkpoint_dir "../keep" \
-  --summary_dir "../keep/summaries"
+voices="${data}/mozilla/librimax/en/v0.1/compressed/other-train.sdb"
+noise="${data}/UPF/noisedata/train.compressed.sdb"
+
+rm ../keep/checkpoint 2>/dev/null || true
+rm ../keep/train-*.* 2>/dev/null || true
+mkdir -p ../keep/current/
+mv ../keep/*.* ../keep/current/ 2>/dev/null || true
+mv ../keep/*checkpoint ../keep/current/ 2>/dev/null || true
+mv ../keep/summaries ../keep/current/ 2>/dev/null || true
+
+# rm -rf "../keep/current"
+# mv "../keep/phase1" "../keep/current"
+# rm -rf "../keep/phase*"
+
+training_phase() {
+  mkdir -p ../keep/current/summaries
+  rm -f ../tmp/feature.cache
+  intensity=$4
+  snr="`awk "BEGIN { print 50.0 - 30.0 * ${intensity} }"`~10"
+  python -u DeepSpeech.py \
+    --train_files "${npr}/best-train.sdb","${npr}/good-train.sdb","${cv}/train.sdb","${fis}-train.sdb","${swb}-train.sdb","${lbs}-train-clean-100.sdb","${lbs}-train-clean-360.sdb","${lbs}-train-other-500.sdb" \
+    --dev_files "${lbs}-dev-clean.sdb","${cv}/dev.csv" \
+    --test_files "${lbs}-test-clean.sdb","${cv}/test.csv" \
+    --train_batch_size 24 \
+    --dev_batch_size 48 \
+    --test_batch_size 48 \
+    --augment overlay[p=0.5,snr=${snr},source=${noise},layers=1] \
+    --augment overlay[p=0.2,snr=${snr},source=${voices},layers=`awk "BEGIN { print int(10 - 4 * ${intensity}) }"`] \
+    --augment codec[p=0.1,bitrate=`awk "BEGIN { print int(48000 - 32000 * ${intensity}) }"`] \
+    --augment reverb[p=0.1,delay=50.0~30.0,decay=`awk "BEGIN { print 5.0 - 1.0 * ${intensity} }"`~0.5] \
+    --augment resample[p=0.1,rate=`awk "BEGIN { print int(12000 - 4000 * ${intensity}) }"`~4000] \
+    --augment volume[p=0.1,dbfs=`awk "BEGIN { print -10 - 30 * ${intensity} }"`] \
+    --augment gaps[p=0.05,n=1:3~2,size=`awk "BEGIN { print int(10 + 100 * ${intensity}) }"`] \
+    --train_cudnn \
+    --n_hidden 2048 \
+    --dropout_rate 0.40 \
+    --epochs ${2} \
+    --learning_rate ${3} \
+    --noearly_stop \
+    --max_to_keep 1 \
+    --feature_cache "../tmp/feature.cache" \
+    --checkpoint_dir "../keep/current" \
+    --summary_dir "../keep/current/summaries"
+  cp -r "../keep/current" "../keep/phase${1}"
+}
+
+# continue from 0.7.0 base model - job: 5554
+training_phase 1  10 0.0001   0.00
+training_phase 2  10 0.0001   0.25
+training_phase 3  10 0.0001   0.50
+training_phase 4  10 0.0001   0.75
+training_phase 5  10 0.0001   1.00
+training_phase 6 100 0.00001  1.00
+training_phase 7 100 0.000005 1.00
