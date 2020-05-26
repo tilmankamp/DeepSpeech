@@ -32,7 +32,8 @@ from six.moves import zip, range
 from .util.config import Config, initialize_globals
 from .util.checkpoints import load_or_init_graph_for_training, load_graph_for_evaluation
 from .util.evaluate_tools import save_samples_json
-from .util.feeding import create_dataset, samples_to_mfccs, audiofile_to_features
+from .util.augmentations import parse_augmentations, GraphAugmentation
+from .util.feeding import create_dataset, audio_to_features, audiofile_to_features
 from .util.flags import create_flags, FLAGS
 from .util.helpers import check_ctcdecoder_version, ExceptionBox
 from .util.logging import create_progressbar, log_debug, log_error, log_info, log_progress, log_warn
@@ -407,17 +408,8 @@ def log_grads_and_vars(grads_and_vars):
 
 
 def train():
-    do_cache_dataset = True
-
-    # pylint: disable=too-many-boolean-expressions
-    if (FLAGS.data_aug_features_multiplicative > 0 or
-            FLAGS.data_aug_features_additive > 0 or
-            FLAGS.augmentation_spec_dropout_keeprate < 1 or
-            FLAGS.augmentation_freq_and_time_masking or
-            FLAGS.augmentation_pitch_and_tempo_scaling or
-            FLAGS.augmentation_speed_up_std > 0 or
-            FLAGS.augmentation_sparse_warp):
-        do_cache_dataset = False
+    augmentations = parse_augmentations(FLAGS.augment)
+    do_cache_dataset = not any(map(lambda a: isinstance(a, GraphAugmentation), augmentations))
 
     exception_box = ExceptionBox()
 
@@ -425,7 +417,7 @@ def train():
     train_set = create_dataset(FLAGS.train_files.split(','),
                                batch_size=FLAGS.train_batch_size,
                                repetitions=FLAGS.augmentations_per_epoch,
-                               augmentation_specs=FLAGS.augment,
+                               augmentations=augmentations,
                                enable_cache=FLAGS.feature_cache and do_cache_dataset,
                                cache_path=FLAGS.feature_cache,
                                train_phase=True,
@@ -653,7 +645,7 @@ def create_inference_graph(batch_size=1, n_steps=16, tflite=False):
     # Create feature computation graph
     input_samples = tfv1.placeholder(tf.float32, [Config.audio_window_samples], 'input_samples')
     samples = tf.expand_dims(input_samples, -1)
-    mfccs, _ = samples_to_mfccs(samples, FLAGS.audio_sample_rate)
+    mfccs, _ = audio_to_features(samples, FLAGS.audio_sample_rate)
     mfccs = tf.identity(mfccs, name='mfccs')
 
     # Input tensor will be of shape [batch_size, n_steps, 2*n_context+1, n_input]

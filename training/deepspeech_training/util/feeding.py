@@ -11,13 +11,13 @@ from tensorflow.python.ops import gen_audio_ops as contrib_audio
 from .config import Config
 from .text import text_to_char_array
 from .flags import FLAGS
-from .spectrogram_augmentations import augment_freq_time_mask, augment_dropout, augment_pitch_and_tempo, augment_speed_up, augment_sparse_warp
+from .augmentations import apply_signal_augmentations, apply_spectrogram_augmentations, apply_feature_augmentations
 from .audio import read_frames_from_file, vad_split, pcm_to_np, DEFAULT_FORMAT
-from .sample_collections import samples_from_sources, augment_samples
+from .sample_collections import samples_from_sources
 from .helpers import remember_exception, MEGABYTE
 
 
-def samples_to_mfccs(samples, sample_rate, train_phase=False, sample_id=None):
+def audio_to_features(samples, sample_rate, train_phase=False, augmentations=None, sample_id=None):
     if train_phase:
         # We need the lambdas to make TensorFlow happy.
         # pylint: disable=unnecessary-lambda
@@ -32,68 +32,38 @@ def samples_to_mfccs(samples, sample_rate, train_phase=False, sample_id=None):
                                                   stride=Config.audio_step_samples,
                                                   magnitude_squared=True)
 
-    # Data Augmentations
-    if train_phase:
-        if FLAGS.augmentation_spec_dropout_keeprate < 1:
-            spectrogram = augment_dropout(spectrogram,
-                                          keep_prob=FLAGS.augmentation_spec_dropout_keeprate)
+    if train_phase and augmentations is not None:
+        spectrogram = apply_spectrogram_augmentations(spectrogram, augmentations)
 
-        # sparse warp must before freq/time masking
-        if FLAGS.augmentation_sparse_warp:
-            spectrogram = augment_sparse_warp(spectrogram,
-                                              time_warping_para=FLAGS.augmentation_sparse_warp_time_warping_para,
-                                              interpolation_order=FLAGS.augmentation_sparse_warp_interpolation_order,
-                                              regularization_weight=FLAGS.augmentation_sparse_warp_regularization_weight,
-                                              num_boundary_points=FLAGS.augmentation_sparse_warp_num_boundary_points,
-                                              num_control_points=FLAGS.augmentation_sparse_warp_num_control_points)
+    features = contrib_audio.mfcc(spectrogram=spectrogram,
+                                  sample_rate=sample_rate,
+                                  dct_coefficient_count=Config.n_input,
+                                  upper_frequency_limit=FLAGS.audio_sample_rate / 2)
+    features = tf.reshape(features, [-1, Config.n_input])
 
-        if FLAGS.augmentation_freq_and_time_masking:
-            spectrogram = augment_freq_time_mask(spectrogram,
-                                                 frequency_masking_para=FLAGS.augmentation_freq_and_time_masking_freq_mask_range,
-                                                 time_masking_para=FLAGS.augmentation_freq_and_time_masking_time_mask_range,
-                                                 frequency_mask_num=FLAGS.augmentation_freq_and_time_masking_number_freq_masks,
-                                                 time_mask_num=FLAGS.augmentation_freq_and_time_masking_number_time_masks)
+    if train_phase and augmentations is not None:
+        features = apply_feature_augmentations(features, augmentations)
 
-        if FLAGS.augmentation_pitch_and_tempo_scaling:
-            spectrogram = augment_pitch_and_tempo(spectrogram,
-                                                  max_tempo=FLAGS.augmentation_pitch_and_tempo_scaling_max_tempo,
-                                                  max_pitch=FLAGS.augmentation_pitch_and_tempo_scaling_max_pitch,
-                                                  min_pitch=FLAGS.augmentation_pitch_and_tempo_scaling_min_pitch)
-
-        if FLAGS.augmentation_speed_up_std > 0:
-            spectrogram = augment_speed_up(spectrogram, speed_std=FLAGS.augmentation_speed_up_std)
-
-    mfccs = contrib_audio.mfcc(spectrogram=spectrogram,
-                               sample_rate=sample_rate,
-                               dct_coefficient_count=Config.n_input,
-                               upper_frequency_limit=FLAGS.audio_sample_rate/2)
-    mfccs = tf.reshape(mfccs, [-1, Config.n_input])
-
-    return mfccs, tf.shape(input=mfccs)[0]
+    return features, tf.shape(input=features)[0]
 
 
-def audio_to_features(audio, sample_rate, train_phase=False, sample_id=None):
-    features, features_len = samples_to_mfccs(audio, sample_rate, train_phase=train_phase, sample_id=sample_id)
-
-    if train_phase:
-        if FLAGS.data_aug_features_multiplicative > 0:
-            features = features*tf.random.normal(mean=1, stddev=FLAGS.data_aug_features_multiplicative, shape=tf.shape(features))
-
-        if FLAGS.data_aug_features_additive > 0:
-            features = features+tf.random.normal(mean=0.0, stddev=FLAGS.data_aug_features_additive, shape=tf.shape(features))
-
-    return features, features_len
-
-
-def audiofile_to_features(wav_filename, train_phase=False):
+def audiofile_to_features(wav_filename, train_phase=False, augmentations=None):
     samples = tf.io.read_file(wav_filename)
     decoded = contrib_audio.decode_wav(samples, desired_channels=1)
-    return audio_to_features(decoded.audio, decoded.sample_rate, train_phase=train_phase, sample_id=wav_filename)
+    return audio_to_features(decoded.audio,
+                             decoded.sample_rate,
+                             train_phase=train_phase,
+                             augmentations=augmentations,
+                             sample_id=wav_filename)
 
 
-def entry_to_features(sample_id, audio, sample_rate, transcript, train_phase=False):
+def entry_to_features(sample_id, audio, sample_rate, transcript, train_phase=False, augmentations=None):
     # https://bugs.python.org/issue32117
-    features, features_len = audio_to_features(audio, sample_rate, train_phase=train_phase, sample_id=sample_id)
+    features, features_len = audio_to_features(audio,
+                                               sample_rate,
+                                               train_phase=train_phase,
+                                               augmentations=augmentations,
+                                               sample_id=sample_id)
     sparse_transcript = tf.SparseTensor(*transcript)
     return sample_id, features, features_len, sparse_transcript
 
@@ -110,7 +80,7 @@ def to_sparse_tuple(sequence):
 def create_dataset(sources,
                    batch_size,
                    repetitions=1,
-                   augmentation_specs=None,
+                   augmentations=None,
                    enable_cache=False,
                    cache_path=None,
                    train_phase=False,
@@ -119,11 +89,11 @@ def create_dataset(sources,
                    buffering=1 * MEGABYTE):
     def generate_values():
         samples = samples_from_sources(sources, buffering=buffering, labeled=True)
-        samples = augment_samples(samples,
-                                  repetitions=repetitions,
-                                  augmentation_specs=augmentation_specs,
-                                  buffering=buffering,
-                                  process_ahead=2 * batch_size if process_ahead is None else process_ahead)
+        samples = apply_signal_augmentations(samples,
+                                             augmentations,
+                                             repetitions=repetitions,
+                                             buffering=buffering,
+                                             process_ahead=2 * batch_size if process_ahead is None else process_ahead)
         for sample in samples:
             transcript = text_to_char_array(sample.transcript, Config.alphabet, context=sample.sample_id)
             transcript = to_sparse_tuple(transcript)
@@ -143,7 +113,7 @@ def create_dataset(sources,
         sample_ids = sample_ids.batch(batch_size)
         return tf.data.Dataset.zip((sample_ids, features, transcripts))
 
-    process_fn = partial(entry_to_features, train_phase=train_phase)
+    process_fn = partial(entry_to_features, train_phase=train_phase, augmentations=augmentations)
 
     dataset = (tf.data.Dataset.from_generator(remember_exception(generate_values, exception_box),
                                               output_types=(tf.string, tf.float32, tf.int32,
@@ -172,7 +142,7 @@ def split_audio_file(audio_path,
             yield time_start, time_end, samples
 
     def to_mfccs(time_start, time_end, samples):
-        features, features_len = samples_to_mfccs(samples, audio_format.rate)
+        features, features_len = audio_to_features(samples, audio_format.rate)
         return time_start, time_end, features, features_len
 
     def create_batch_set(bs, criteria):
