@@ -430,7 +430,7 @@ def train():
                                cache_path=FLAGS.feature_cache,
                                train_phase=True,
                                exception_box=exception_box,
-                               process_ahead=len(Config.available_devices) * FLAGS.train_batch_size * 2,
+                               process_ahead=len(Config.available_devices) * FLAGS.train_batch_size * 8,
                                buffering=FLAGS.read_buffer)
 
     iterator = tfv1.data.Iterator.from_structure(tfv1.data.get_output_types(train_set),

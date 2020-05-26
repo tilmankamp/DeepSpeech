@@ -2,7 +2,7 @@
 
 set -xe
 
-apt-get install -y python3-venv libopus0
+apt-get install -y python3-venv libopus0 libsndfile1-dev
 
 python3 -m venv /tmp/venv
 source /tmp/venv/bin/activate
@@ -12,8 +12,6 @@ pip install .
 pip uninstall -y tensorflow
 pip install tensorflow-gpu==1.14
 
-mkdir -p ../keep/summaries
-
 data="${SHARED_DIR}/data"
 fis="${data}/LDC/fisher"
 swb="${data}/LDC/LDC97S62/swb"
@@ -21,19 +19,36 @@ lbs="${data}/OpenSLR/LibriSpeech/librivox"
 cv="${data}/mozilla/CommonVoice/en_1087h_2019-06-12/clips"
 npr="${data}/NPR/WAMU/sets/v0.3"
 
+voices="${data}/mozilla/librimax/en/v0.1/compressed/other-train.sdb"
+noise="${data}/UPF/noisedata/train.compressed.sdb"
+
+ext=".compressed.sdb"
+
 python -u DeepSpeech.py \
-  --train_files "${npr}/best-train.sdb","${npr}/good-train.sdb","${cv}/train.sdb","${fis}-train.sdb","${swb}-train.sdb","${lbs}-train-clean-100.sdb","${lbs}-train-clean-360.sdb","${lbs}-train-other-500.sdb" \
-  --dev_files "${lbs}-dev-clean.sdb" \
-  --test_files "${lbs}-test-clean.sdb" \
-  --train_batch_size 24 \
-  --dev_batch_size 48 \
-  --test_batch_size 48 \
+  --train_files "${npr}/best-train${ext}","${npr}/good-train${ext}","${cv}/train${ext}","${fis}-train${ext}","${swb}-train${ext}","${lbs}-train-clean-100${ext}","${lbs}-train-clean-360${ext}","${lbs}-train-other-500${ext}" \
+  --dev_files "${lbs}-dev-clean.sdb","${cv}/dev.csv" \
+  --test_files "${lbs}-test-clean.sdb","${cv}/test.csv" \
+  --train_batch_size 128 \
+  --dev_batch_size 128 \
+  --test_batch_size 128 \
+  --augment overlay[p=0.5,snr=30~20,source=${noise},layers=1] \
+  --augment overlay[p=0.1,snr=30~20,source=${voices},layers=6~4] \
+  --augment codec[p=0.1,bitrate=32000~16000] \
+  --augment reverb[p=0.1,delay=50.0~40.0,decay=2.5~2.0] \
+  --augment resample[p=0.1,rate=12000~8000] \
+  --augment volume[p=0.1,dbfs=-30.0~25.0] \
+  --augment gaps[p=0.05,n=3~2,size=60~50] \
   --train_cudnn \
   --n_hidden 2048 \
+  --dropout_rate 0.05 \
+  --epochs 100 \
   --learning_rate 0.0001 \
-  --dropout_rate 0.40 \
-  --epochs 150 \
   --noearly_stop \
-  --feature_cache "../tmp/feature.cache" \
+  --max_to_keep 1 \
+  --read_buffer 10M \
   --checkpoint_dir "../keep" \
   --summary_dir "../keep/summaries"
+
+# continue from 0.7.0 base model - job: 5554
+# LR schedule: 100x 0.0001, 100x 0.00001, 100x 0.000005
+
