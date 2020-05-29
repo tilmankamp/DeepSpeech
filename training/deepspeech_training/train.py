@@ -442,6 +442,10 @@ def train():
                                    buffering=FLAGS.read_buffer) for source in dev_sources]
         dev_init_ops = [iterator.make_initializer(dev_set) for dev_set in dev_sets]
 
+    clock_ph = tfv1.placeholder(tf.float32, name='clock')
+    epoch_ph = tfv1.placeholder(tf.int32, name='epoch')
+    epoch_seed_ph = tfv1.placeholder(tf.int32, name='epoch_seed')
+
     # Dropout
     dropout_rates = [tfv1.placeholder(tf.float32, name='dropout_{}'.format(i)) for i in range(6)]
     dropout_feed_dict = {
@@ -490,6 +494,8 @@ def train():
     best_dev_saver = tfv1.train.Saver(max_to_keep=1)
     best_dev_path = os.path.join(FLAGS.save_checkpoint_dir, 'best_dev')
 
+    print_random = tf.print(tf.random_uniform([]))
+
     # Save flags next to checkpoints
     os.makedirs(FLAGS.save_checkpoint_dir, exist_ok=True)
     flags_file = os.path.join(FLAGS.save_checkpoint_dir, 'flags.txt')
@@ -509,6 +515,10 @@ def train():
             is_train = set_name == 'train'
             train_op = apply_gradient_op if is_train else []
             feed_dict = dropout_feed_dict if is_train else no_dropout_feed_dict
+
+            feed_dict[epoch_ph] = epoch
+            feed_dict[epoch_seed_ph] = FLAGS.random_seed + epoch
+            feed_dict[clock_ph] = epoch / FLAGS.epochs
 
             total_loss = 0.0
             step_count = 0
@@ -538,8 +548,8 @@ def train():
             # Batch loop
             while True:
                 try:
-                    _, current_step, batch_loss, problem_files, step_summary = \
-                        session.run([train_op, global_step, loss, non_finite_files, step_summaries_op],
+                    _, _, current_step, batch_loss, problem_files, step_summary = \
+                        session.run([print_random, train_op, global_step, loss, non_finite_files, step_summaries_op],
                                     feed_dict=feed_dict)
                     exception_box.raise_if_set()
                 except tf.errors.InvalidArgumentError as err:

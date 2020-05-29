@@ -334,7 +334,8 @@ def apply_signal_augmentations(samples,
                 else:
                     yield sample, fixed_clock
 
-    augmentations = list(filter(lambda aug: isinstance(aug, SignalAugmentation), augmentations))
+    augmentations = [] if augmentations is None else list(filter(lambda aug: isinstance(aug, SignalAugmentation),
+                                                                 augmentations))
     try:
         for augmentation in augmentations:
             augmentation.start(buffering=buffering)
@@ -528,9 +529,10 @@ def apply_spectrogram_augmentations(spectrogram, augmentations):
     Tensor of type float32
         The augmented spectrogram
     """
-    for augmentation in augmentations:
-        if isinstance(augmentation, SpectrogramAugmentation):
-            spectrogram = augmentation.apply_to_spectrogram(spectrogram)
+    if augmentations is not None:
+        for augmentation in augmentations:
+            if isinstance(augmentation, SpectrogramAugmentation):
+                spectrogram = augmentation.apply_to_spectrogram(spectrogram)
     return spectrogram
 
 
@@ -554,8 +556,16 @@ class Multiply(FeaturesAugmentation):
 
     def apply_to_features(self, features):
         import tensorflow as tf  # pylint: disable=import-outside-toplevel
+        import tensorflow.compat.v1 as tfv1  # pylint: disable=import-outside-toplevel
         features_aug = features * tf.random.normal(mean=1.0, stddev=self.std, shape=tf.shape(features))
-        return tf.cond(tf.random.uniform([]) < self.probability, lambda: features_aug, lambda: features)
+
+        rv = tf.random.stateless_uniform([], (2, 42))
+        decision = tf.less(rv, self.probability)
+
+        tf.print(rv, decision)
+        tf.cond(decision, lambda: tf.print('yes'), lambda: tf.print('no'))
+
+        return tf.cond(decision, lambda: features_aug, lambda: features)
 
 
 def apply_feature_augmentations(features, augmentations):
@@ -574,7 +584,8 @@ def apply_feature_augmentations(features, augmentations):
     Tensor of type float32
         The augmented features
     """
-    for augmentation in augmentations:
-        if isinstance(augmentation, FeaturesAugmentation):
-            features = augmentation.apply_to_features(features)
+    if augmentations is not None:
+        for augmentation in augmentations:
+            if isinstance(augmentation, FeaturesAugmentation):
+                features = augmentation.apply_to_features(features)
     return features

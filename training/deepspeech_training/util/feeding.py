@@ -1,8 +1,10 @@
 # -*- coding: utf-8 -*-
 from __future__ import absolute_import, division, print_function
 
+from collections import Counter
 from functools import partial
 
+import random
 import numpy as np
 import tensorflow as tf
 
@@ -17,7 +19,7 @@ from .sample_collections import samples_from_sources
 from .helpers import remember_exception, MEGABYTE
 
 
-def audio_to_features(samples, sample_rate, train_phase=False, augmentations=None, sample_id=None):
+def audio_to_features(audio, sample_rate, train_phase=False, augmentations=None, sample_id=None):
     if train_phase:
         # We need the lambdas to make TensorFlow happy.
         # pylint: disable=unnecessary-lambda
@@ -27,7 +29,7 @@ def audio_to_features(samples, sample_rate, train_phase=False, augmentations=Non
                 lambda: tf.no_op(),
                 name='matching_sample_rate')
 
-    spectrogram = contrib_audio.audio_spectrogram(samples,
+    spectrogram = contrib_audio.audio_spectrogram(audio,
                                                   window_size=Config.audio_window_samples,
                                                   stride=Config.audio_step_samples,
                                                   magnitude_squared=True)
@@ -57,7 +59,7 @@ def audiofile_to_features(wav_filename, train_phase=False, augmentations=None):
                              sample_id=wav_filename)
 
 
-def entry_to_features(sample_id, audio, sample_rate, transcript, train_phase=False, augmentations=None):
+def entry_to_features(sample_id, sample_number, audio, sample_rate, transcript, train_phase=False, augmentations=None):
     # https://bugs.python.org/issue32117
     features, features_len = audio_to_features(audio,
                                                sample_rate,
@@ -87,6 +89,8 @@ def create_dataset(sources,
                    exception_box=None,
                    process_ahead=None,
                    buffering=1 * MEGABYTE):
+    sample_counter = Counter()
+
     def generate_values():
         samples = samples_from_sources(sources, buffering=buffering, labeled=True)
         samples = apply_signal_augmentations(samples,
@@ -95,9 +99,10 @@ def create_dataset(sources,
                                              buffering=buffering,
                                              process_ahead=2 * batch_size if process_ahead is None else process_ahead)
         for sample in samples:
+            sample_counter['sample_number'] += 1
             transcript = text_to_char_array(sample.transcript, Config.alphabet, context=sample.sample_id)
             transcript = to_sparse_tuple(transcript)
-            yield sample.sample_id, sample.audio, sample.audio_format.rate, transcript
+            yield sample.sample_id, sample_counter['sample_number'], sample.audio, sample.audio_format.rate, transcript
 
     # Batching a dataset of 2D SparseTensors creates 3D batches, which fail
     # when passed to tf.nn.ctc_loss, so we reshape them to remove the extra
@@ -116,7 +121,7 @@ def create_dataset(sources,
     process_fn = partial(entry_to_features, train_phase=train_phase, augmentations=augmentations)
 
     dataset = (tf.data.Dataset.from_generator(remember_exception(generate_values, exception_box),
-                                              output_types=(tf.string, tf.float32, tf.int32,
+                                              output_types=(tf.string, tf.int64, tf.float32, tf.int32,
                                                             (tf.int64, tf.int32, tf.int64)))
                               .map(process_fn, num_parallel_calls=tf.data.experimental.AUTOTUNE))
     if enable_cache:
