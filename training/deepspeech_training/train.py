@@ -416,6 +416,7 @@ def train():
     # Create training and validation datasets
     train_set = create_dataset(FLAGS.train_files.split(','),
                                batch_size=FLAGS.train_batch_size,
+                               epochs=FLAGS.epochs,
                                repetitions=FLAGS.augmentations_per_epoch,
                                augmentations=augmentations,
                                enable_cache=FLAGS.feature_cache and do_cache_dataset,
@@ -494,8 +495,6 @@ def train():
     best_dev_saver = tfv1.train.Saver(max_to_keep=1)
     best_dev_path = os.path.join(FLAGS.save_checkpoint_dir, 'best_dev')
 
-    print_random = tf.print(tf.random_uniform([]))
-
     # Save flags next to checkpoints
     os.makedirs(FLAGS.save_checkpoint_dir, exist_ok=True)
     flags_file = os.path.join(FLAGS.save_checkpoint_dir, 'flags.txt')
@@ -548,8 +547,8 @@ def train():
             # Batch loop
             while True:
                 try:
-                    _, _, current_step, batch_loss, problem_files, step_summary = \
-                        session.run([print_random, train_op, global_step, loss, non_finite_files, step_summaries_op],
+                    _, current_step, batch_loss, problem_files, step_summary = \
+                        session.run([train_op, global_step, loss, non_finite_files, step_summaries_op],
                                     feed_dict=feed_dict)
                     exception_box.raise_if_set()
                 except tf.errors.InvalidArgumentError as err:

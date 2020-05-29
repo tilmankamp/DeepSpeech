@@ -7,7 +7,7 @@ import numpy as np
 
 from multiprocessing import Queue, Process
 from .audio import gain_db_to_ratio, max_dbfs, normalize_audio, AUDIO_TYPE_NP, AUDIO_TYPE_PCM, AUDIO_TYPE_OPUS
-from .helpers import LimitingPool, int_range, float_range, pick_value_from_range, MEGABYTE
+from .helpers import LimitingPool, int_range, float_range, pick_value_from_range, tf_pick_value_from_range, MEGABYTE
 
 BUFFER_SIZE = 1 * MEGABYTE
 SPEC_PARSER = re.compile(r'^(?P<cls>[a-z_]+)(\[(?P<params>.*)\])?$')
@@ -22,29 +22,32 @@ class SignalAugmentation(Augmentation):
     def start(self, buffering=BUFFER_SIZE):
         pass
 
-    def apply_to_sample(self, sample, clock=0.0):
-        raise NotImplementedError
+    def apply(self, sample, clock=0.0):
+        pass
 
     def stop(self):
         pass
 
 
 class GraphAugmentation(Augmentation):
-    pass
+    def apply(self, tensor, clock=0, seed=0):
+        return tensor
+
+    def apply_with_probability(self, tensor, clock=0, seed=0):
+        import tensorflow as tf  # pylint: disable=import-outside-toplevel
+        return tf.cond(tf.less(tf.random.stateless_uniform([], (0, seed)), self.probability),
+                       lambda: self.apply(tensor, clock=clock, seed=seed),
+                       lambda: tensor)
 
 
 class SpectrogramAugmentation(GraphAugmentation):
-    def __init__(self, p=1.0, prio=1):
-        self.probability = float(p)
-        self.prio = prio
-
-    def apply_to_spectrogram(self, spectrogram):
-        raise NotImplementedError
+    def __init__(self, p=1.0, priority=1):
+        super(SpectrogramAugmentation, self).__init__(p)
+        self.priority = priority
 
 
 class FeaturesAugmentation(GraphAugmentation):
-    def apply_to_features(self, features):
-        raise NotImplementedError
+    pass
 
 
 def parse_augmentation(augmentation_spec):
@@ -140,7 +143,7 @@ class Overlay(SignalAugmentation):
                                        kwargs={'buffering': buffering})
         self.enqueue_process.start()
 
-    def apply_to_sample(self, sample, clock):
+    def apply(self, sample, clock):
         sample.change_audio_type(new_audio_type=AUDIO_TYPE_NP)
         n_layers = pick_value_from_range(self.layers, clock=clock)
         audio = sample.audio
@@ -180,7 +183,7 @@ class Reverb(SignalAugmentation):
         self.delay = float_range(delay)
         self.decay = float_range(decay)
 
-    def apply_to_sample(self, sample, clock):
+    def apply(self, sample, clock):
         sample.change_audio_type(new_audio_type=AUDIO_TYPE_NP)
         audio = np.array(sample.audio, dtype=np.float64)
         orig_dbfs = max_dbfs(audio)
@@ -209,7 +212,7 @@ class Resample(SignalAugmentation):
         super(Resample, self).__init__(p)
         self.rate = int_range(rate)
 
-    def apply_to_sample(self, sample, clock):
+    def apply(self, sample, clock):
         # late binding librosa and its dependencies
         from librosa.core import resample  # pylint: disable=import-outside-toplevel
         sample.change_audio_type(new_audio_type=AUDIO_TYPE_NP)
@@ -229,7 +232,7 @@ class Codec(SignalAugmentation):
         super(Codec, self).__init__(p)
         self.bitrate = int_range(bitrate)
 
-    def apply_to_sample(self, sample, clock):
+    def apply(self, sample, clock):
         bitrate = pick_value_from_range(self.bitrate, clock=clock)
         sample.change_audio_type(new_audio_type=AUDIO_TYPE_PCM)  # decoding to ensure it has to get encoded again
         sample.change_audio_type(new_audio_type=AUDIO_TYPE_OPUS, bitrate=bitrate)  # will get decoded again downstream
@@ -242,7 +245,7 @@ class Gaps(SignalAugmentation):
         self.n_gaps = int_range(n)
         self.size = float_range(size)
 
-    def apply_to_sample(self, sample, clock):
+    def apply(self, sample, clock):
         sample.change_audio_type(new_audio_type=AUDIO_TYPE_NP)
         audio = sample.audio
         n_gaps = pick_value_from_range(self.n_gaps, clock=clock)
@@ -261,7 +264,7 @@ class Volume(SignalAugmentation):
         super(Volume, self).__init__(p)
         self.target_dbfs = float_range(dbfs)
 
-    def apply_to_sample(self, sample, clock):
+    def apply(self, sample, clock):
         sample.change_audio_type(new_audio_type=AUDIO_TYPE_NP)
         target_dbfs = pick_value_from_range(self.target_dbfs, clock=clock)
         sample.audio = normalize_audio(sample.audio, dbfs=target_dbfs)
@@ -286,7 +289,7 @@ def _augment_sample(timed_sample, context=None):
     sample, clock = timed_sample
     for augmentation in context.augmentations:
         if random.random() < augmentation.probability:
-            augmentation.apply_to_sample(sample, clock)
+            augmentation.apply(sample, clock)
     sample.change_audio_type(new_audio_type=context.target_audio_type)
     return sample
 
@@ -360,7 +363,7 @@ class TimeMask(SpectrogramAugmentation):
         self.n = int(n)
         self.max_size = int(max_size)
 
-    def apply_to_spectrogram(self, spectrogram):
+    def apply(self, spectrogram, clock=0, seed=0):
         import tensorflow as tf  # pylint: disable=import-outside-toplevel
         time_max = tf.shape(spectrogram)[1]
         freq_max = tf.shape(spectrogram)[2]
@@ -373,7 +376,7 @@ class TimeMask(SpectrogramAugmentation):
             value_ones_freq_next = tf.ones(shape=[1, time_max, freq_max - (f0 + f)])
             freq_mask = tf.concat([value_ones_freq_prev, value_zeros_freq, value_ones_freq_next], axis=2)
             spectrogram_aug = spectrogram_aug * freq_mask
-        return tf.cond(tf.random.uniform([]) < self.probability, lambda: spectrogram_aug, lambda: spectrogram)
+        return spectrogram_aug
 
 
 class FrequencyMask(SpectrogramAugmentation):
@@ -383,7 +386,7 @@ class FrequencyMask(SpectrogramAugmentation):
         self.n = int(n)
         self.max_size = int(max_size)
 
-    def apply_to_spectrogram(self, spectrogram):
+    def apply(self, spectrogram, clock=0, seed=0):
         import tensorflow as tf  # pylint: disable=import-outside-toplevel
         time_max = tf.shape(spectrogram)[1]
         freq_max = tf.shape(spectrogram)[2]
@@ -396,7 +399,7 @@ class FrequencyMask(SpectrogramAugmentation):
             value_zeros_time_next = tf.ones(shape=[1, time_max - (t0 + t), freq_max])
             time_mask = tf.concat([value_zeros_time_prev, value_zeros_time, value_zeros_time_next], axis=1)
             spectrogram_aug = spectrogram_aug * time_mask
-        return tf.cond(tf.random.uniform([]) < self.probability, lambda: spectrogram_aug, lambda: spectrogram)
+        return spectrogram_aug
 
 
 class PitchAndTempo(SpectrogramAugmentation):
@@ -407,7 +410,7 @@ class PitchAndTempo(SpectrogramAugmentation):
         self.min_pitch = float(min_pitch)
         self.max_pitch = float(max_pitch)
 
-    def apply_to_spectrogram(self, spectrogram):
+    def apply(self, spectrogram, clock=0, seed=0):
         import tensorflow as tf  # pylint: disable=import-outside-toplevel
         original_shape = tf.shape(spectrogram)
         chosen_pitch = tf.random.uniform(shape=(), minval=self.min_pitch, maxval=self.max_pitch)
@@ -427,8 +430,7 @@ class PitchAndTempo(SpectrogramAugmentation):
                                                                        target_height=tf.shape(spectrogram_aug)[1],
                                                                        target_width=original_shape[2]),
                                   lambda: spectrogram_aug)
-        spectrogram_aug = spectrogram_aug[:, :, :, 0]
-        return tf.cond(tf.random.uniform([]) < self.probability, lambda: spectrogram_aug, lambda: spectrogram)
+        return spectrogram_aug[:, :, :, 0]
 
 
 class SpeedUp(SpectrogramAugmentation):
@@ -437,7 +439,7 @@ class SpeedUp(SpectrogramAugmentation):
         super(SpeedUp, self).__init__(p)
         self.std = float(std)
 
-    def apply_to_spectrogram(self, spectrogram):
+    def apply(self, spectrogram, clock=0, seed=0):
         import tensorflow as tf  # pylint: disable=import-outside-toplevel
         original_shape = tf.shape(spectrogram)
         # abs makes sure the augmentation will only speed up
@@ -445,8 +447,7 @@ class SpeedUp(SpectrogramAugmentation):
         new_freq_size = tf.cast(tf.cast(original_shape[2], tf.float32), tf.int32)
         new_time_size = tf.cast(tf.cast(original_shape[1], tf.float32) / chosen_speed, tf.int32)
         spectrogram_aug = tf.image.resize_bilinear(tf.expand_dims(spectrogram, -1), [new_time_size, new_freq_size])
-        spectrogram_aug = spectrogram_aug[:, :, :, 0]
-        return tf.cond(tf.random.uniform([]) < self.probability, lambda: spectrogram_aug, lambda: spectrogram)
+        return spectrogram_aug[:, :, :, 0]
 
 
 class Dropout(SpectrogramAugmentation):
@@ -455,10 +456,9 @@ class Dropout(SpectrogramAugmentation):
         super(Dropout, self).__init__(p)
         self.rate = float(rate)
 
-    def apply_to_spectrogram(self, spectrogram):
+    def apply(self, spectrogram, clock=0, seed=0):
         import tensorflow as tf
-        spectrogram_aug = tf.nn.dropout(spectrogram, rate=self.rate)
-        return tf.cond(tf.random.uniform([]) < self.probability, lambda: spectrogram_aug, lambda: spectrogram)
+        return tf.nn.dropout(spectrogram, rate=self.rate)
 
 
 class SparseWarp(SpectrogramAugmentation):
@@ -471,7 +471,7 @@ class SparseWarp(SpectrogramAugmentation):
         self.nbp = int(nbp)
         self.ncp = int(ncp)
 
-    def apply_to_spectrogram(self, spectrogram):
+    def apply(self, spectrogram, clock=0, seed=0):
         import tensorflow as tf  # pylint: disable=import-outside-toplevel
         import tensorflow.compat.v1 as tfv1  # pylint: disable=import-outside-toplevel
         from .sparse_image_warp import sparse_image_warp  # pylint: disable=import-outside-toplevel
@@ -509,11 +509,10 @@ class SparseWarp(SpectrogramAugmentation):
                                                interpolation_order=self.interpolation_order,
                                                regularization_weight=self.regularization_weight,
                                                num_boundary_points=self.nbp)
-        spectrogram_aug = tf.reshape(spectrogram_aug, shape=(1, -1, freq_size))
-        return tf.cond(tf.random.uniform([]) < self.probability, lambda: spectrogram_aug, lambda: spectrogram)
+        return tf.reshape(spectrogram_aug, shape=(1, -1, freq_size))
 
 
-def apply_spectrogram_augmentations(spectrogram, augmentations):
+def apply_spectrogram_augmentations(spectrogram, augmentations, clock=0, seed=0):
     """
     Augments training sample spectrograms with spectrogram augmentations from passed augmentation list.
 
@@ -532,43 +531,35 @@ def apply_spectrogram_augmentations(spectrogram, augmentations):
     if augmentations is not None:
         for augmentation in augmentations:
             if isinstance(augmentation, SpectrogramAugmentation):
-                spectrogram = augmentation.apply_to_spectrogram(spectrogram)
+                spectrogram = augmentation.apply_with_probability(spectrogram, clock=clock, seed=seed)
     return spectrogram
 
 
 class Add(FeaturesAugmentation):
     """See "Add augmentation" in TRAINING.rst"""
-    def __init__(self, p=1.0, std=0.0):
+    def __init__(self, p=1.0, stddev=0.0):
         super(Add, self).__init__(p)
-        self.std = float(std)
+        self.stddev = float_range(stddev)
 
-    def apply_to_features(self, features):
+    def apply(self, features, clock=0, seed=0):
         import tensorflow as tf  # pylint: disable=import-outside-toplevel
-        features_aug = features + tf.random.normal(mean=0.0, stddev=self.std, shape=tf.shape(features))
-        return tf.cond(tf.random.uniform([]) < self.probability, lambda: features_aug, lambda: features)
+        stddev = tf_pick_value_from_range(self.stddev, clock=clock, seed=seed)
+        return features + tf.random.normal(mean=0.0, stddev=self.stddev, shape=tf.shape(features))
 
 
 class Multiply(FeaturesAugmentation):
     """See "Multiply augmentation" in TRAINING.rst"""
-    def __init__(self, p=1.0, std=0.0):
+    def __init__(self, p=1.0, stddev=0.0):
         super(Multiply, self).__init__(p)
-        self.std = float(std)
+        self.stddev = float_range(stddev)
 
-    def apply_to_features(self, features):
+    def apply(self, features, clock=0, seed=0):
         import tensorflow as tf  # pylint: disable=import-outside-toplevel
-        import tensorflow.compat.v1 as tfv1  # pylint: disable=import-outside-toplevel
-        features_aug = features * tf.random.normal(mean=1.0, stddev=self.std, shape=tf.shape(features))
-
-        rv = tf.random.stateless_uniform([], (2, 42))
-        decision = tf.less(rv, self.probability)
-
-        tf.print(rv, decision)
-        tf.cond(decision, lambda: tf.print('yes'), lambda: tf.print('no'))
-
-        return tf.cond(decision, lambda: features_aug, lambda: features)
+        stddev = tf_pick_value_from_range(self.stddev, clock=clock, seed=seed)
+        return features * tf.random.normal(mean=1.0, stddev=stddev, shape=tf.shape(features))
 
 
-def apply_feature_augmentations(features, augmentations):
+def apply_feature_augmentations(features, augmentations, clock=0, seed=0):
     """
     Augments training sample features with feature augmentations from passed augmentation list.
 
@@ -587,5 +578,5 @@ def apply_feature_augmentations(features, augmentations):
     if augmentations is not None:
         for augmentation in augmentations:
             if isinstance(augmentation, FeaturesAugmentation):
-                features = augmentation.apply_to_features(features)
+                features = augmentation.apply_with_probability(features, clock=clock, seed=seed)
     return features

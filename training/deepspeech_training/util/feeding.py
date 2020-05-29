@@ -19,7 +19,7 @@ from .sample_collections import samples_from_sources
 from .helpers import remember_exception, MEGABYTE
 
 
-def audio_to_features(audio, sample_rate, train_phase=False, augmentations=None, sample_id=None):
+def audio_to_features(audio, sample_rate, clock=0, train_phase=False, augmentations=None, sample_id=None, seed=0):
     if train_phase:
         # We need the lambdas to make TensorFlow happy.
         # pylint: disable=unnecessary-lambda
@@ -35,7 +35,7 @@ def audio_to_features(audio, sample_rate, train_phase=False, augmentations=None,
                                                   magnitude_squared=True)
 
     if train_phase and augmentations is not None:
-        spectrogram = apply_spectrogram_augmentations(spectrogram, augmentations)
+        spectrogram = apply_spectrogram_augmentations(spectrogram, augmentations, clock=clock, seed=seed)
 
     features = contrib_audio.mfcc(spectrogram=spectrogram,
                                   sample_rate=sample_rate,
@@ -44,7 +44,7 @@ def audio_to_features(audio, sample_rate, train_phase=False, augmentations=None,
     features = tf.reshape(features, [-1, Config.n_input])
 
     if train_phase and augmentations is not None:
-        features = apply_feature_augmentations(features, augmentations)
+        features = apply_feature_augmentations(features, augmentations, clock=clock, seed=seed)
 
     return features, tf.shape(input=features)[0]
 
@@ -59,13 +59,15 @@ def audiofile_to_features(wav_filename, train_phase=False, augmentations=None):
                              sample_id=wav_filename)
 
 
-def entry_to_features(sample_id, sample_number, audio, sample_rate, transcript, train_phase=False, augmentations=None):
+def entry_to_features(sample_id, sample_number, clock, audio, sample_rate, transcript, train_phase=False, augmentations=None):
     # https://bugs.python.org/issue32117
     features, features_len = audio_to_features(audio,
                                                sample_rate,
+                                               clock=clock,
                                                train_phase=train_phase,
                                                augmentations=augmentations,
-                                               sample_id=sample_id)
+                                               sample_id=sample_id,
+                                               seed=sample_number)
     sparse_transcript = tf.SparseTensor(*transcript)
     return sample_id, features, features_len, sparse_transcript
 
@@ -82,6 +84,7 @@ def to_sparse_tuple(sequence):
 def create_dataset(sources,
                    batch_size,
                    repetitions=1,
+                   epochs=1,
                    augmentations=None,
                    enable_cache=False,
                    cache_path=None,
@@ -89,20 +92,25 @@ def create_dataset(sources,
                    exception_box=None,
                    process_ahead=None,
                    buffering=1 * MEGABYTE):
-    sample_counter = Counter()
+    counter = Counter()
 
     def generate_values():
+        epoch = counter['epoch']
+        if train_phase:
+            counter['epoch'] += 1
         samples = samples_from_sources(sources, buffering=buffering, labeled=True)
+        num_samples = len(samples)
         samples = apply_signal_augmentations(samples,
                                              augmentations,
                                              repetitions=repetitions,
                                              buffering=buffering,
                                              process_ahead=2 * batch_size if process_ahead is None else process_ahead)
-        for sample in samples:
-            sample_counter['sample_number'] += 1
+        for sample_index, sample in enumerate(samples):
+            counter['sample_number'] += 1
+            clock = (epoch * num_samples + sample_index) / (epochs * num_samples) if train_phase and epochs > 0 else 0.0
             transcript = text_to_char_array(sample.transcript, Config.alphabet, context=sample.sample_id)
             transcript = to_sparse_tuple(transcript)
-            yield sample.sample_id, sample_counter['sample_number'], sample.audio, sample.audio_format.rate, transcript
+            yield sample.sample_id, counter['sample_number'], clock, sample.audio, sample.audio_format.rate, transcript
 
     # Batching a dataset of 2D SparseTensors creates 3D batches, which fail
     # when passed to tf.nn.ctc_loss, so we reshape them to remove the extra
@@ -121,7 +129,7 @@ def create_dataset(sources,
     process_fn = partial(entry_to_features, train_phase=train_phase, augmentations=augmentations)
 
     dataset = (tf.data.Dataset.from_generator(remember_exception(generate_values, exception_box),
-                                              output_types=(tf.string, tf.int64, tf.float32, tf.int32,
+                                              output_types=(tf.string, tf.int64, tf.float32, tf.float32, tf.int32,
                                                             (tf.int64, tf.int32, tf.int64)))
                               .map(process_fn, num_parallel_calls=tf.data.experimental.AUTOTUNE))
     if enable_cache:
