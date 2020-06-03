@@ -551,11 +551,6 @@ def train():
                         session.run([train_op, global_step, loss, non_finite_files, step_summaries_op],
                                     feed_dict=feed_dict)
                     exception_box.raise_if_set()
-                except tf.errors.InvalidArgumentError as err:
-                    if FLAGS.augmentation_sparse_warp:
-                        log_info("Ignoring sparse warp error: {}".format(err))
-                        continue
-                    raise
                 except tf.errors.OutOfRangeError:
                     exception_box.raise_if_set()
                     break

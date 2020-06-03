@@ -184,6 +184,6 @@ def tf_pick_value_from_range(value_range, clock=None):
     value = tf.random.stateless_uniform([],
                                         minval=value - value_range.r,
                                         maxval=value + value_range.r,
-                                        seed=(-clock * tf.int32.min, clock * tf.int32.max),
+                                        seed=(clock * tf.int32.min, clock * tf.int32.max),
                                         dtype=tf.float32)
     return tf.cast(tf.math.round(value), tf.int32) if isinstance(value_range.start, int) else value
