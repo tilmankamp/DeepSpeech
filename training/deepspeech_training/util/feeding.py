@@ -4,7 +4,6 @@ from __future__ import absolute_import, division, print_function
 from collections import Counter
 from functools import partial
 
-import random
 import numpy as np
 import tensorflow as tf
 
@@ -13,7 +12,7 @@ from tensorflow.python.ops import gen_audio_ops as contrib_audio
 from .config import Config
 from .text import text_to_char_array
 from .flags import FLAGS
-from .augmentations import apply_signal_augmentations, apply_spectrogram_augmentations, apply_feature_augmentations
+from .augmentations import apply_sample_augmentations, apply_graph_augmentations
 from .audio import read_frames_from_file, vad_split, pcm_to_np, DEFAULT_FORMAT
 from .sample_collections import samples_from_sources
 from .helpers import remember_exception, MEGABYTE
@@ -29,13 +28,16 @@ def audio_to_features(audio, sample_rate, clock=0.0, train_phase=False, augmenta
                 lambda: tf.no_op(),
                 name='matching_sample_rate')
 
+    if train_phase and augmentations is not None:
+        audio = apply_graph_augmentations('signal', audio, augmentations, clock=clock)
+
     spectrogram = contrib_audio.audio_spectrogram(audio,
                                                   window_size=Config.audio_window_samples,
                                                   stride=Config.audio_step_samples,
                                                   magnitude_squared=True)
 
     if train_phase and augmentations is not None:
-        spectrogram = apply_spectrogram_augmentations(spectrogram, augmentations, clock=clock)
+        spectrogram = apply_graph_augmentations('spectrogram', spectrogram, augmentations, clock=clock)
 
     features = contrib_audio.mfcc(spectrogram=spectrogram,
                                   sample_rate=sample_rate,
@@ -44,7 +46,7 @@ def audio_to_features(audio, sample_rate, clock=0.0, train_phase=False, augmenta
     features = tf.reshape(features, [-1, Config.n_input])
 
     if train_phase and augmentations is not None:
-        features = apply_feature_augmentations(features, augmentations, clock=clock)
+        features = apply_graph_augmentations('features', features, augmentations, clock=clock)
 
     return features, tf.shape(input=features)[0]
 
@@ -100,7 +102,7 @@ def create_dataset(sources,
             epoch_counter['epoch'] += 1
         samples = samples_from_sources(sources, buffering=buffering, labeled=True)
         num_samples = len(samples) * repetitions
-        samples = apply_signal_augmentations(samples,
+        samples = apply_sample_augmentations(samples,
                                              augmentations,
                                              repetitions=repetitions,
                                              buffering=buffering,
