@@ -4,6 +4,7 @@ from __future__ import absolute_import, division, print_function
 from collections import Counter
 from functools import partial
 
+import os
 import numpy as np
 import tensorflow as tf
 
@@ -85,10 +86,8 @@ def to_sparse_tuple(sequence):
 
 def create_dataset(sources,
                    batch_size,
-                   repetitions=1,
                    epochs=1,
                    augmentations=None,
-                   enable_cache=False,
                    cache_path=None,
                    train_phase=False,
                    exception_box=None,
@@ -101,12 +100,13 @@ def create_dataset(sources,
         if train_phase:
             epoch_counter['epoch'] += 1
         samples = samples_from_sources(sources, buffering=buffering, labeled=True)
-        num_samples = len(samples) * repetitions
+        num_samples = len(samples)
         samples = apply_sample_augmentations(samples,
                                              augmentations,
-                                             repetitions=repetitions,
                                              buffering=buffering,
-                                             process_ahead=2 * batch_size if process_ahead is None else process_ahead)
+                                             process_ahead=2 * batch_size if process_ahead is None else process_ahead,
+                                             clock_from=epoch / epochs,
+                                             clock_to=(epoch + 1) / epochs)
         for sample_index, sample in enumerate(samples):
             clock = (epoch * num_samples + sample_index) / (epochs * num_samples) if train_phase and epochs > 0 else 0.0
             transcript = text_to_char_array(sample.transcript, Config.alphabet, context=sample.sample_id)
@@ -131,9 +131,9 @@ def create_dataset(sources,
 
     dataset = (tf.data.Dataset.from_generator(remember_exception(generate_values, exception_box),
                                               output_types=(tf.string, tf.float32, tf.int32,
-                                                            (tf.int64, tf.int32, tf.int64), tf.float32))
+                                                            (tf.int64, tf.int32, tf.int64), tf.float64))
                               .map(process_fn, num_parallel_calls=tf.data.experimental.AUTOTUNE))
-    if enable_cache:
+    if cache_path is not None:
         dataset = dataset.cache(cache_path)
     dataset = (dataset.window(batch_size, drop_remainder=True).flat_map(batch_fn)
                       .prefetch(len(Config.available_devices)))

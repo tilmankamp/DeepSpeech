@@ -41,7 +41,8 @@ class GraphAugmentation(Augmentation):
 
     def apply_with_probability(self, tensor, clock=0.0):
         import tensorflow as tf  # pylint: disable=import-outside-toplevel
-        return tf.cond(tf.less(tf.random.stateless_uniform([], seed=(-clock, clock)), self.probability),
+        rv = tf.random.stateless_uniform([], seed=(clock * tf.int32.min, clock * tf.int32.max))
+        return tf.cond(tf.less(rv, self.probability),
                        lambda: self.apply(tensor, clock=clock),
                        lambda: tensor)
 
@@ -162,8 +163,8 @@ def apply_sample_augmentations(samples,
                                audio_type=AUDIO_TYPE_NP,
                                buffering=BUFFER_SIZE,
                                process_ahead=None,
-                               repetitions=1,
-                               fixed_clock=None):
+                               clock_from=0.0,
+                               clock_to=1.0):
     """
     Prepares samples for being used during training.
     This includes parallel and buffered application of augmentations and a conversion to a specified audio-type.
@@ -180,26 +181,23 @@ def apply_sample_augmentations(samples,
         Read-buffer size to use while reading files.
     process_ahead : int
         Number of samples to pre-process ahead of time.
-    repetitions : int
-        How often the input sample enumeration should get repeated for being re-augmented.
-    fixed_clock : float
-        Sets the internal clock to a value between 0.0 (beginning of epoch) and 1.0 (end of epoch).
-        Setting this to a number is used for simulating augmentations at a certain epoch-time.
-        If kept at None (default), the internal clock will run regularly from 0.0 to 1.0,
-        hence preparing them for training.
+    clock_from : float
+        Start clock value between 0.0 and 1.0 for the first sample. Has to be <= than clock_to.
+    clock_to : float
+        Final clock value between 0.0 and 1.0 for the last sample. Has to be >= than clock_from.
 
     Returns
     -------
     iterable of util.sample_collections.LabeledSample or util.audio.Sample
     """
     def timed_samples():
-        for repetition in range(repetitions):
-            for sample_index, sample in enumerate(samples):
-                if fixed_clock is None:
-                    yield sample, (repetition * len(samples) + sample_index) / (repetitions * len(samples))
-                else:
-                    yield sample, fixed_clock
+        for sample_index, sample in enumerate(samples):
+            sample_clock = clock_from + (clock_to - clock_from) * (sample_index / len(samples))
+            yield sample, sample_clock
 
+    assert 0.0 <= clock_from <= 1.0
+    assert 0.0 <= clock_to <= 1.0
+    assert clock_from <= clock_to
     augmentations = [] if augmentations is None else list(filter(lambda aug: isinstance(aug, SampleAugmentation),
                                                                  augmentations))
     try:
@@ -488,7 +486,7 @@ class FrequencyMask(GraphAugmentation):
             f0 = tf.random.stateless_uniform((), (-seed, seed), minval=0, maxval=freq_max - size, dtype=tf.dtypes.int32)
             freq_mask = tf.concat([tf.ones([1, time_max, f0]),
                                    tf.zeros([1, time_max, size]),
-                                   tf.ones([1, time_max, freq_max - f0 - size])], axis=1)
+                                   tf.ones([1, time_max, freq_max - f0 - size])], axis=2)
             return i + 1, spectrogram_aug * freq_mask
 
         return tf.while_loop(lambda i, spectrogram_aug: i < n, body, (0, spectrogram))[1]

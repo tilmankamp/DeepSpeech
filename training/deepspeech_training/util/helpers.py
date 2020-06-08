@@ -176,14 +176,17 @@ def pick_value_from_range(value_range, clock=None):
     return round(value) if isinstance(value_range.start, int) else value
 
 
-def tf_pick_value_from_range(value_range, clock=None):
+def tf_pick_value_from_range(value_range, clock=None, double_precision=False):
     import tensorflow as tf  # pylint: disable=import-outside-toplevel
-    clock = (tf.random.stateless_uniform([], seed=(-1, 1)) if clock is None
-             else tf.maximum(0.0, tf.minimum(1.0, clock)))
+    clock = (tf.random.stateless_uniform([], seed=(-1, 1), dtype=tf.float64) if clock is None
+             else tf.maximum(tf.constant(0.0, dtype=tf.float64), tf.minimum(tf.constant(1.0, dtype=tf.float64), clock)))
     value = value_range.start + clock * (value_range.end - value_range.start)
     value = tf.random.stateless_uniform([],
                                         minval=value - value_range.r,
                                         maxval=value + value_range.r,
                                         seed=(clock * tf.int32.min, clock * tf.int32.max),
-                                        dtype=tf.float32)
-    return tf.cast(tf.math.round(value), tf.int32) if isinstance(value_range.start, int) else value
+                                        dtype=tf.float64)
+    if isinstance(value_range.start, int):
+        return tf.cast(tf.math.round(value), tf.int64 if double_precision else tf.int32)
+    else:
+        return tf.cast(value, tf.float64 if double_precision else tf.float32)

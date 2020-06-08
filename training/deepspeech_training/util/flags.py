@@ -18,6 +18,7 @@ def create_flags():
 
     f.DEFINE_string('read_buffer', '1MB', 'buffer-size for reading samples from datasets (supports file-size suffixes KB, MB, GB, TB)')
     f.DEFINE_string('feature_cache', '', 'cache MFCC features to disk to speed up future training runs on the same data. This flag specifies the path where cached features extracted from --train_files will be saved. If empty, or if online augmentation flags are enabled, caching will be disabled.')
+    f.DEFINE_integer('cache_for_epochs', 0, 'after how many epochs the feature cache is invalidated again - 0 for "never"')
 
     f.DEFINE_integer('feature_win_len', 32, 'feature extraction audio window length in milliseconds')
     f.DEFINE_integer('feature_win_step', 20, 'feature extraction window step length in milliseconds')
@@ -27,7 +28,6 @@ def create_flags():
     # ================
 
     f.DEFINE_multi_string('augment', None, 'specifies an augmentation of the training samples. Format is "--augment operation[param1=value1, ...]"')
-    f.DEFINE_integer('augmentations_per_epoch', 1, 'how often the train set should be repeated and re-augmented per epoch')
 
     # Global Constants
     # ================

@@ -409,17 +409,13 @@ def log_grads_and_vars(grads_and_vars):
 
 def train():
     augmentations = parse_augmentations(FLAGS.augment)
-    do_cache_dataset = not any(map(lambda a: isinstance(a, GraphAugmentation), augmentations))
-
     exception_box = ExceptionBox()
 
     # Create training and validation datasets
     train_set = create_dataset(FLAGS.train_files.split(','),
                                batch_size=FLAGS.train_batch_size,
                                epochs=FLAGS.epochs,
-                               repetitions=FLAGS.augmentations_per_epoch,
                                augmentations=augmentations,
-                               enable_cache=FLAGS.feature_cache and do_cache_dataset,
                                cache_path=FLAGS.feature_cache,
                                train_phase=True,
                                exception_box=exception_box,
@@ -524,6 +520,12 @@ def train():
 
             step_summary_writer = step_summary_writers.get(set_name)
             checkpoint_time = time.time()
+
+            if is_train and FLAGS.cache_for_epochs > 0 and FLAGS.feature_cache is not None:
+                feature_cache_index = FLAGS.feature_cache + '.index'
+                if epoch % FLAGS.cache_for_epochs == 0 and os.path.isfile(feature_cache_index):
+                    log_info('Invalidating feature cache')
+                    os.remove(feature_cache_index)  # this will let TF also overwrite the related cache data files
 
             # Setup progress bar
             class LossWidget(progressbar.widgets.FormatLabel):

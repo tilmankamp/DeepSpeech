@@ -43,7 +43,8 @@ def play_collection():
                               audio_type=AUDIO_TYPE_PCM,
                               augmentation_specs=CLI_ARGS.augment,
                               process_ahead=0,
-                              fixed_clock=CLI_ARGS.clock)
+                              clock_from=CLI_ARGS.clock,
+                              clock_to=CLI_ARGS.clock)
     for sample in samples:
         if not CLI_ARGS.quiet:
             print('Sample "{}"'.format(sample.sample_id), file=sys.stderr)
