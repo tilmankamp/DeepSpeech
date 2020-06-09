@@ -10,7 +10,6 @@ DESIRED_LOG_LEVEL = sys.argv[LOG_LEVEL_INDEX] if 0 < LOG_LEVEL_INDEX < len(sys.a
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = DESIRED_LOG_LEVEL
 
 import absl.app
-import json
 import numpy as np
 import progressbar
 import shutil
@@ -32,7 +31,6 @@ from six.moves import zip, range
 from .util.config import Config, initialize_globals
 from .util.checkpoints import load_or_init_graph_for_training, load_graph_for_evaluation
 from .util.evaluate_tools import save_samples_json
-from .util.augmentations import parse_augmentations, GraphAugmentation
 from .util.feeding import create_dataset, audio_to_features, audiofile_to_features
 from .util.flags import create_flags, FLAGS
 from .util.helpers import check_ctcdecoder_version, ExceptionBox
@@ -408,14 +406,13 @@ def log_grads_and_vars(grads_and_vars):
 
 
 def train():
-    augmentations = parse_augmentations(FLAGS.augment)
     exception_box = ExceptionBox()
 
     # Create training and validation datasets
     train_set = create_dataset(FLAGS.train_files.split(','),
                                batch_size=FLAGS.train_batch_size,
                                epochs=FLAGS.epochs,
-                               augmentations=augmentations,
+                               augmentations=Config.augmentations,
                                cache_path=FLAGS.feature_cache,
                                train_phase=True,
                                exception_box=exception_box,

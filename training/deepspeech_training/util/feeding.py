@@ -4,7 +4,6 @@ from __future__ import absolute_import, division, print_function
 from collections import Counter
 from functools import partial
 
-import os
 import numpy as np
 import tensorflow as tf
 
@@ -105,8 +104,8 @@ def create_dataset(sources,
                                              augmentations,
                                              buffering=buffering,
                                              process_ahead=2 * batch_size if process_ahead is None else process_ahead,
-                                             clock_from=epoch / epochs,
-                                             clock_to=(epoch + 1) / epochs)
+                                             clock=epoch / epochs,
+                                             final_clock=(epoch + 1) / epochs)
         for sample_index, sample in enumerate(samples):
             clock = (epoch * num_samples + sample_index) / (epochs * num_samples) if train_phase and epochs > 0 else 0.0
             transcript = text_to_char_array(sample.transcript, Config.alphabet, context=sample.sample_id)
