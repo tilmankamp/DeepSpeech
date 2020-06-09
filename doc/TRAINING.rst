@@ -270,12 +270,6 @@ Augmentation
 
 Augmentation is a useful technique for better generalization of machine learning models. Thus, a pre-processing pipeline with various augmentation techniques on raw pcm and spectrogram has been implemented and can be used while training the model. Following are the available augmentation techniques that can be enabled at training time by using the corresponding flags in the command line.
 
-
-Audio Augmentation
-------------------
-
-Augmentations that are applied before potential feature caching can be specified through the ``--augment`` flag. Being a multi-flag, it can be specified multiple times (see below for an example).
-
 Each sample of the training data will get treated by every specified augmentation in their given order. However: whether an augmentation will actually get applied to a sample is decided by chance on base of the augmentation's probability value. For example a value of ``p=0.1`` would apply the according augmentation to just 10% of all samples. This also means that augmentations are not mutually exclusive on a per-sample basis.
 
 The ``--augment`` flag uses a common syntax for all augmentation types:
@@ -305,6 +299,8 @@ Ranges specified with integer limits will only assume integer (rounded) values.
 
 If feature caching is enabled, these augmentations will only be performed on the first epoch and the result will be reused for subsequent epochs. The flag ``--augmentations_per_epoch N`` (by default `N` is 1) could be used to get more than one epoch worth of augmentations into the cache. During training, each epoch will do ``N`` passes over the training set, each time performing augmentation independently of previous passes. Be aware: this will also multiply the required size of the feature cache if it's enabled.
 
+Sample domain augmentations
+---------------------------
 
 **Overlay augmentation** ``--augment overlay[p=<float>,source=<str>,snr=<float-range>,layers=<int-range>]``
   Layers another audio source (multiple times) onto augmented samples.
@@ -326,16 +322,6 @@ If feature caching is enabled, these augmentations will only be performed on the
   * **delay**: time delay in ms for the first signal reflection - higher values are widening the perceived "room"
 
   * **decay**: sound decay in dB per reflection - higher values will result in a less reflective perceived "room"
-
-
-**Gaps augmentation** ``--augment gaps[p=<float>,n=<int-range>,size=<float-range>]``
-  Sets time-intervals within the augmented samples to zero (silence) at random positions.
-
-  * **p**: probability value between 0.0 (never) and 1.0 (always) if a given sample gets augmented by this method
-
-  * **n**: number of intervals to set to zero
-
-  * **size**: duration of intervals in ms
 
 
 **Resample augmentation** ``--augment resample[p=<float>,rate=<int-range>]``
@@ -361,6 +347,96 @@ If feature caching is enabled, these augmentations will only be performed on the
 
   * **dbfs** : target volume in dBFS (default value of 3.0103 will normalize min and max amplitudes to -1.0/1.0)
 
+Spectrogram domain augmentations
+--------------------------------
+
+**Pitch and tempo augmentation** ``--augment pitch_and_tempo[p=<float>,pitch=<float-range>,tempo=<float-range>]``
+  Scales spectrogram on time and frequency axis and thus changing pitch and tempo.
+
+  * **p**: probability value between 0.0 (never) and 1.0 (always) if a given sample gets augmented by this method
+
+  * **pitch**: pitch factor by with the frequency axis is scaled (e.g. a value of 2.0 will raise audio frequency by one octave)
+
+  * **tempo**: tempo factor by which the time axis is shrunken (e.g. a value of 2.0 will double audio tempo)
+
+
+**Speed augmentation** ``--augment time_mask[p=<float>,factor=<float-range>]``
+  Scales spectrogram on time axis and thus changes playback tempo.
+
+  * **p**: probability value between 0.0 (never) and 1.0 (always) if a given sample gets augmented by this method
+
+  * **factor**: speed factor by which the time axis is shrunken (e.g. a value of 2.0 will double audio tempo)
+
+
+**Warp augmentation** ``--augment warp[p=<float>,shift=<float-range>,order=<int-range>,nbp=<int-range>,ncp=<int-range>,regularization_weight=<float>]``
+  Image warping using correspondences between sparse control points. Applies a non-linear image warp to the spectrogram, where the warp is specified by the source and destination locations of a (potentially small) number of control points.
+
+  * **p**: probability value between 0.0 (never) and 1.0 (always) if a given sample gets augmented by this method
+
+  * **shift**: maximum shift distance of control points on time axis in ms
+
+  * **order**: polynomial order used by the spline interpolation
+
+  * **nbp**: how many zero-flow boundary points to include at each spectrogram edge
+
+  * **ncp**: how many control points to warp inside the spectrogram
+
+  * **regularization_weight**: weight on smoothness regularizer in interpolation
+
+
+**Frequency mask augmentation** ``--augment time_mask[p=<float>,n=<int-range>,size=<int-range>]``
+  Sets frequency-intervals within the augmented samples to zero (silence) at random frequencies.
+
+  * **p**: probability value between 0.0 (never) and 1.0 (always) if a given sample gets augmented by this method
+
+  * **n**: number of intervals to mask
+
+  * **size**: number of frequency bands to mask per interval
+
+Multi domain augmentations
+--------------------------
+
+**Time mask augmentation** ``--augment time_mask[p=<float>,n=<int-range>,size=<float-range>,domain=<domain>]``
+  Sets time-intervals within the augmented samples to zero (silence) at random positions.
+
+  * **p**: probability value between 0.0 (never) and 1.0 (always) if a given sample gets augmented by this method
+
+  * **n**: number of intervals to set to zero
+
+  * **size**: duration of intervals in ms
+
+  * **domain**: data representation to apply augmentation to - "signal", "features" or "spectrogram" (default)
+
+
+**Dropout augmentation** ``--augment dropout[p=<float>,rate=<float-range>,domain=<domain>]``
+  Zeros random data points of the targeted data representation.
+
+  * **p**: probability value between 0.0 (never) and 1.0 (always) if a given sample gets augmented by this method
+
+  * **rate**: dropout rate ranging from 0.0 for no dropout to 1.0 for 100% dropout
+
+  * **domain**: data representation to apply augmentation to - "signal", "features" or "spectrogram" (default)
+
+
+**Add augmentation** ``--augment add[p=<float>,stddev=<float-range>,domain=<domain>]``
+  Adds random values (noise) picked from a normal distribution to data points of the targeted data representation.
+
+  * **p**: probability value between 0.0 (never) and 1.0 (always) if a given sample gets augmented by this method
+
+  * **stddev**: standard deviation of the normal distribution to pick values from
+
+  * **domain**: data representation to apply augmentation to - "signal", "features" (default) or "spectrogram"
+
+
+**Multiply augmentation** ``--augment multiply[p=<float>,stddev=<float-range>,domain=<domain>]``
+  Multiplies data points of the targeted data representation with random values (noise) picked from a normal distribution.
+
+  * **p**: probability value between 0.0 (never) and 1.0 (always) if a given sample gets augmented by this method
+
+  * **stddev**: standard deviation of the normal distribution to pick values from
+
+  * **domain**: data representation to apply augmentation to - "signal", "features" (default) or "spectrogram"
+
 
 Example training with all augmentations:
 
@@ -372,7 +448,6 @@ Example training with all augmentations:
           --augment overlay[p=0.5,source=noise.sdb,layers=1,snr=50:20~10] \
           --augment overlay[p=0.2,source=voices.sdb,layers=10:6,snr=50:20~10] \
           --augment reverb[p=0.1,delay=50.0~30.0,decay=10.0:2.0~1.0] \
-          --augment gaps[p=0.05,n=1:3~2,size=10:100] \
           --augment resample[p=0.1,rate=12000:8000~4000] \
           --augment codec[p=0.1,bitrate=48000:16000] \
           --augment volume[p=0.1,dbfs=-10:-40] \
@@ -393,42 +468,3 @@ Example simulation of the codec augmentation of a wav-file first at the beginnin
 
         bin/play.py --augment codec[p=0.1,bitrate=48000:16000] --clock 0.0 test.wav
         bin/play.py --augment codec[p=0.1,bitrate=48000:16000] --clock 1.0 test.wav
-
-
-The following augmentations are applied after feature caching, hence the way they are applied will not repeat epoch-wise.
-Working on spectrogram and feature level, `bin/play.py` offers no ability to simulate them.
-
-#. **Standard deviation for Gaussian additive noise:** ``--data_aug_features_additive``
-#. **Standard deviation for Normal distribution around 1 for multiplicative noise:** ``--data_aug_features_multiplicative`` 
-#. **Standard deviation for speeding-up tempo. If Standard deviation is 0, this augmentation is not performed:** ``--augmentation_speed_up_std`` 
-
-Spectrogram Augmentation
-------------------------
-
-Inspired by Google Paper on `SpecAugment: A Simple Data Augmentation Method for Automatic Speech Recognition <https://arxiv.org/abs/1904.08779>`_
-
-
-#. 
-   **Keep rate of dropout augmentation on a spectrogram (if 1, no dropout will be performed on the spectrogram)**\ : 
-
-
-   * Keep Rate : ``--augmentation_spec_dropout_keeprate value between range [0 - 1]`` 
-
-#. 
-   **Whether to use frequency and time masking augmentation:** 
-
-
-   * Enable / Disable : ``--augmentation_freq_and_time_masking / --noaugmentation_freq_and_time_masking``  
-   * Max range of masks in the frequency domain when performing freqtime-mask augmentation: ``--augmentation_freq_and_time_masking_freq_mask_range eg: 5``
-   * Number of masks in the frequency domain when performing freqtime-mask augmentation: ``--augmentation_freq_and_time_masking_number_freq_masks eg: 3`` 
-   * Max range of masks in the time domain when performing freqtime-mask augmentation: ``--augmentation_freq_and_time_masking_time_mask_range eg: 2`` 
-   * Number of masks in the time domain when performing freqtime-mask augmentation: ``--augmentation_freq_and_time_masking_number_time_masks eg: 3`` 
-
-#. 
-   **Whether to use spectrogram speed and tempo scaling:** 
-
-
-   * Enable / Disable : ``--augmentation_pitch_and_tempo_scaling / --noaugmentation_pitch_and_tempo_scaling``  
-   * Min value of pitch scaling: ``--augmentation_pitch_and_tempo_scaling_min_pitch eg:0.95`` 
-   * Max value of pitch scaling: ``--augmentation_pitch_and_tempo_scaling_max_pitch eg:1.2``  
-   * Max value of tempo scaling: ``--augmentation_pitch_and_tempo_scaling_max_tempo eg:1.2``  
